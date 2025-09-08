@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <title>SCADA Lite</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">SCADA Lite</div>
+      <nav class="nav">
+        <a href="#" data-route="dashboard" class="active">Dashboard</a>
+        <a href="#" data-route="tanks">Tanques</a>
+        <a href="#" data-route="pumps">Bombas</a>
+        <a href="#" data-route="alarms">Alarmas</a>
+        <a href="#" data-route="audit">Auditoría</a>
+      </nav>
+      <div class="operator">
+        <label>Operador:</label>
+        <input id="operatorName" placeholder="tu_nombre" />
+        <button id="saveOperator">Guardar</button>
+      </div>
+    </header>
+
+    <main>
+      <!-- DASHBOARD -->
+      <section id="page-dashboard" class="page visible">
+        <h2>Dashboard</h2>
+        <div class="cards" id="dashCards">
+          <div class="card">
+            <div class="card-title">Tanques</div>
+            <div class="card-value" id="dashTanksCount">—</div>
+          </div>
+          <div class="card">
+            <div class="card-title">Bombas</div>
+            <div class="card-value" id="dashPumpsCount">—</div>
+          </div>
+          <div class="card">
+            <div class="card-title">Alarmas activas</div>
+            <div class="card-value" id="dashActiveAlarms">—</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TANKS -->
+      <section id="page-tanks" class="page">
+        <h2>Tanques</h2>
+        <div id="tanksTableWrap" class="table-wrap"></div>
+
+        <details class="details">
+          <summary>Detalle Tanque</summary>
+          <div id="tankDetail">
+            <div id="tankLatestBox" class="box"></div>
+
+            <div class="cmd-panel">
+              <h3>Comandos de Tanque</h3>
+              <div class="row">
+                <label>Acción rápida (escenario):</label>
+                <select id="tankScenario">
+                  <option value="normal">normal</option>
+                  <option value="cavitacion">cavitacion</option>
+                  <option value="sensor_trabado">sensor_trabado</option>
+                  <option value="filtro_tapado">filtro_tapado</option>
+                  <option value="power_loss">power_loss</option>
+                </select>
+                <button data-tank-action="SCENARIO">Enviar</button>
+              </div>
+
+              <div class="row">
+                <label>Set nivel (%):</label>
+                <input id="tankLevelPct" type="number" min="0" max="100" step="1" />
+                <button data-tank-action="SET_TANK_LEVEL">Aplicar</button>
+              </div>
+
+              <div class="row">
+                <label>Válvula IN/OUT (%):</label>
+                <input id="valveIn" type="number" min="0" max="100" placeholder="in_pct" />
+                <input id="valveOut" type="number" min="0" max="100" placeholder="out_pct" />
+                <button data-tank-action="SET_VALVE">Aplicar</button>
+              </div>
+
+              <div class="row">
+                <label>Fuga (lpm):</label>
+                <input id="leakLpm" type="number" min="0" step="0.1" />
+                <button data-tank-action="SET_LEAK">Aplicar</button>
+              </div>
+
+              <div class="row">
+                <label>Ruido (amplitud):</label>
+                <input id="noiseAmp" type="number" min="0" step="0.1" />
+                <button data-tank-action="SET_NOISE">Aplicar</button>
+              </div>
+
+              <div class="row">
+                <label>Periodos (s):</label>
+                <input id="periodSeconds" type="number" min="0.1" step="0.1" placeholder="period_seconds" />
+                <input id="pollCmdSeconds" type="number" min="0.1" step="0.1" placeholder="poll_cmd_seconds" />
+                <button data-tank-action="SET_PERIODS">Aplicar</button>
+              </div>
+
+              <div id="tankCmdsWrap" class="box"></div>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <!-- PUMPS -->
+      <section id="page-pumps" class="page">
+        <h2>Bombas</h2>
+        <div id="pumpsTableWrap" class="table-wrap"></div>
+
+        <details class="details">
+          <summary>Detalle Bomba</summary>
+          <div id="pumpDetail">
+            <div id="pumpLatestBox" class="box"></div>
+
+            <div class="cmd-panel">
+              <h3>Comandos de Bomba</h3>
+              <div class="row">
+                <button data-pump-action="START">START</button>
+                <button data-pump-action="STOP">STOP</button>
+                <button data-pump-action="AUTO">AUTO</button>
+                <button data-pump-action="MAN">MAN</button>
+              </div>
+              <div class="row">
+                <label>Speed (%)</label>
+                <input id="pumpSpeed" type="range" min="0" max="100" value="50" />
+                <span id="pumpSpeedVal">50%</span>
+                <button data-pump-action="SPEED">SET SPEED</button>
+              </div>
+              <div id="pumpCmdsWrap" class="box"></div>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <!-- ALARMS -->
+      <section id="page-alarms" class="page">
+        <h2>Alarmas</h2>
+        <div id="alarmsTableWrap" class="table-wrap"></div>
+      </section>
+
+      <!-- AUDIT -->
+      <section id="page-audit" class="page">
+        <h2>Auditoría</h2>
+        <form id="auditFilter" class="filters">
+          <select name="asset_type">
+            <option value="">asset_type</option>
+            <option>tank</option>
+            <option>pump</option>
+            <option>ALARM</option>
+          </select>
+          <input name="asset_id" type="number" placeholder="asset_id" />
+          <input name="code" placeholder="code" />
+          <input name="state" placeholder="state" />
+          <input name="since" type="datetime-local" />
+          <input name="until" type="datetime-local" />
+          <button>Buscar</button>
+        </form>
+        <div id="auditTableWrap" class="table-wrap"></div>
+      </section>
+    </main>
+
+    <div id="toast"></div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
