@@ -1,6 +1,7 @@
 # app/routes/ingest.py
-from fastapi import APIRouter, Depends, HTTPException, status
 from typing import Any, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, status
 from psycopg import errors as psy_errors
 
 from app.schemas.ingest import TankIngestIn, TankIngestOut
@@ -24,22 +25,24 @@ def _get_level_percent(saved: Any) -> Optional[float]:
 @router.post("/tank", response_model=TankIngestOut, status_code=status.HTTP_201_CREATED)
 def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
     """
-    - Prioriza el device_id que venga del API Key (auth); si no hay, usa el del payload.
-    - Inserta pasando también volume_l / temperature_c / raw_json si existen.
-    - Mapea errores de DB a 400 (FK / checks) o 500 (otros).
-    - Evalúa alarmas en best-effort (no bloquea la respuesta si falla).
+    - Prioriza el device_id resuelto por API Key; si no hay, usa el del payload.
+    - Inserta (tank_id, level_percent, volume_l, temperature_c, raw_json, device_id).
+    - Mapea errores de DB a 400 (FK/Checks) o 500 (otros).
+    - Evalúa alarmas en best-effort (no bloquea la respuesta).
     """
-    # 1) Elegí device_id: primero el validado por el API key
+    # 1) Elegir device_id (preferimos el autenticado para evitar spoof)
     dev_from_auth = (auth or {}).get("device_id")
     dev_from_payload = getattr(payload, "device_id", None)
-    device_id_db = dev_from_auth or dev_from_payload  # tolerante: puede ser int o str
+    device_id_db = dev_from_auth or dev_from_payload
+    if device_id_db is not None:
+        device_id_db = str(device_id_db)  # columna es TEXT
 
-    # 2) Armar extras crudos si tu schema los trae (no rompe si no existen)
+    # 2) Extras opcionales
     volume_l = getattr(payload, "volume_l", None)
     temperature_c = getattr(payload, "temperature_c", None)
     raw_json = getattr(payload, "extra", None)
 
-    # 3) Insert en DB con manejo fino de errores
+    # 3) Insert con manejo de errores fino
     try:
         saved = repo.insert_tank_reading(
             tank_id=payload.tank_id,
@@ -51,19 +54,18 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
             raw_json=raw_json,
         )
     except psy_errors.ForeignKeyViolation:
-        # p.ej. tank_id no existe o device_id no matchea FK
+        # p.ej. tank_id no existe
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="invalid tank_id or device_id (FK)",
+            detail="invalid tank_id or device_id (foreign key)",
         )
     except psy_errors.CheckViolation as e:
-        # p.ej. constraint de rangos
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"payload violates constraint: {e}",
         )
     except Exception as e:
-        # Log y 500 (no 503 genérico)
+        # Log + 500 (no 503 genérico)
         print(f"[ingest/tank] DB insert failed: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
