@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 
 # --- Config centralizada con fallback a .env ---
@@ -10,20 +12,23 @@ try:
     from app.core.config import settings  # opcional
 except Exception:
     settings = None
-    from dotenv import load_dotenv
-    load_dotenv()
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except Exception:
+        pass
 
 
 def _get_env(name: str, default: str = "") -> str:
     """Lee primero de settings (si existe) y si no, del entorno."""
     if settings and hasattr(settings, name):
-        return getattr(settings, name)
+        return str(getattr(settings, name))
     return os.getenv(name, default)
 
 
 # ===== CORS =====
 # CORS_ALLOW_ORIGINS admite:
-#   - "*"  -> todos los orígenes (válido porque no usamos cookies)
+#   - "*"  -> todos los orígenes (válido porque no usamos cookies/sesión)
 #   - lista coma-separada: "https://a.com,https://b.com"
 # Opcional: CORS_ALLOW_ORIGIN_REGEX para patrones (p.ej. previews de Vercel).
 _raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
@@ -37,14 +42,30 @@ else:
     ALLOWED_ORIGINS = [o.strip() for o in _raw.split(",") if o.strip()]
 
 ALLOW_CREDENTIALS = False  # si pasás a cookies/sesión -> True y NO uses "*"
-ALLOW_METHODS = ["*"]      # GET,POST,PUT,OPTIONS...
-ALLOW_HEADERS = ["*"]      # X-API-Key, Authorization, Content-Type
+ALLOW_METHODS = ["*"]      # GET, POST, PUT, PATCH, DELETE, OPTIONS...
+ALLOW_HEADERS = ["*"]      # X-API-Key, Authorization, Content-Type, etc.
 
-app = FastAPI(title="ESP32 Tank/Pump API")
+# ===== Trusted hosts (opcional) =====
+# p.ej.: TRUSTED_HOSTS="backend-v85n.onrender.com,.vercel.app,localhost,127.0.0.1"
+_trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
+TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
 
-print("[CORS] allow_all =", ALLOW_ALL_ORIGINS)
-print("[CORS] allow_origins =", ALLOWED_ORIGINS)
+APP_TITLE = _get_env("APP_TITLE", "ESP32 Tank/Pump API")
+APP_VERSION = _get_env("APP_VERSION", "") or _get_env("RENDER_GIT_COMMIT", "")[:8]
+
+app = FastAPI(title=APP_TITLE, version=APP_VERSION or None)
+
+# Logs de arranque
+print("[CORS] allow_all       =", ALLOW_ALL_ORIGINS)
+print("[CORS] allow_origins   =", ALLOWED_ORIGINS)
 print("[CORS] allow_origin_regex =", _origin_regex or "(none)")
+print("[CORS] allow_credentials =", ALLOW_CREDENTIALS)
+if TRUSTED_HOSTS:
+    print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
+
+# Middlewares
+if TRUSTED_HOSTS:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,6 +75,9 @@ app.add_middleware(
     allow_methods=ALLOW_METHODS,
     allow_headers=ALLOW_HEADERS,
 )
+
+# Compresión (útil para listas grandes / history)
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # --- Routers TANQUES ---
 from app.routes.ingest import router as ingest_tank_router
@@ -122,6 +146,21 @@ app.include_router(ws_router)
 # --- Endpoints utilitarios ---
 from app.core.db import get_conn
 
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "service": APP_TITLE,
+        "version": APP_VERSION or None,
+        "docs": "/docs",
+        "health": "/health",
+    }
+
+@app.get("/favicon.ico")
+def favicon_noop():
+    # Evita 404 ruidoso si algún cliente pide favicon al backend
+    return {}
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -135,6 +174,20 @@ def health_db():
         return {"ok": True, "db": "up"}
     except Exception as e:
         raise HTTPException(500, f"DB error: {e}")
+
+@app.get("/__config")
+def cfg_echo():
+    """Pequeño eco de configuración segura para diagnóstico."""
+    return {
+        "cors": {
+            "allow_all": ALLOW_ALL_ORIGINS,
+            "allow_origins": ALLOWED_ORIGINS,
+            "allow_origin_regex": _origin_regex or None,
+            "allow_credentials": ALLOW_CREDENTIALS,
+        },
+        "trusted_hosts": TRUSTED_HOSTS or None,
+        "version": APP_VERSION or None,
+    }
 
 @app.get("/__tg_env")
 def tg_env():
