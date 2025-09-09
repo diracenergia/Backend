@@ -7,7 +7,6 @@ from fastapi.staticfiles import StaticFiles
 
 # --- Config centralizada con fallback a .env ---
 try:
-    # Si más adelante creás un settings pydantic, lo tomamos de acá.
     from app.core.config import settings  # opcional
 except Exception:
     settings = None
@@ -23,20 +22,37 @@ def _get_env(name: str, default: str = "") -> str:
 
 
 # ===== CORS =====
-# Preferimos orígenes explícitos. Si no hay env, usamos localhost/127.0.0.1:5173 por defecto.
-_raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
-ALLOWED_ORIGINS = [o.strip() for o in _raw.split(",") if o.strip()]
+# CORS_ALLOW_ORIGINS admite:
+#   - "*"  -> todos los orígenes (válido porque no usamos cookies)
+#   - lista coma-separada: "https://a.com,https://b.com"
+# Opcional: CORS_ALLOW_ORIGIN_REGEX para patrones (p.ej. previews de Vercel).
+_raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
+_origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
 
-app = FastAPI(title="ESP32 Tank/Pump API (Local)")
+if _raw == "*":
+    ALLOW_ALL_ORIGINS = True
+    ALLOWED_ORIGINS = ["*"]
+else:
+    ALLOW_ALL_ORIGINS = False
+    ALLOWED_ORIGINS = [o.strip() for o in _raw.split(",") if o.strip()]
 
-print("CORS allow_origins =", ALLOWED_ORIGINS)
+ALLOW_CREDENTIALS = False  # si pasás a cookies/sesión -> True y NO uses "*"
+ALLOW_METHODS = ["*"]      # GET,POST,PUT,OPTIONS...
+ALLOW_HEADERS = ["*"]      # X-API-Key, Authorization, Content-Type
+
+app = FastAPI(title="ESP32 Tank/Pump API")
+
+print("[CORS] allow_all =", ALLOW_ALL_ORIGINS)
+print("[CORS] allow_origins =", ALLOWED_ORIGINS)
+print("[CORS] allow_origin_regex =", _origin_regex or "(none)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,   # enumera orígenes concretos
-    allow_credentials=False,         # si usás cookies, poné True y NO uses '*'
-    allow_methods=["*"],
-    allow_headers=["*"],             # necesario para X-API-Key y Authorization
+    allow_origins=ALLOWED_ORIGINS,          # ["*"] si _raw == "*"
+    allow_origin_regex=_origin_regex or None,
+    allow_credentials=ALLOW_CREDENTIALS,    # con True no podés usar "*"
+    allow_methods=ALLOW_METHODS,
+    allow_headers=ALLOW_HEADERS,
 )
 
 # --- Routers TANQUES ---
@@ -69,7 +85,7 @@ except Exception:
 # --- 🔌 WebSocket telemetry router (ruta exacta /ws/telemetry) ---
 from app.ws import router as ws_router
 
-# --- Montaje de UI estática ---
+# --- Montaje de UI estática (opcional) ---
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WEB_DIR = REPO_ROOT / "web"
 if WEB_DIR.exists():
@@ -106,11 +122,9 @@ app.include_router(ws_router)
 # --- Endpoints utilitarios ---
 from app.core.db import get_conn
 
-
 @app.get("/health")
 def health():
     return {"ok": True}
-
 
 @app.get("/health/db")
 def health_db():
@@ -121,7 +135,6 @@ def health_db():
         return {"ok": True, "db": "up"}
     except Exception as e:
         raise HTTPException(500, f"DB error: {e}")
-
 
 @app.get("/__tg_env")
 def tg_env():
@@ -150,7 +163,6 @@ except Exception:
     pass
 
 # ===== Alarm Listener (LISTEN/NOTIFY → Telegram) =====
-# Carga perezosa con tolerancia a fallos: si no existe el módulo, no rompas el arranque.
 try:
     from app.services.alarm_listener import start_alarm_listener, stop_alarm_listener
     _HAS_ALARM_LISTENER = True
@@ -160,17 +172,14 @@ except Exception as e:
     stop_alarm_listener = None
     _HAS_ALARM_LISTENER = False
 
-
 @app.on_event("startup")
 def _startup_listeners():
-    # Arrancamos el listener de alarmas si está disponible.
     if _HAS_ALARM_LISTENER and callable(start_alarm_listener):
         try:
             start_alarm_listener()
             print("[alarm-listener] started")
         except Exception as e:
             print(f"⚠️ error al iniciar alarm-listener: {e}")
-
 
 @app.on_event("shutdown")
 def _shutdown_listeners():
