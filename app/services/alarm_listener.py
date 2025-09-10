@@ -3,20 +3,14 @@ from __future__ import annotations
 
 import os
 import json
-import select
-import asyncio
+import time
+import threading
 import logging
-from threading import Thread, Event
-from typing import Optional
+from typing import Optional, Dict, Any
 
-import psycopg  # v3
+from app.core.db import get_conn  # debe devolver una psycopg.Connection (v3)
+from app.services import notify_alarm  # donde está la lógica de Telegram
 
-from app.core.db import EVENTS_DSN  # DSN especial para LISTEN/NOTIFY
-from app.services.notify_alarm import notify_alarm
-
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -24,186 +18,134 @@ logging.basicConfig(
 )
 log = logging.getLogger("alarm-listener")
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
-CHANNEL = (os.getenv("ALARM_NOTIFY_CHANNEL") or "alarm_events").strip()
+CHAN = os.getenv("ALARM_NOTIFY_CHANNEL", "alarm_events")
 
-# Thread y stop flag
-_thread: Optional[Thread] = None
-_stop_evt: Optional[Event] = None
+# Estado interno
+_thread: Optional[threading.Thread] = None
+_stop = threading.Event()
+_last_sent: list[dict] = []   # cache de últimos mensajes enviados (debug)
+
+# Backoff reconexión
+_RETRY_BASE = 1.5
+_RETRY_MAX = 30.0
 
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-def _parse_payload(raw: str) -> Optional[dict]:
+def _decode_payload(payload: str) -> Dict[str, Any]:
     try:
-        payload = json.loads(raw)
-        log.debug("parse ok payload_keys=%s", list(payload.keys()))
-        return payload
+        data = json.loads(payload)
+        if not isinstance(data, dict):
+            raise ValueError("payload no es dict")
+        return data
     except Exception as e:
-        log.error("json_invalid err=%s raw_preview=%s", e, raw[:200])
-        return None
+        log.exception("decode error err=%s payload=%r", e, payload[:200])
+        return {}
 
 
-def _op_from_payload(payload: dict) -> str:
-    return (payload.get("op") or payload.get("operation") or "").upper()
-
-
-def _should_send(payload: dict) -> bool:
+def _should_send(evt: Dict[str, Any]) -> bool:
     """
-    Enviamos SIEMPRE cruces de umbral:
-      - RAISED: se cruzó el umbral
-      - CLEARED: volvió a la normalidad
-    No deduplicamos ni anti-spam acá.
+    Regla simple: enviar solo RAISED/CLEARED que tengan asset_type/asset_id/code.
+    Podés agregar filtros más finos acá si querés.
     """
-    op = _op_from_payload(payload)
-    decision = op in {"RAISED", "RAISE", "CLEARED", "CLEAR"}
-    log.debug("should_send op=%s decision=%s", op, decision)
-    return decision
+    op = evt.get("op")
+    ok = bool(op in ("RAISED", "CLEARED")
+              and evt.get("asset_type")
+              and evt.get("asset_id") is not None
+              and evt.get("code"))
+    log.info("should_send op=%s decision=%s", op, ok)
+    return ok
 
 
-async def _dispatch_async(payload: dict) -> None:
+def _dispatch(evt: Dict[str, Any]) -> None:
+    """
+    Llama al módulo notify_alarm (que vos ya tenés mandando Telegram).
+    """
     try:
-        log.info(
-            "dispatch start op=%s asset_type=%s asset_id=%s code=%s",
-            _op_from_payload(payload),
-            payload.get("asset_type"),
-            payload.get("asset_id"),
-            payload.get("code"),
-        )
-        await notify_alarm(payload)
-        log.info("dispatch done status=sent")
+        log.info("dispatch start op=%s asset=%s-%s code=%s",
+                 evt.get("op"), evt.get("asset_type"), evt.get("asset_id"), evt.get("code"))
+        # -> usá el notify que ya tenés. Puedes adaptar campos si tu función espera otros nombres
+        status = notify_alarm.send(evt)
+        _last_sent.append({"ts": time.time(), "evt": evt, "status": status})
+        if len(_last_sent) > 100:
+            _last_sent.pop(0)
+        log.info("dispatch done status=%s", status)
     except Exception as e:
-        log.exception("dispatch error err=%s", e)
+        log.exception("dispatch error err=%s evt=%r", e, evt)
 
 
-def _listen_loop(stop_evt: Event) -> None:
+def _listen_once() -> None:
     """
-    Hilo bloqueante que hace LISTEN al canal y despacha a notify_alarm.
-    Usa select() para esperar notificaciones sin ocupar CPU.
+    Abre conexión, LISTEN, y consume notificaciones con psycopg3:
+    - conn.notifies.get(timeout=…)
     """
-    log.info("loop starting channel=%s dsn_present=%s", CHANNEL, bool(EVENTS_DSN))
-
-    # Event loop propio para corrutinas
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    # Conexión en autocommit para recibir notificaciones inmediatamente
-    try:
-        conn = psycopg.connect(EVENTS_DSN, autocommit=True, application_name="alarm-listener")
-        log.info("db_connect ok")
-    except Exception as e:
-        log.exception("db_connect error err=%s", e)
-        return
-
-    try:
-        with conn.cursor() as cur:
-            cur.execute(f'LISTEN "{CHANNEL}";')
-        log.info("listen_subscribed channel=%s", CHANNEL)
-    except Exception as e:
-        log.exception("listen_subscribe error err=%s channel=%s", e, CHANNEL)
+    log.info("db_conn opening channel=%s", CHAN)
+    with get_conn() as conn, conn.cursor() as cur:
+        # psycopg3: LISTEN
+        cur.execute(f'LISTEN "{CHAN}"')
         try:
-            conn.close()
+            conn.commit()  # por si la conexión no está en autocommit
         except Exception:
             pass
-        return
+        log.info("listen_subscribed channel=%s", CHAN)
 
-    try:
-        fd = conn.fileno()
-        while not stop_evt.is_set():
-            ready, _, _ = select.select([fd], [], [], 2.0)  # 2s para chequear stop flag
-            if not ready:
+        # Bucle de consumo
+        while not _stop.is_set():
+            try:
+                # psycopg3: queue-like API para notificaciones
+                # timeout en segundos (float). Si no llega nada, tira queue.Empty
+                notify = conn.notifies.get(timeout=5.0)  # type: ignore[attr-defined]
+            except Exception:
+                # timeouts u otras excepciones benignas: seguir
                 continue
 
-            conn.poll()
-            while conn.notifies:
-                n = conn.notifies.pop(0)
-                raw = n.payload or ""
-                log.debug("notify_recv len=%s", len(raw))
-                payload = _parse_payload(raw)
-                if not payload:
+            try:
+                log.info("notify_recv pid=%s payload_len=%s", getattr(notify, "pid", None), len(notify.payload))
+                evt = _decode_payload(notify.payload)
+                if not evt:
                     continue
+                if _should_send(evt):
+                    _dispatch(evt)
+            except Exception as e:
+                log.exception("notify handle error err=%s", e)
 
-                if _should_send(payload):
-                    loop.create_task(_dispatch_async(payload))
-                else:
-                    log.info(
-                        "notify_skip op=%s reason=not_threshold_cross",
-                        _op_from_payload(payload),
-                    )
-    except Exception as e:
-        log.exception("loop error err=%s", e)
-    finally:
+    log.info("db_conn closed")
+
+
+def _listen_loop() -> None:
+    """
+    Loop con reconexión exponencial.
+    """
+    attempt = 0
+    while not _stop.is_set():
         try:
-            conn.close()
-            log.info("db_conn closed")
-        except Exception:
-            pass
-        try:
-            loop.stop()
-            loop.close()
-        except Exception:
-            pass
-        log.info("loop stopped")
+            _listen_once()
+            # Si salimos normalmente, reiniciamos intento
+            attempt = 0
+        except Exception as e:
+            attempt += 1
+            wait_s = min(_RETRY_MAX, _RETRY_BASE ** attempt)
+            log.exception("loop error err=%r; retrying in %.1fs", e, wait_s)
+            # Pequeño sleep antes de reintentar
+            for _ in range(int(wait_s * 10)):
+                if _stop.is_set():
+                    break
+                time.sleep(0.1)
+    log.info("loop stopped")
 
 
-# -----------------------------------------------------------------------------
-# API pública
-# -----------------------------------------------------------------------------
 def start_alarm_listener() -> None:
-    global _thread, _stop_evt
+    global _thread
     if _thread and _thread.is_alive():
-        log.warning("already_started")
+        log.info("already running")
         return
-    _stop_evt = Event()
-    _thread = Thread(target=_listen_loop, args=(_stop_evt,), daemon=True)
+    _stop.clear()
+    _thread = threading.Thread(target=_listen_loop, name="alarm-listener", daemon=True)
     _thread.start()
-    log.info("thread_started")
+    log.info("thread started")
 
 
 def stop_alarm_listener() -> None:
-    global _thread, _stop_evt
-    if _stop_evt:
-        _stop_evt.set()
+    global _thread
+    _stop.set()
     if _thread:
-        _thread.join(timeout=2.0)
-    log.info("thread_stopped")
-
-
-# -----------------------------------------------------------------------------
-# Self-test opcional: permite verificar sin eventos reales
-# -----------------------------------------------------------------------------
-async def selftest_fire_samples() -> None:
-    """
-    Llama a notify_alarm() con dos payloads de ejemplo (RAISED y CLEARED).
-    Útil para probar formato y envío a Telegram.
-    """
-    sample_raised = {
-        "op": "RAISED",
-        "asset_type": "tank",
-        "asset_id": 12,
-        "code": "LEVEL_HIGH",
-        "message": "Nivel alto sobre >90%",
-        "severity": "WARNING",
-        "value": 92.3,
-        "threshold": 90.0,
-        "ts_raised": "2025-09-10T10:00:00Z",
-    }
-    sample_cleared = {
-        "op": "CLEARED",
-        "asset_type": "tank",
-        "asset_id": 12,
-        "code": "LEVEL_HIGH",
-        "message": "Nivel normalizado",
-        "severity": "INFO",
-        "value": 88.0,
-        "threshold": 90.0,
-        "ts_cleared": "2025-09-10T10:05:00Z",
-    }
-
-    log.info("selftest start")
-    await notify_alarm(sample_raised)
-    await notify_alarm(sample_cleared)
-    log.info("selftest done")
+        _thread.join(timeout=5)
+    log.info("thread stopped")
