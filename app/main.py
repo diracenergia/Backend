@@ -93,7 +93,6 @@ from app.routes.audit import router as audit_router
 from app.routes.diag_listener import router as diag_listener_router
 app.include_router(diag_listener_router)
 
-
 # Router opcional: CRUD de metadatos de tanques
 try:
     from app.routes.tanks import router as tanks_router
@@ -216,66 +215,63 @@ try:
 except Exception as e:
     print(f"⚠️ conn router no disponible: {e}")
 
-# ===== Alarm Listener (LISTEN/NOTIFY → Telegram) =====
+# ===== Alarm Poller (sin LISTEN/NOTIFY) =====
 try:
-    from app.services.alarm_listener import start_alarm_listener, stop_alarm_listener
-    _HAS_ALARM_LISTENER = True
+    from app.services.alarm_poller import start_alarm_poller, stop_alarm_poller
+    _HAS_ALARM_POLLER = True
 except Exception as e:
-    print(f"⚠️ alarm-listener no disponible: {e}")
-    start_alarm_listener = None
-    stop_alarm_listener = None
-    _HAS_ALARM_LISTENER = False
+    print(f"⚠️ alarm-poller no disponible: {e}")
+    start_alarm_poller = None
+    stop_alarm_poller = None
+    _HAS_ALARM_POLLER = False
 
 @app.on_event("startup")
 def _startup_listeners():
-    if _HAS_ALARM_LISTENER and callable(start_alarm_listener):
+    if _HAS_ALARM_POLLER and callable(start_alarm_poller):
         try:
-            start_alarm_listener()
-            print("[alarm-listener] started")
+            start_alarm_poller()
+            print("[alarm-poller] started")
         except Exception as e:
-            print(f"⚠️ error al iniciar alarm-listener: {e}")
+            print(f"⚠️ error al iniciar alarm-poller: {e}")
 
 @app.on_event("shutdown")
 def _shutdown_listeners():
-    if _HAS_ALARM_LISTENER and callable(stop_alarm_listener):
+    if _HAS_ALARM_POLLER and callable(stop_alarm_poller):
         try:
-            stop_alarm_listener()
-            print("[alarm-listener] stopped")
+            stop_alarm_poller()
+            print("[alarm-poller] stopped")
         except Exception as e:
-            print(f"⚠️ error al detener alarm-listener: {e}")
+            print(f"⚠️ error al detener alarm-poller: {e}")
 
-# ===== Endpoints de diagnóstico del listener =====
-@app.get("/__alarm_listener_status")
-def listener_status():
+# ===== Endpoints de diagnóstico del poller =====
+@app.get("/__alarm_poller_status")
+def poller_status():
     try:
-        from app.services import alarm_listener as al
+        from app.services import alarm_poller as ap
     except Exception as e:
-        return {"alive": False, "channel": None, "error": f"import_error: {e}"}
+        return {"alive": False, "error": f"import_error: {e}"}
 
-    alive = bool(getattr(al, "_thread", None) and getattr(al._thread, "is_alive", lambda: False)())
-    channel = getattr(al, "CHANNEL", None) or getattr(al, "CHAN", None)
-
-    sent_cache = None
-    try:
-        sent_cache = len(getattr(al, "_last_sent", []))
-    except Exception:
-        pass
+    alive = bool(getattr(ap, "_thread", None) and getattr(ap._thread, "is_alive", lambda: False)())
+    batch = getattr(ap, "BATCH", None)
+    sleep_empty = getattr(ap, "SLEEP_EMPTY", None)
+    sleep_busy = getattr(ap, "SLEEP_BUSY", None)
 
     return {
         "alive": alive,
-        "channel": channel,
-        "sent_cache": sent_cache,
+        "batch": batch,
+        "sleep_empty": sleep_empty,
+        "sleep_busy": sleep_busy,
     }
 
-@app.post("/__alarm_listener_stop")
-def listener_stop():
-    if _HAS_ALARM_LISTENER and callable(stop_alarm_listener):
+@app.post("/__alarm_poller_stop")
+def poller_stop():
+    if _HAS_ALARM_POLLER and callable(stop_alarm_poller):
         try:
-            stop_alarm_listener()
+            stop_alarm_poller()
             return {"stopped": True}
         except Exception as e:
             return {"stopped": False, "error": str(e)}
-    return {"stopped": False, "error": "listener no disponible"}
+    return {"stopped": False, "error": "poller no disponible"}
 
 # ===== Qué versión de alarms_eval está cargada =====
 @app.get("/__which_alarms_eval")
@@ -317,8 +313,8 @@ def which_alarm_events():
 @app.post("/__diag_publish")
 def __diag_publish(payload: dict = Body(...)):
     """
-    Empuja un evento al canal 'alarm_events' usando alarm_events._notify(payload).
-    Sirve para testear el listener/Telegram sin depender del router aparte.
+    Empuja un evento a alarm_events._notify(payload).
+    Útil para probar el template de Telegram sin depender de otros módulos.
     """
     try:
         from app.services import alarm_events
