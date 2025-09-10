@@ -23,7 +23,9 @@ try:
         if DEBUG_TG:
             log.info("tg_send(local) OK")
 except Exception:
-    import requests
+    import json
+    from urllib.request import Request, urlopen
+    from urllib.error import HTTPError, URLError
 
     def tg_send(text: str):
         token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -32,25 +34,28 @@ except Exception:
             raise RuntimeError("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID")
 
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": chat, "text": text, "parse_mode": "HTML"}
+        payload = json.dumps({"chat_id": chat, "text": text, "parse_mode": "HTML"}).encode("utf-8")
+        req = Request(url, data=payload, headers={"Content-Type": "application/json"})
 
         if DEBUG_TG:
-            log.info("tg_send(HTTP) url=%s chat=%s len=%s", url, chat, len(text))
-            log.info("tg_send(HTTP) payload_head=%s", str(payload)[:200])
+            log.info("tg_send(urllib) url=%s chat=%s len=%s", url, chat, len(text))
 
-        r = requests.post(url, json=payload, timeout=12)
-
-        body = None
         try:
-            body = r.json()
-        except Exception:
-            body = {"raw": r.text[:500]}
+            with urlopen(req, timeout=12) as resp:
+                status = resp.getcode()
+                body = resp.read(1000).decode("utf-8", "replace")
+            if DEBUG_TG or status != 200:
+                log.info("tg_send(urllib) status=%s body=%s", status, body)
+            if status != 200:
+                raise RuntimeError(f"Telegram fail status={status} body={body}")
+        except HTTPError as he:
+            b = he.read(1000).decode("utf-8", "replace") if he.fp else ""
+            log.info("tg_send(urllib) HTTPError code=%s body=%s", he.code, b)
+            raise
+        except URLError as ue:
+            log.info("tg_send(urllib) URLError reason=%s", ue.reason)
+            raise
 
-        if DEBUG_TG or r.status_code != 200 or not body.get("ok", False):
-            log.info("tg_send(HTTP) status=%s body=%s", r.status_code, body)
-
-        if r.status_code != 200 or not body.get("ok", False):
-            raise RuntimeError(f"Telegram fail status={r.status_code} body={body}")
 
 # ---- Config poller ----
 _thread: Optional[threading.Thread] = None
