@@ -1,15 +1,11 @@
 # app/services/alarm_listener.py
 from __future__ import annotations
 
-import os
-import json
-import time
-import threading
-import logging
+import os, json, time, threading, logging, queue
 from typing import Optional, Dict, Any
 
-from app.core.db import get_conn  # debe devolver una psycopg.Connection (v3)
-from app.services import notify_alarm  # donde está la lógica de Telegram
+from app.core.db import get_conn
+from app.services import notify_alarm  # tu sender a Telegram
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -19,11 +15,12 @@ logging.basicConfig(
 log = logging.getLogger("alarm-listener")
 
 CHAN = os.getenv("ALARM_NOTIFY_CHANNEL", "alarm_events")
+__VERSION__ = "alist-2025-09-10T13:35Z"
 
 # Estado interno
 _thread: Optional[threading.Thread] = None
 _stop = threading.Event()
-_last_sent: list[dict] = []   # cache de últimos mensajes enviados (debug)
+_last_sent: list[dict] = []
 
 # Backoff reconexión
 _RETRY_BASE = 1.5
@@ -42,10 +39,6 @@ def _decode_payload(payload: str) -> Dict[str, Any]:
 
 
 def _should_send(evt: Dict[str, Any]) -> bool:
-    """
-    Regla simple: enviar solo RAISED/CLEARED que tengan asset_type/asset_id/code.
-    Podés agregar filtros más finos acá si querés.
-    """
     op = evt.get("op")
     ok = bool(op in ("RAISED", "CLEARED")
               and evt.get("asset_type")
@@ -56,13 +49,9 @@ def _should_send(evt: Dict[str, Any]) -> bool:
 
 
 def _dispatch(evt: Dict[str, Any]) -> None:
-    """
-    Llama al módulo notify_alarm (que vos ya tenés mandando Telegram).
-    """
     try:
         log.info("dispatch start op=%s asset=%s-%s code=%s",
                  evt.get("op"), evt.get("asset_type"), evt.get("asset_id"), evt.get("code"))
-        # -> usá el notify que ya tenés. Puedes adaptar campos si tu función espera otros nombres
         status = notify_alarm.send(evt)
         _last_sent.append({"ts": time.time(), "evt": evt, "status": status})
         if len(_last_sent) > 100:
@@ -73,36 +62,36 @@ def _dispatch(evt: Dict[str, Any]) -> None:
 
 
 def _listen_once() -> None:
-    """
-    Abre conexión, LISTEN, y consume notificaciones con psycopg3:
-    - conn.notifies.get(timeout=…)
-    """
-    log.info("db_conn opening channel=%s", CHAN)
+    log.info("db_conn opening channel=%s version=%s", CHAN, __VERSION__)
     with get_conn() as conn, conn.cursor() as cur:
-        # psycopg3: LISTEN
         cur.execute(f'LISTEN "{CHAN}"')
         try:
-            conn.commit()  # por si la conexión no está en autocommit
+            conn.commit()
         except Exception:
             pass
         log.info("listen_subscribed channel=%s", CHAN)
 
-        # Bucle de consumo
+        last_log = time.time()
         while not _stop.is_set():
             try:
-                # psycopg3: queue-like API para notificaciones
-                # timeout en segundos (float). Si no llega nada, tira queue.Empty
-                notify = conn.notifies.get(timeout=5.0)  # type: ignore[attr-defined]
-            except Exception:
-                # timeouts u otras excepciones benignas: seguir
+                notify = conn.notifies.get(timeout=5.0)  # queue-like (psycopg3)
+            except queue.Empty:
+                now = time.time()
+                # cada ~60s logueamos que seguimos vivos
+                if now - last_log > 60:
+                    log.info("idle waiting channel=%s", CHAN)
+                    last_log = now
+                continue
+            except Exception as e:
+                # error real leyendo la cola
+                log.exception("notifies.get error err=%s", e)
                 continue
 
             try:
-                log.info("notify_recv pid=%s payload_len=%s", getattr(notify, "pid", None), len(notify.payload))
+                log.info("notify_recv pid=%s payload_len=%s",
+                         getattr(notify, "pid", None), len(notify.payload))
                 evt = _decode_payload(notify.payload)
-                if not evt:
-                    continue
-                if _should_send(evt):
+                if evt and _should_send(evt):
                     _dispatch(evt)
             except Exception as e:
                 log.exception("notify handle error err=%s", e)
@@ -111,20 +100,15 @@ def _listen_once() -> None:
 
 
 def _listen_loop() -> None:
-    """
-    Loop con reconexión exponencial.
-    """
     attempt = 0
     while not _stop.is_set():
         try:
             _listen_once()
-            # Si salimos normalmente, reiniciamos intento
             attempt = 0
         except Exception as e:
             attempt += 1
             wait_s = min(_RETRY_MAX, _RETRY_BASE ** attempt)
             log.exception("loop error err=%r; retrying in %.1fs", e, wait_s)
-            # Pequeño sleep antes de reintentar
             for _ in range(int(wait_s * 10)):
                 if _stop.is_set():
                     break
@@ -140,7 +124,7 @@ def start_alarm_listener() -> None:
     _stop.clear()
     _thread = threading.Thread(target=_listen_loop, name="alarm-listener", daemon=True)
     _thread.start()
-    log.info("thread started")
+    log.info("thread started version=%s", __VERSION__)
 
 
 def stop_alarm_listener() -> None:
