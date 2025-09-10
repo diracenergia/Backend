@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter
 from psycopg import conninfo
-from app.core.db import get_conn
+from app.core.db import get_events_conn as get_conn
 
 router = APIRouter()
 
