@@ -6,19 +6,21 @@ from typing import Optional, Tuple
 # Repos (coinciden con tu backend)
 from app.repos import tanks as tanks_repo
 from app.repos import alarms as alarms_repo
-from app.repos import audit as audit_repo  # si querés auditar, ya está importado
+from app.repos import audit as audit_repo  # si querés auditar
 
 # Notificador (LISTEN/NOTIFY → listener → Telegram)
-# Estas funciones ya las agregaste en app/services/alarm_events.py
+# Usamos la firma recomendada:
+#   publish_raised(asset_type, asset_id, code, message, severity, value, threshold, ts_raised)
+#   publish_cleared(asset_type, asset_id, code, message, severity, value, threshold, ts_cleared)
 from app.services.alarm_events import publish_raised, publish_cleared
+
+from psycopg.types.json import Json  # psycopg v3
 
 # -----------------------------------------------------------------------------
 # Config / Mapping
 # -----------------------------------------------------------------------------
 
-# Mapa de thresholds → (código_alarma, severidad_publicada)
-# OJO: en DB tu CHECK de severity es en minúsculas: 'critical'/'warning'/'info'
-#      Para DB guardamos lowercase; para Telegram/publicación usamos UPPER.
+# Mapa de thresholds → (código_alarma, severidad_publicada_en_DB_lowercase)
 _THRESHOLD_MAP = {
     "low_low":   ("LOW_LOW",   "critical"),
     "low":       ("LOW",       "warning"),
@@ -26,14 +28,13 @@ _THRESHOLD_MAP = {
     "high_high": ("HIGH_HIGH", "critical"),
 }
 
-# Alias que usa el payload hacia el listener/Telegram
+# Alias que mandamos en el payload (útil para mostrar en Telegram)
 _THRESH_ALIAS = {
-    "LOW_LOW": "very_low",
-    "LOW":     "low",
-    "HIGH":    "high",
+    "LOW_LOW":  "very_low",
+    "LOW":      "low",
+    "HIGH":     "high",
     "HIGH_HIGH":"very_high",
 }
-
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -42,10 +43,13 @@ _THRESH_ALIAS = {
 def _utcnow():
     return datetime.now(timezone.utc)
 
+def _iso(dt: datetime) -> str:
+    # ISO8601 con Z
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
 def _decide_state(level_pct: float, cfg: dict) -> Optional[Tuple[str, str, str]]:
     """
-    Devuelve (alarm_code_upper, severity_db_lower, threshold_alias)
-    o None si está en rango normal.
+    Devuelve (alarm_code_upper, severity_db_lower, threshold_key) o None si normal.
     cfg espera: low_low_pct, low_pct, high_pct, high_high_pct
     """
     for k in ("low_low_pct", "low_pct", "high_pct", "high_high_pct"):
@@ -67,7 +71,6 @@ def _decide_state(level_pct: float, cfg: dict) -> Optional[Tuple[str, str, str]]
 
     return None  # normal
 
-
 def _clear_one(alarm_id: int, *, asset_type: str, asset_id: int, code: str,
                severity_db: str, message: str, value: float) -> None:
     """
@@ -77,26 +80,22 @@ def _clear_one(alarm_id: int, *, asset_type: str, asset_id: int, code: str,
     if not cleared:
         return  # ya estaba limpia
 
-    # Publicar CLEARED → listener → Telegram
+    # Publicar CLEARED → listener → Telegram (incluye timestamp)
     publish_cleared(
-        alarm_id=alarm_id,
         asset_type=asset_type,
         asset_id=asset_id,
-        code=code,                         # listener lo normaliza a UPPER
-        severity=severity_db,              # listener lo normaliza a UPPER
+        code=code,                         # UPPER
         message=message or "",
+        severity=severity_db,              # DB en lower; el notifier lo mostrará en UPPER si querés
         value=value,
-        threshold=None,
+        threshold=None,                    # opcional al limpiar
+        ts_cleared=_iso(_utcnow()),
     )
-
 
 def _clear_all_for_tank(tank_id: int, *, value: float) -> None:
     """
     Limpia TODAS las alarmas activas del tanque (cualquier código).
     """
-    # Traemos cualquier activa del tanque y vamos limpiando
-    # Repos no tiene "list_active_by_tank", así que hacemos un fetch manual mínimo.
-    # Si querés, podés extender repos/alarms con un list_active(asset_type, asset_id).
     from psycopg.rows import dict_row
     from app.core.db import get_conn
 
@@ -120,7 +119,6 @@ def _clear_all_for_tank(tank_id: int, *, value: float) -> None:
             value=value,
         )
 
-
 # -----------------------------------------------------------------------------
 # API pública que usa ingest.py
 # -----------------------------------------------------------------------------
@@ -128,18 +126,15 @@ def _clear_all_for_tank(tank_id: int, *, value: float) -> None:
 def eval_tank_alarm(tank_id: int, level_pct: Optional[float]) -> Optional[int]:
     """
     Evalúa una lectura de tanque contra thresholds y levanta/limpia alarmas.
-    - tank_id: ID del tanque
-    - level_pct: nivel (%). Si viene None, no hace nada.
     Retorna alarm_id si levantó una nueva alarma; None si no levantó o si limpió.
     """
     if level_pct is None:
         return None
 
-    # 1) Obtener thresholds (con fallback a defaults si falta alguno)
-    cfg = tanks_repo.get_config_by_id(tank_id)  # ya existe en tu repo
-    # cfg: {low_low_pct, low_pct, high_pct, high_high_pct, ...}
+    # 1) Obtener thresholds
+    cfg = tanks_repo.get_config_by_id(tank_id)  # {low_low_pct, low_pct, high_pct, high_high_pct, ...}
 
-    # 2) Determinar si está fuera de rango
+    # 2) Determinar estado
     state = _decide_state(level_pct, cfg)
     if state is None:
         # Normal → limpiar activas (si las hay)
@@ -149,10 +144,10 @@ def eval_tank_alarm(tank_id: int, level_pct: Optional[float]) -> Optional[int]:
     alarm_code_upper, severity_db_lower, threshold_key = state
     threshold_alias = _THRESH_ALIAS.get(alarm_code_upper, threshold_key)
 
-    # 3) ¿Existe una ACTIVA del mismo código para este tanque?
+    # 3) ¿Existe una ACTIVA del mismo código?
     active = alarms_repo.get_active(asset_type="tank", asset_id=tank_id, code=alarm_code_upper)
     if active:
-        # Ya hay una activa de ese tipo → no duplicamos
+        # Ya está levantada → no duplicamos
         return active.id
 
     # 4) Crear nueva alarma en DB (severity en lower por constraint)
@@ -160,35 +155,35 @@ def eval_tank_alarm(tank_id: int, level_pct: Optional[float]) -> Optional[int]:
     created = alarms_repo.create(
         asset_type="tank",
         asset_id=tank_id,
-        code=alarm_code_upper,              # código almacenado tal cual (UPPER)
+        code=alarm_code_upper,              # UPPER
         severity=severity_db_lower,         # DB espera lower-case
         message=message,
         ts_raised=_utcnow(),
         is_active=True,
-        extra={"value": level_pct, "threshold": threshold_alias},
+        # ⚠️ Json(...) para evitar “cannot adapt type 'dict'”
+        extra=Json({"value": level_pct, "threshold": threshold_alias}),
     )
     alarm_id = created.id
 
-    # 5) Publicar RAISED → listener → Telegram
+    # 5) Publicar RAISED → listener → Telegram (incluye timestamp)
     publish_raised(
-        alarm_id=alarm_id,
         asset_type="tank",
         asset_id=tank_id,
-        code=alarm_code_upper,              # listener lo pondrá en UPPER igual
-        severity=severity_db_lower,         # listener lo pondrá en UPPER al enviar
+        code=alarm_code_upper,
         message=message,
+        severity=severity_db_lower,
         value=level_pct,
         threshold=threshold_alias,
+        ts_raised=_iso(_utcnow()),
     )
 
-    # 6) (Opcional) si tenés columna tg_notified_at, la marcamos
+    # 6) (Opcional) marcar tg_notified_at
     try:
         from app.core.db import get_conn
         with get_conn() as conn, conn.cursor() as cur:
             cur.execute("UPDATE public.alarms SET tg_notified_at = now() WHERE id=%s", (alarm_id,))
             conn.commit()
     except Exception:
-        # Si la columna no existe o falla, no es crítico.
         pass
 
     return alarm_id
