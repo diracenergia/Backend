@@ -1,22 +1,31 @@
 # app/services/notify_alarm.py
 from __future__ import annotations
 
+import os
+import logging
 from typing import Optional
 
 from ..core.telegram import send_telegram  # sender asíncrono existente
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="ts=%(asctime)s level=%(levelname)s module=%(name)s msg=%(message)s",
+)
+log = logging.getLogger("notify-alarm")
 
 
 def _esc(s: str | None) -> str:
     if s is None:
         return ""
-    # Telegram en HTML
+    # Telegram HTML
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _equip_label(a: dict) -> str:
-    """
-    Etiqueta corta para el equipo (podés ajustar a tu modelo real).
-    """
     t = (a.get("asset_type") or "").lower()
     i = a.get("asset_id")
     if t == "tank":
@@ -30,9 +39,9 @@ def _equip_label(a: dict) -> str:
 
 def _norm_op(a: dict) -> str:
     op = (a.get("op") or a.get("operation") or "").upper()
-    if op in {"RAISE"}:
+    if op == "RAISE":
         return "RAISED"
-    if op in {"CLEAR"}:
+    if op == "CLEAR":
         return "CLEARED"
     return op
 
@@ -40,10 +49,11 @@ def _norm_op(a: dict) -> str:
 async def notify_alarm(a: dict) -> None:
     """
     Enviar SIEMPRE que venga un evento de cruce de umbral (RAISED/CLEARED).
-    Sin anti-flood, sin filtro de severidad.
+    Sin anti-flood, sin filtro de severidad. Con logs detallados.
     """
     op = _norm_op(a)
     if op not in {"RAISED", "CLEARED"}:
+        log.info("skip_send reason=op_not_threshold_cross op=%s", op)
         return
 
     equipo = _equip_label(a)
@@ -51,10 +61,7 @@ async def notify_alarm(a: dict) -> None:
     msg_text = a.get("message") or ("Alarma" if op == "RAISED" else "Alarma normalizada")
 
     # Timestamps “mejor esfuerzo”
-    ts = (
-        a.get("ts_raised") if op == "RAISED"
-        else a.get("ts_cleared") or a.get("ts") or ""
-    )
+    ts = a.get("ts_raised") if op == "RAISED" else (a.get("ts_cleared") or a.get("ts") or "")
 
     header = "ALERTA" if op == "RAISED" else "NORMALIZADA"
 
@@ -80,18 +87,17 @@ async def notify_alarm(a: dict) -> None:
         parts.append(f'<b>Hora:</b> {_esc(ts)}')
 
     text = "\n".join(parts)
-    await send_telegram(text)
 
-
-async def notify_ack(a: dict, user: str) -> None:
-    """
-    (Opcional) Notificación de ACK si más adelante la querés usar.
-    """
-    equipo = _equip_label(a)
-    code = (a.get("code") or "").upper()
-    text = (
-        f'🆗 <b>ACK</b> por <b>{_esc(user)}</b>\n'
-        f'<b>Equipo:</b> {_esc(equipo)}\n'
-        + (f'<b>Código:</b> {_esc(code)}\n' if code else "")
+    # Logs antes del envío
+    log.info(
+        "send_attempt op=%s equipo=%s code=%s severity=%s value=%s threshold=%s",
+        op, equipo, code or "-", sev or "-", value, threshold
     )
-    await send_telegram(text)
+
+    try:
+        # Nota: si send_telegram retorna algo, lo logueamos; si no, confirmamos sin valor.
+        result = await send_telegram(text)
+        log.info("send_done status=ok result=%s", result if result is not None else "none")
+    except Exception as e:
+        log.exception("send_error err=%s op=%s equipo=%s code=%s", e, op, equipo, code)
+        # No relanzamos; preferimos que el listener siga funcionando.
