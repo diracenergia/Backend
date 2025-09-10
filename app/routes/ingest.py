@@ -1,5 +1,7 @@
 # app/routes/ingest.py
 from typing import Any, Optional
+import logging
+import importlib
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from psycopg import errors as psy_errors
@@ -7,8 +9,9 @@ from psycopg import errors as psy_errors
 from app.schemas.ingest import TankIngestIn, TankIngestOut
 from app.repos import tanks as repo
 from app.core.security import device_id_dep
-from app.services.alarms_eval import eval_tank_alarm  # debe existir
 from app.repos.presence import bump_presence  # ✅ presencia online/offline
+
+log = logging.getLogger("ingest")
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
@@ -21,6 +24,26 @@ def _get_level_percent(saved: Any) -> Optional[float]:
     if hasattr(saved, "model_dump"):
         return saved.model_dump().get("level_percent")
     return getattr(saved, "level_percent", None)
+
+
+def _get_eval_fn():
+    """
+    Import perezoso para no tumbar la app si app.services.alarms_eval tiene un error.
+    Loguea el problema real si falla.
+    """
+    try:
+        mod = importlib.import_module("app.services.alarms_eval")
+        fn = getattr(mod, "eval_tank_alarm", None)
+        if not callable(fn):
+            raise AttributeError("eval_tank_alarm no encontrado/callable")
+        # Log de versión si el módulo la expone
+        ver = getattr(mod, "__VERSION__", None)
+        if ver:
+            log.info("alarms-eval module loaded version=%s", ver)
+        return fn
+    except Exception as e:
+        log.exception("import eval_tank_alarm failed err=%s", e)
+        return None
 
 
 @router.post("/tank", response_model=TankIngestOut, status_code=status.HTTP_201_CREATED)
@@ -68,7 +91,7 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
         )
     except Exception as e:
         # Log + 500 (no 503 genérico)
-        print(f"[ingest/tank] DB insert failed: {e}")
+        log.exception("[ingest/tank] DB insert failed err=%s", e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="ingest failed",
@@ -79,14 +102,19 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
         if device_id_db:
             bump_presence(device_id_db)
     except Exception as e:
-        print(f"[presence] bump failed: {e}")
+        log.warning("[presence] bump failed err=%s", e)
 
     # 5) Evaluación de alarmas (best-effort)
     try:
         lvl = _get_level_percent(saved)
-        print(f"[ingest] eval_tank_alarm tank={payload.tank_id} lvl={lvl}")
-        eval_tank_alarm(payload.tank_id, lvl)
+        log.info("[ingest] eval_tank_alarm tank=%s lvl=%s", payload.tank_id, lvl)
+
+        eval_fn = _get_eval_fn()
+        if not eval_fn:
+            log.warning("[ingest] eval_tank_alarm no disponible; ver logs de 'ingest'")
+        else:
+            eval_fn(payload.tank_id, lvl)
     except Exception as e:
-        print(f"[WARN] alarm eval failed: {e}")
+        log.warning("[WARN] alarm eval failed: %s", e)
 
     return saved
