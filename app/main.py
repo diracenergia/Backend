@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 
 # --- Config centralizada con fallback a .env ---
 try:
-    from app.core.config import settings  # opcional
+    from app.core.config import settings  # opcional (pydantic settings)
 except Exception:
     settings = None
     try:
@@ -27,10 +27,6 @@ def _get_env(name: str, default: str = "") -> str:
 
 
 # ===== CORS =====
-# CORS_ALLOW_ORIGINS admite:
-#   - "*"  -> todos los orígenes (válido porque no usamos cookies/sesión)
-#   - lista coma-separada: "https://a.com,https://b.com"
-# Opcional: CORS_ALLOW_ORIGIN_REGEX para patrones (p.ej. previews de Vercel).
 _raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
 _origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
 
@@ -41,12 +37,11 @@ else:
     ALLOW_ALL_ORIGINS = False
     ALLOWED_ORIGINS = [o.strip() for o in _raw.split(",") if o.strip()]
 
-ALLOW_CREDENTIALS = False  # si pasás a cookies/sesión -> True y NO uses "*"
-ALLOW_METHODS = ["*"]      # GET, POST, PUT, PATCH, DELETE, OPTIONS...
-ALLOW_HEADERS = ["*"]      # X-API-Key, Authorization, Content-Type, etc.
+ALLOW_CREDENTIALS = False
+ALLOW_METHODS = ["*"]
+ALLOW_HEADERS = ["*"]
 
 # ===== Trusted hosts (opcional) =====
-# p.ej.: TRUSTED_HOSTS="backend-v85n.onrender.com,.vercel.app,localhost,127.0.0.1"
 _trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
 TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
 
@@ -56,60 +51,54 @@ APP_VERSION = _get_env("APP_VERSION", "") or _get_env("RENDER_GIT_COMMIT", "")[:
 app = FastAPI(title=APP_TITLE, version=APP_VERSION or None)
 
 # Logs de arranque
-print("[CORS] allow_all       =", ALLOW_ALL_ORIGINS)
-print("[CORS] allow_origins   =", ALLOWED_ORIGINS)
+print("[CORS] allow_all          =", ALLOW_ALL_ORIGINS)
+print("[CORS] allow_origins      =", ALLOWED_ORIGINS)
 print("[CORS] allow_origin_regex =", _origin_regex or "(none)")
-print("[CORS] allow_credentials =", ALLOW_CREDENTIALS)
+print("[CORS] allow_credentials  =", ALLOW_CREDENTIALS)
 if TRUSTED_HOSTS:
     print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
 
-# Middlewares
+# ===== Middlewares =====
 if TRUSTED_HOSTS:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,          # ["*"] si _raw == "*"
+    allow_origins=ALLOWED_ORIGINS,
     allow_origin_regex=_origin_regex or None,
-    allow_credentials=ALLOW_CREDENTIALS,    # con True no podés usar "*"
+    allow_credentials=ALLOW_CREDENTIALS,
     allow_methods=ALLOW_METHODS,
     allow_headers=ALLOW_HEADERS,
 )
 
-# Compresión (útil para listas grandes / history)
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
-# --- Routers TANQUES ---
+# ===== Routers principales =====
 from app.routes.ingest import router as ingest_tank_router
 from app.routes.latest import router as latest_tank_router
 from app.routes.history import router as history_tank_router
 from app.routes.configs import router as configs_tank_router
 from app.routes.commands_tanks import router as commands_tank_router
 
-# --- Routers BOMBAS ---
 from app.routes.ingest_pump import router as ingest_pump_router
 from app.routes.latest_pump import router as latest_pump_router
 from app.routes.history_pump import router as history_pump_router
 from app.routes.configs_pump import router as configs_pump_router
 from app.routes.commands_pumps import router as commands_pump_router
 
-# --- Routers ALARMAS / AUDIT ---
 from app.routes.alarms import router as alarms_router
 from app.routes.audit import router as audit_router
 
-# --- Otros routers (tests / utilidades) ---
-from app.routes.test_telegram import router as test_router
-
-# --- Router opcional: CRUD de metadatos de tanques (/tanks GET/POST/PUT) ---
+# Router opcional: CRUD de metadatos de tanques
 try:
     from app.routes.tanks import router as tanks_router
 except Exception:
     tanks_router = None
 
-# --- 🔌 WebSocket telemetry router (ruta exacta /ws/telemetry) ---
+# 🔌 WebSocket telemetry router
 from app.ws import router as ws_router
 
-# --- Montaje de UI estática (opcional) ---
+# ===== Montaje de UI estática =====
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WEB_DIR = REPO_ROOT / "web"
 if WEB_DIR.exists():
@@ -117,33 +106,52 @@ if WEB_DIR.exists():
 else:
     print(f"⚠️ /ui deshabilitado: no existe {WEB_DIR}")
 
-# --- Incluir Routers (TANQUES) ---
+# ===== Incluir Routers =====
+# Tanques
 app.include_router(ingest_tank_router)
 app.include_router(latest_tank_router)
 app.include_router(history_tank_router)
 app.include_router(configs_tank_router)
 app.include_router(commands_tank_router)
 
-# --- Incluir Routers (BOMBAS) ---
+# Bombas
 app.include_router(ingest_pump_router)
 app.include_router(latest_pump_router)
 app.include_router(history_pump_router)
 app.include_router(configs_pump_router)
 app.include_router(commands_pump_router)
 
-# --- Incluir Router opcional (CRUD metadatos de tanques) ---
+# CRUD Tanques (opcional)
 if tanks_router:
     app.include_router(tanks_router)
 
-# --- Incluir Routers (ALARMAS / AUDIT / TEST) ---
+# Alarmas / Auditoría
 app.include_router(alarms_router)
 app.include_router(audit_router)
-app.include_router(test_router)
 
-# --- 🔌 Incluir WebSocket router (/ws/telemetry) ---
+# 🔧 Routers de test / diagnóstico
+try:
+    from app.routes.test_telegram import router as test_telegram_router
+    app.include_router(test_telegram_router)
+except Exception as e:
+    print(f"⚠️ test_telegram router no disponible: {e}")
+
+try:
+    from app.routes.test_alarm import router as test_alarm_router
+    app.include_router(test_alarm_router)
+except Exception as e:
+    print(f"⚠️ test_alarm router no disponible: {e}")
+
+try:
+    from app.routes.debug_alarm import router as debug_alarm_router
+    app.include_router(debug_alarm_router)
+except Exception as e:
+    print(f"⚠️ debug_alarm router no disponible: {e}")
+
+# 🔌 WebSocket
 app.include_router(ws_router)
 
-# --- Endpoints utilitarios ---
+# ===== Endpoints utilitarios =====
 from app.core.db import get_conn
 
 @app.get("/")
@@ -158,7 +166,6 @@ def root():
 
 @app.get("/favicon.ico")
 def favicon_noop():
-    # Evita 404 ruidoso si algún cliente pide favicon al backend
     return {}
 
 @app.get("/health")
@@ -177,7 +184,6 @@ def health_db():
 
 @app.get("/__config")
 def cfg_echo():
-    """Pequeño eco de configuración segura para diagnóstico."""
     return {
         "cors": {
             "allow_all": ALLOW_ALL_ORIGINS,
@@ -198,22 +204,12 @@ def tg_env():
         "CHAT": _get_env("TELEGRAM_CHAT_ID", ""),
     }
 
-# --- Conexión (diagnóstico) ---
-from app.routes.conn import router as conn_router
-app.include_router(conn_router)
-
-# --- (Opcional) Endpoints de debug del listener / prueba de NOTIFY ---
+# ===== Conexión (diagnóstico) =====
 try:
-    from app.routes.debug_alarm import router as debug_alarm_router  # /__alarm_listener_status
-    app.include_router(debug_alarm_router)
-except Exception:
-    pass
-
-try:
-    from app.routes.test_alarm import router as test_alarm_router      # /__test_alarm_notify
-    app.include_router(test_alarm_router)
-except Exception:
-    pass
+    from app.routes.conn import router as conn_router
+    app.include_router(conn_router)
+except Exception as e:
+    print(f"⚠️ conn router no disponible: {e}")
 
 # ===== Alarm Listener (LISTEN/NOTIFY → Telegram) =====
 try:
@@ -242,3 +238,18 @@ def _shutdown_listeners():
             print("[alarm-listener] stopped")
         except Exception as e:
             print(f"⚠️ error al detener alarm-listener: {e}")
+
+# ===== Endpoints de diagnóstico del listener =====
+@app.get("/__alarm_listener_status")
+def listener_status():
+    from app.services import alarm_listener as al
+    alive = al._thread.is_alive() if al._thread else False
+    sent_count = len(al._last_sent)
+    return {"alive": alive, "sent_cache": sent_count, "channel": al.CHAN}
+
+@app.post("/__alarm_listener_stop")
+def listener_stop():
+    if _HAS_ALARM_LISTENER and callable(stop_alarm_listener):
+        stop_alarm_listener()
+        return {"stopped": True}
+    return {"stopped": False, "error": "listener no disponible"}

@@ -1,49 +1,40 @@
+# app/repos/audit.py  (agregar)
+from typing import Optional, Any, Dict, List
+from psycopg.rows import dict_row
 from app.core.db import get_conn
-from psycopg.types.json import Json
 
-def insert_alarm_ack_event(user: str, asset_type: str, asset_id: int, code: str, severity: str, note: str | None):
-    asset_label = f"TK-{asset_id}" if asset_type == "tank" else f"PU-{asset_id}"
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO audit_events(
-                ts,"user",role,action,asset,details,result,
-                domain,asset_type,asset_id,code,severity,state
-            )
-            VALUES (
-                now(), %s, 'operator', 'ALARM', %s,
-                %s,
-                'ok',
-                'ALARM', %s, %s, %s, %s, 'ACKED'
-            )
-        """, (user, asset_label, Json({"note": note}), asset_type, asset_id, code, severity))
-        conn.commit()
+_TABLE = "public.audit_events"
+_COLS = ("id","ts","user","role","action","asset","details","result",
+         "domain","asset_type","asset_id","code","severity","state")
 
 def list_audit(
-    asset_type: str | None,
-    asset_id: int | None,
-    code: str | None,
-    state: str | None,
-    since,
-    until,
-    limit: int
-):
-    sql = """
-      SELECT ts, "user", role, action, asset, details, result,
-             domain, asset_type, asset_id, code, severity, state
-      FROM audit_events
-      WHERE 1=1
-    """
-    args: list = []
-    if asset_type: sql += " AND asset_type=%s"; args.append(asset_type)
-    if asset_id:   sql += " AND asset_id=%s";   args.append(asset_id)
-    if code:       sql += " AND code=%s";       args.append(code)
-    if state:      sql += " AND state=%s";      args.append(state)
-    if since:      sql += " AND ts >= %s";      args.append(since)
-    if until:      sql += " AND ts <  %s";      args.append(until)
-    sql += " ORDER BY ts DESC LIMIT %s"; args.append(limit)
+    asset_type: Optional[str] = None,
+    asset_id: Optional[int] = None,
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    since: Optional[str] = None,   # ISO-8601 o 'YYYY-MM-DD'
+    until: Optional[str] = None,   # idem
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    sql = f"SELECT {','.join(_COLS)} FROM {_TABLE} WHERE 1=1"
+    params: List[Any] = []
 
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql, args)
-        rows = cur.fetchall()
-        cols = [d[0] for d in cur.description]
-    return [dict(zip(cols, r)) for r in rows]
+    if asset_type:
+        sql += " AND asset_type = %s"; params.append(asset_type)
+    if asset_id is not None:
+        sql += " AND asset_id = %s"; params.append(asset_id)
+    if code:
+        sql += " AND code = %s"; params.append(code)
+    if state:
+        sql += " AND state = %s"; params.append(state)
+    if since:
+        sql += " AND ts >= %s"; params.append(since)
+    if until:
+        sql += " AND ts < %s"; params.append(until)
+
+    sql += " ORDER BY ts DESC, id DESC LIMIT %s"
+    params.append(limit)
+
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, tuple(params))
+        return cur.fetchall()

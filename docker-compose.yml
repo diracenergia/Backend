@@ -47,18 +47,31 @@ services:
     build: .
     container_name: bdd-api
     working_dir: /code
-    # ⬇️ CARGA todas las variables de .env (DB_URL, TELEGRAM_*, etc.)
     env_file:
       - ./.env
     environment:
       TZ: America/Argentina/Buenos_Aires
       RUN_ENV: docker
-      # deja DB_URL aquí por si no estuviera en .env (lo de .env lo pisa)
+
+      # DSN: definir AMBAS para que el listener encuentre DATABASE_URL
       DB_URL: postgresql://postgres:postgres@db:5432/munirdls
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/munirdls
+
+      # CORS
       CORS_ALLOW_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+
+      # MQTT
       MQTT_HOST: mosquitto
       MQTT_PORT: 1883
+
+      # WebSocket
       WS_ALLOWED_ORIGINS: "*"
+
+      # Telegram / Listener
+      TELEGRAM_ENABLED: "true"
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set_in_.env}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:?set_in_.env}
+      ALARM_NOTIFY_CHANNEL: alarm_events
     command: >
       bash -lc "uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
     volumes:
@@ -72,7 +85,6 @@ services:
         condition: service_healthy
       mosquitto:
         condition: service_started
-    # ⚠️ Si tu imagen no tiene curl, quita este healthcheck o instálalo en el Dockerfile
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
       interval: 10s
@@ -90,13 +102,29 @@ services:
     environment:
       TZ: America/Argentina/Buenos_Aires
       RUN_ENV: docker
+
+      # DSN (mismo comentario que arriba)
       DB_URL: postgresql://postgres:postgres@db:5432/munirdls
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/munirdls
+
+      # CORS
       CORS_ALLOW_ORIGINS: http://localhost:5173,*
+
+      # MQTT
       MQTT_HOST: mosquitto
       MQTT_PORT: 1883
+
+      # WebSocket
       WS_ALLOWED_ORIGINS: "*"
+
+      # Telegram / Listener
+      TELEGRAM_ENABLED: "true"
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set_in_.env}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:?set_in_.env}
+      ALARM_NOTIFY_CHANNEL: alarm_events
+    # ⚠️ 1 worker para evitar mensajes duplicados del listener
     command: >
-      bash -lc "uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2"
+      bash -lc "uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1"
     ports:
       - "8000:8000"
     depends_on:
