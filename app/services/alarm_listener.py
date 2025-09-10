@@ -1,11 +1,11 @@
 # app/services/alarm_listener.py
 from __future__ import annotations
 
-import os, json, time, threading, logging, queue
-from typing import Optional, Dict, Any
+import os, json, time, threading, logging, queue, inspect
+from typing import Optional, Dict, Any, Callable, Tuple
 
 from app.core.db import get_conn
-from app.services import notify_alarm  # sender a Telegram
+from app.services import notify_alarm  # tu sender a Telegram
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -15,7 +15,7 @@ logging.basicConfig(
 log = logging.getLogger("alarm-listener")
 
 CHAN = os.getenv("ALARM_NOTIFY_CHANNEL", "alarm_events")
-__VERSION__ = "alist-2025-09-10T13:45Z"
+__VERSION__ = "alist-2025-09-10T14:05Z"
 
 # Estado interno
 _thread: Optional[threading.Thread] = None
@@ -61,24 +61,82 @@ def _dispatch(evt: Dict[str, Any]) -> None:
         log.exception("dispatch error err=%s evt=%r", e, evt)
 
 
-def _get_notifies_queue(conn):
+# ---------- Soporte multi-API de psycopg3 para notifies ----------
+
+def _supports_timeout(fn: Callable) -> bool:
+    """Detecta si la función acepta 'timeout' en la firma."""
+    try:
+        sig = inspect.signature(fn)
+        return any(p.kind in (p.KEYWORD_ONLY, p.POSITIONAL_OR_KEYWORD) and p.name == "timeout"
+                   for p in sig.parameters.values())
+    except Exception:
+        return False
+
+
+def _get_notifies_source(conn) -> Tuple[str, object, Optional[Callable[[], object]]]:
     """
-    Soporta ambas APIs:
-      - psycopg3 habitual: conn.notifies  -> queue-like
-      - otras builds:     conn.notifies() -> queue-like
+    Devuelve (mode, obj, factory)
+      - mode 'queue'     -> obj tiene .get(timeout)
+      - mode 'gen_to'    -> obj es generator creado con timeout (factory recrea)
+      - mode 'gen_block' -> obj es generator sin timeout (factory recrea)
     """
     attr = getattr(conn, "notifies", None)
     if attr is None:
         raise AttributeError("connection has no 'notifies'")
-    if callable(attr):
-        # tu caso actual: es una función que devuelve la cola
-        q = attr()
-        log.info("notifies source=function -> queue=%s", type(q).__name__)
-        return q
-    # caso estándar: atributo queue-like
-    log.info("notifies source=attribute -> queue=%s", type(attr).__name__)
-    return attr
 
+    # Caso 1: atributo queue-like
+    if not callable(attr):
+        if hasattr(attr, "get"):
+            log.info("notifies mode=queue type=%s", type(attr).__name__)
+            return "queue", attr, None
+        # atributo pero no queue: raro
+        log.warning("notifies attribute inesperado type=%s", type(attr).__name__)
+        return "unknown_attr", attr, None
+
+    # Caso 2: callable -> intentamos con timeout
+    mode = "gen_block"
+    factory: Optional[Callable[[], object]] = None
+
+    if _supports_timeout(attr):
+        # usa timeout kw si lo soporta
+        def factory_timeout():
+            return attr(timeout=5.0)
+        obj = factory_timeout()
+        mode = "gen_to"
+        factory = factory_timeout
+        log.info("notifies mode=gen_to (callable con timeout) obj=%s", type(obj).__name__)
+    else:
+        # sin timeout (bloqueante)
+        def factory_block():
+            return attr()
+        obj = factory_block()
+        mode = "gen_block"
+        factory = factory_block
+        log.info("notifies mode=gen_block (callable sin timeout) obj=%s", type(obj).__name__)
+
+    return mode, obj, factory
+
+
+def _next_notify_gen(gen_obj, factory: Optional[Callable[[], object]]):
+    """
+    Avanza un generator de notifies. Si termina, lo recrea vía factory.
+    Devuelve (notify, gen_obj_actualizado)
+    """
+    try:
+        notify = next(gen_obj)
+        return notify, gen_obj
+    except StopIteration:
+        # volvemos a crear el generator
+        if factory:
+            gen_obj = factory()
+            return None, gen_obj
+        return None, gen_obj
+    except Exception as e:
+        log.exception("generator next error err=%s", e)
+        return None, gen_obj
+
+
+# ---------- Loop principal ----------
 
 def _listen_once() -> None:
     log.info("db_conn opening channel=%s version=%s", CHAN, __VERSION__)
@@ -90,22 +148,46 @@ def _listen_once() -> None:
             pass
         log.info("listen_subscribed channel=%s", CHAN)
 
-        q = _get_notifies_queue(conn)
+        mode, source, factory = _get_notifies_source(conn)
+        last_idle = time.time()
 
-        last_log = time.time()
         while not _stop.is_set():
             try:
-                notify = q.get(timeout=5.0)
+                if mode == "queue":
+                    # Queue-like API
+                    notify = source.get(timeout=5.0)  # type: ignore[attr-defined]
+                elif mode in ("gen_to", "gen_block"):
+                    # Generator API
+                    notify, source = _next_notify_gen(source, factory)  # type: ignore[assignment]
+                    if notify is None:
+                        # sin evento; damos oportunidad a salir
+                        if mode == "gen_block":
+                            # en gen_block no hay timeout: evitamos busy-loop
+                            time.sleep(0.05)
+                        # log de idle cada 60s
+                        now = time.time()
+                        if now - last_idle > 60:
+                            log.info("idle waiting channel=%s mode=%s", CHAN, mode)
+                            last_idle = now
+                        continue
+                else:
+                    # fallback muy raro: dormimos y reintentamos
+                    time.sleep(0.5)
+                    continue
             except queue.Empty:
+                # queue con timeout sin eventos
                 now = time.time()
-                if now - last_log > 60:
-                    log.info("idle waiting channel=%s", CHAN)
-                    last_log = now
+                if now - last_idle > 60:
+                    log.info("idle waiting channel=%s mode=%s", CHAN, mode)
+                    last_idle = now
                 continue
             except Exception as e:
-                log.exception("notifies.get error err=%s", e)
+                log.exception("notifies error err=%s mode=%s", e, mode)
+                # Pequeño sleep para evitar loop caliente ante error repetido
+                time.sleep(0.1)
                 continue
 
+            # Tenemos un notify
             try:
                 pid = getattr(notify, "pid", None)
                 payload = getattr(notify, "payload", None)
