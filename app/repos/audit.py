@@ -1,49 +1,43 @@
+# app/repos/audit.py
+from __future__ import annotations
+from typing import Optional, Any, Dict, List
+from datetime import datetime, timezone
+from psycopg.rows import dict_row
 from app.core.db import get_conn
-from psycopg.types.json import Json
 
-def insert_alarm_ack_event(user: str, asset_type: str, asset_id: int, code: str, severity: str, note: str | None):
-    asset_label = f"TK-{asset_id}" if asset_type == "tank" else f"PU-{asset_id}"
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO audit_events(
-                ts,"user",role,action,asset,details,result,
-                domain,asset_type,asset_id,code,severity,state
-            )
-            VALUES (
-                now(), %s, 'operator', 'ALARM', %s,
-                %s,
-                'ok',
-                'ALARM', %s, %s, %s, %s, 'ACKED'
-            )
-        """, (user, asset_label, Json({"note": note}), asset_type, asset_id, code, severity))
-        conn.commit()
+_TABLE = "public.audit_events"
+_COLS = ("id","ts","user","role","action","asset","details","result",
+         "domain","asset_type","asset_id","code","severity","state")
 
-def list_audit(
-    asset_type: str | None,
-    asset_id: int | None,
-    code: str | None,
-    state: str | None,
-    since,
-    until,
-    limit: int
+def log(
+    *, ts: Optional[datetime]=None,
+    asset_type: str, asset_id: int,
+    code: str, severity: str, state: str,
+    details: Optional[Dict[str, Any]] = None,
+    user: Optional[str] = None, role: Optional[str] = None,
+    action: Optional[str] = None, asset: Optional[str] = None,
+    result: Optional[str] = None, domain: str = "AUDIT",
 ):
-    sql = """
-      SELECT ts, "user", role, action, asset, details, result,
-             domain, asset_type, asset_id, code, severity, state
-      FROM audit_events
-      WHERE 1=1
     """
-    args: list = []
-    if asset_type: sql += " AND asset_type=%s"; args.append(asset_type)
-    if asset_id:   sql += " AND asset_id=%s";   args.append(asset_id)
-    if code:       sql += " AND code=%s";       args.append(code)
-    if state:      sql += " AND state=%s";      args.append(state)
-    if since:      sql += " AND ts >= %s";      args.append(since)
-    if until:      sql += " AND ts <  %s";      args.append(until)
-    sql += " ORDER BY ts DESC LIMIT %s"; args.append(limit)
+    Inserta una fila en audit_events. Los campos no usados quedan NULL.
+    """
+    ts = ts or datetime.now(timezone.utc)
+    sql = f"""
+      INSERT INTO {_TABLE}
+        (ts, "user", role, action, asset, details, result, domain,
+         asset_type, asset_id, code, severity, state)
+      VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+      RETURNING {",".join(_COLS)};
+    """
+    params = (ts, user, role, action, asset, details, result, domain,
+              asset_type, asset_id, code, severity, state)
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, params)
+        conn.commit()
+        return cur.fetchone() or {}
 
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql, args)
-        rows = cur.fetchall()
-        cols = [d[0] for d in cur.description]
-    return [dict(zip(cols, r)) for r in rows]
+def list_recent(limit: int = 100) -> List[Dict[str, Any]]:
+    sql = f"SELECT {','.join(_COLS)} FROM {_TABLE} ORDER BY ts DESC, id DESC LIMIT %s;"
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, (limit,))
+        return cur.fetchall()
