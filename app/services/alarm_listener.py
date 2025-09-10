@@ -3,208 +3,150 @@ from __future__ import annotations
 
 import os
 import json
-import time
-import asyncio
 import select
 from threading import Thread, Event
-from html import escape
-from time import monotonic
-from typing import Optional, Dict, Any
+from typing import Optional
 
 import psycopg  # v3
-from app.core.telegram import send_telegram as tg_send_async  # tu sender async
-from app.core.db import get_conn
 
-# =========================
+from app.core.db import EVENTS_DSN  # DSN especial para LISTEN/NOTIFY
+from app.services.notify_alarm import notify_alarm  # nuestro notifier async
+import asyncio
+
+
+# -----------------------------------------------------------------------------
 # Config
-# =========================
-CHAN = os.getenv("ALARM_NOTIFY_CHANNEL", "alarm_events")
-DSN  = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
+# -----------------------------------------------------------------------------
+CHANNEL = (os.getenv("ALARM_NOTIFY_CHANNEL") or "alarm_events").strip()
 
-# =========================
-# Estado global
-# =========================
-_stop_evt: Optional[Event] = None
+# Thread y stop flag
 _thread: Optional[Thread] = None
+_stop_evt: Optional[Event] = None
 
-# Anti-spam / dedupe por alarm_id
-_SEV_RANK = {"INFO": 1, "WARNING": 2, "CRITICAL": 3}
-_last_sent: Dict[int, Dict[str, Any]] = {}   # alarm_id -> {op, sev, th, t}
 
-# =========================
+# -----------------------------------------------------------------------------
 # Helpers
-# =========================
-def _fmt_asset(asset_type: Optional[str], asset_id: Optional[int]) -> str:
-    at = (asset_type or "").lower()
-    prefix = {"tank": "TK", "pump": "PU", "valve": "VL"}.get(at, (at[:2] or "AS").upper())
-    return f"{prefix}-{asset_id or 0}"
+# -----------------------------------------------------------------------------
+def _debug(msg: str) -> None:
+    print(f"[alarm-listener] {msg}")
 
-def _fetch_alarm(alarm_id: Optional[int]) -> Optional[dict]:
-    if not alarm_id:
-        return None
+
+def _parse_payload(raw: str) -> Optional[dict]:
     try:
-        with get_conn() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, asset_type, asset_id, code, severity, message, is_active, extra
-                  FROM public.alarms
-                 WHERE id = %s
-                """,
-                (alarm_id,),
-            )
-            row = cur.fetchone()
-            if not row:
-                return None
-            cols = [d[0] for d in cur.description]
-            return dict(zip(cols, row))
+        return json.loads(raw)
     except Exception as e:
-        print(f"[alarm-listener] fetch alarm {alarm_id} error: {e}")
+        _debug(f"❌ JSON inválido: {e} raw={raw[:200]}")
         return None
 
-def _html_from(payload: dict, alarm: Optional[dict]) -> str:
-    op         = (payload.get("op") or "").upper()            # RAISED | UPDATED | CLEARED
-    alarm_id   = payload.get("alarm_id")
-    asset_type = payload.get("asset_type") or (alarm and alarm.get("asset_type"))
-    asset_id   = payload.get("asset_id")   or (alarm and alarm.get("asset_id"))
-    code       = payload.get("code")       or (alarm and alarm.get("code"))
-    severity   = (payload.get("severity") or (alarm and alarm.get("severity","")) or "").upper()
-    threshold  = payload.get("threshold")  or (
-        alarm and isinstance(alarm.get("extra"), dict) and alarm["extra"].get("threshold")
-    ) or ""
-    message    = (payload.get("message") or (alarm and alarm.get("message")) or "")
 
-    emoji      = {"RAISED": "🚨", "UPDATED": "🔺", "CLEARED": "✅"}.get(op, "ℹ️")
-    asset_lbl  = _fmt_asset(asset_type, asset_id)
-
-    parts = [
-        f"{emoji} <b>{escape(op)}</b> · <code>{escape(asset_lbl)}</code> · <code>{escape(str(code or ''))}</code>",
-        f"<b>{escape(severity)}</b>" if severity else "",
-        escape(message) if message else "",
-        f"<i>threshold:</i> {escape(str(threshold))}" if threshold else "",
-        f"<i>id:</i> <code>{escape(str(alarm_id))}</code>" if alarm_id else "",
-    ]
-    return "\n".join(p for p in parts if p)
-
-def _should_send(payload: dict, alarm: Optional[dict]) -> bool:
+def _should_send(payload: dict) -> bool:
     """
-    Reglas anti-spam:
-      - Enviamos 1 sola vez por RAISED (por alarm_id).
-      - Enviamos siempre el CLEARED (pero no repetido).
-      - UPDATED solo si escala severidad o cambia threshold.
+    Enviamos SIEMPRE cruces de umbral:
+      - RAISED: se cruzó el umbral
+      - CLEARED: volvió a la normalidad
+    No deduplicamos ni aplicamos anti-spam acá.
     """
-    op = (payload.get("op") or "").upper()
-    alarm_id = payload.get("alarm_id")
-    if not alarm_id:
-        return True  # sin ID no podemos dedup → preferimos enviar
-
-    sev = (payload.get("severity") or (alarm and alarm.get("severity","")) or "").upper()
-    th  = payload.get("threshold") or (
-        alarm and isinstance(alarm.get("extra"), dict) and alarm["extra"].get("threshold")
-    ) or ""
-
-    prev = _last_sent.get(alarm_id)
-
-    if op == "RAISED":
-        if prev and prev.get("op") == "RAISED":
-            return False
-        _last_sent[alarm_id] = {"op": "RAISED", "sev": sev, "th": th, "t": monotonic()}
+    op = (payload.get("op") or payload.get("operation") or "").upper()
+    # Permitimos también alias comunes por si el publisher manda variantes.
+    if op in {"RAISED", "RAISE"}:
         return True
-
-    if op == "UPDATED":
-        if not prev:
-            _last_sent[alarm_id] = {"op": "UPDATED", "sev": sev, "th": th, "t": monotonic()}
-            return True
-        if _SEV_RANK.get(sev, 0) > _SEV_RANK.get(prev.get("sev",""), 0) or th != prev.get("th"):
-            _last_sent[alarm_id] = {"op": "UPDATED", "sev": sev, "th": th, "t": monotonic()}
-            return True
-        return False
-
-    if op == "CLEARED":
-        if prev and prev.get("op") == "CLEARED":
-            return False
-        _last_sent[alarm_id] = {"op": "CLEARED", "sev": sev, "th": th, "t": monotonic()}
-        return True
-
-    # Desconocidos: enviar una vez
-    if not prev:
-        _last_sent[alarm_id] = {"op": op, "sev": sev, "th": th, "t": monotonic()}
+    if op in {"CLEARED", "CLEAR"}:
         return True
     return False
 
-def _send_to_telegram(text: str) -> None:
+
+async def _dispatch_async(payload: dict) -> None:
     try:
-        res = asyncio.run(tg_send_async(text))
-        print("[alarm-listener] tg result:", res)
+        await notify_alarm(payload)
     except Exception as e:
-        print(f"[alarm-listener] telegram send error: {e}")
+        _debug(f"❌ error en notify_alarm: {e}")
 
-def _handle_payload(payload: dict):
-    alarm = _fetch_alarm(payload.get("alarm_id"))
-    if not _should_send(payload, alarm):
-        # suprimido por anti-spam
+
+def _listen_loop(stop_evt: Event) -> None:
+    """
+    Hilo bloqueante que hace LISTEN al canal y despacha a notify_alarm.
+    Usa select() para esperar notificaciones sin ocupar CPU.
+    """
+    _debug(f"iniciando loop; canal={CHANNEL}")
+
+    # Un event loop propio para nuestras corrutinas
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # Conexión en autocommit para que reciba notificaciones inmediatamente
+    try:
+        conn = psycopg.connect(EVENTS_DSN, autocommit=True, application_name="alarm-listener")
+    except Exception as e:
+        _debug(f"❌ no se pudo conectar a EVENTS_DSN: {e}")
         return
-    text = _html_from(payload, alarm)
-    _send_to_telegram(text)
 
-# =========================
-# Loop principal
-# =========================
-def _listen_loop(stop_evt: Event):
-    if not DSN:
-        print("[alarm-listener] ❌ faltan credenciales DB: set DATABASE_URL o DB_URL")
-        return
-
-    backoff = 1.0
-    while not stop_evt.is_set():
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f'LISTEN "{CHANNEL}";')
+        _debug("LISTEN suscripto correctamente")
+    except Exception as e:
+        _debug(f"❌ error al suscribirse a LISTEN {CHANNEL}: {e}")
         try:
-            with psycopg.connect(DSN, autocommit=True, application_name="alarm-listener") as conn:
-                with conn.cursor() as cur:
-                    cur.execute(f"LISTEN {CHAN};")
-                print(f"[alarm-listener] ✅ listening on '{CHAN}'")
+            conn.close()
+        except Exception:
+            pass
+        return
 
-                fd = conn.pgconn.socket  # file descriptor del socket libpq
-                backoff = 1.0  # reset backoff al conectar
+    try:
+        fd = conn.fileno()
+        while not stop_evt.is_set():
+            # Espera hasta 2s por actividad de socket para poder chequear el stop flag
+            ready, _, _ = select.select([fd], [], [], 2.0)
+            if not ready:
+                continue
 
-                while not stop_evt.is_set():
-                    # Espera hasta 1s por datos
-                    r, _, _ = select.select([fd], [], [], 1.0)
-                    if r:
-                        # Traer datos del socket a psycopg y preparar notificaciones
-                        conn.pgconn.consume_input()
-                        conn.poll()  # IMPORTANTE: hace visibles las notifies()
+            # Trae notificaciones pendientes
+            conn.poll()
+            while conn.notifies:
+                n = conn.notifies.pop(0)
+                raw = n.payload or ""
+                payload = _parse_payload(raw)
+                if not payload:
+                    continue
 
-                    # Drenar notificaciones
-                    for notify in conn.notifies():
-                        try:
-                            payload = json.loads(notify.payload)
-                            print("[alarm-listener] recv:", payload)
-                        except Exception as e:
-                            print("[alarm-listener] bad payload:", notify.payload, e)
-                            continue
-                        _handle_payload(payload)
+                if _should_send(payload):
+                    loop.create_task(_dispatch_async(payload))
+                else:
+                    # Mensajes que no son cruces de umbral (UPDATE, ACK, etc.)
+                    pass
+    except Exception as e:
+        _debug(f"❌ loop error: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        try:
+            loop.stop()
+            loop.close()
+        except Exception:
+            pass
+        _debug("loop finalizado")
 
-        except Exception as e:
-            print(f"[alarm-listener] error de conexión/loop: {e}")
-            # backoff exponencial suave hasta 10s
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 10.0)
 
-# =========================
-# Control público
-# =========================
-def start_alarm_listener():
-    global _stop_evt, _thread
+# -----------------------------------------------------------------------------
+# API pública
+# -----------------------------------------------------------------------------
+def start_alarm_listener() -> None:
+    global _thread, _stop_evt
     if _thread and _thread.is_alive():
+        _debug("ya estaba iniciado")
         return
     _stop_evt = Event()
     _thread = Thread(target=_listen_loop, args=(_stop_evt,), daemon=True)
     _thread.start()
-    print("[alarm-listener] started")
+    _debug("started")
 
-def stop_alarm_listener():
-    global _stop_evt, _thread
+
+def stop_alarm_listener() -> None:
+    global _thread, _stop_evt
     if _stop_evt:
         _stop_evt.set()
     if _thread:
-        _thread.join(timeout=2)
-    print("[alarm-listener] stopped")
+        _thread.join(timeout=2.0)
+    _debug("stopped")
