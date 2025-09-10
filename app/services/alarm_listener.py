@@ -1,17 +1,10 @@
 # app/services/alarm_listener.py
 from __future__ import annotations
-
 import os, json, time, threading, logging
 from typing import Optional, Dict, Any
-import psycopg
 
-# NO usamos get_conn aquí para evitar pool/pgbouncer en modo "transaction"
-# Usa una conexión dedicada en modo sesión.
-def _connect_listen():
-    dsn = os.getenv("DATABASE_URL_LISTEN") or os.getenv("DATABASE_URL")
-    # autocommit=True para que LISTEN quede activo sin depender de transacciones
-    conn = psycopg.connect(dsn, autocommit=True, application_name="alarm-listener")
-    return conn
+from app.core.db import get_events_conn  # ⬅️ usar la conexión directa
+from app.services import notify_alarm
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -21,6 +14,7 @@ logging.basicConfig(
 log = logging.getLogger("alarm-listener")
 
 CHAN = os.getenv("ALARM_NOTIFY_CHANNEL", "alarm_events")
+
 _thread: Optional[threading.Thread] = None
 _stop = threading.Event()
 _last_sent: list[dict] = []
@@ -28,31 +22,23 @@ _last_sent: list[dict] = []
 _RETRY_BASE = 1.5
 _RETRY_MAX = 30.0
 
-from app.services import notify_alarm
-
 def _decode_payload(payload: str) -> Dict[str, Any]:
     try:
         data = json.loads(payload)
-        if not isinstance(data, dict):
-            raise ValueError("payload no es dict")
-        return data
+        return data if isinstance(data, dict) else {}
     except Exception as e:
-        log.exception("decode error err=%s payload_head=%r", e, payload[:200])
+        log.exception("decode error err=%s payload=%r", e, payload[:200])
         return {}
 
 def _should_send(evt: Dict[str, Any]) -> bool:
     op = evt.get("op")
-    ok = bool(op in ("RAISED", "CLEARED")
-              and evt.get("asset_type")
-              and evt.get("asset_id") is not None
-              and evt.get("code"))
+    ok = bool(op in ("RAISED", "CLEARED") and evt.get("asset_type") and evt.get("asset_id") is not None and evt.get("code"))
     log.info("should_send op=%s decision=%s", op, ok)
     return ok
 
 def _dispatch(evt: Dict[str, Any]) -> None:
     try:
-        log.info("dispatch start op=%s asset=%s-%s code=%s",
-                 evt.get("op"), evt.get("asset_type"), evt.get("asset_id"), evt.get("code"))
+        log.info("dispatch start op=%s asset=%s-%s code=%s", evt.get("op"), evt.get("asset_type"), evt.get("asset_id"), evt.get("code"))
         status = notify_alarm.send(evt)
         _last_sent.append({"ts": time.time(), "evt": evt, "status": status})
         if len(_last_sent) > 100:
@@ -62,34 +48,26 @@ def _dispatch(evt: Dict[str, Any]) -> None:
         log.exception("dispatch error err=%s evt=%r", e, evt)
 
 def _listen_once() -> None:
-    log.info("db_conn opening channel=%s", CHAN)
-    with _connect_listen() as conn, conn.cursor() as cur:
-        # Diagnóstico de dónde estamos conectados
-        cur.execute("select current_database(), inet_server_addr(), inet_server_port(), version()")
-        db, host, port, ver = cur.fetchone()
-        log.info("db_conn info db=%s host=%s port=%s ver=%s", db, host, port, ver.splitlines()[0])
-
+    log.info("db_conn opening(channel=%s)", CHAN)
+    with get_events_conn() as conn, conn.cursor() as cur:
         cur.execute(f'LISTEN "{CHAN}"')
-        log.info("listen_subscribed channel=%s", CHAN)
+        # autocommit=True en la conexión; no hace falta commit extra
+        log.info("listen_subscribed channel=%s dsn=%s", CHAN, getattr(conn, "dsn", "<hidden>"))
 
         while not _stop.is_set():
             try:
-                got = 0
-                for notify in conn.notifies(timeout=5.0):  # generador psycopg3
-                    got += 1
-                    payload = getattr(notify, "payload", "")
-                    log.info("notify_recv pid=%s payload_len=%s", getattr(notify, "pid", None), len(payload))
-                    evt = _decode_payload(payload)
-                    if not evt:
-                        continue
-                    if _should_send(evt):
+                # psycopg3: iterador de notificaciones
+                for notify in conn.notifies(timeout=5.0):
+                    log.info("notify_recv pid=%s payload_len=%s", getattr(notify, "pid", None), len(notify.payload))
+                    evt = _decode_payload(notify.payload)
+                    if evt and _should_send(evt):
                         _dispatch(evt)
-                if got == 0:
-                    log.debug("notify_poll timeout=5s (no events)")
+            except TimeoutError:
+                # quiet period; seguir
+                continue
             except Exception as e:
                 log.exception("notifies loop error err=%s", e)
-                time.sleep(0.5)
-
+                break
     log.info("db_conn closed")
 
 def _listen_loop() -> None:
@@ -101,9 +79,9 @@ def _listen_loop() -> None:
         except Exception as e:
             attempt += 1
             wait_s = min(_RETRY_MAX, _RETRY_BASE ** attempt)
-            log.exception("loop error err=%r; retrying in %.1fs", e, wait_s)
-            t0 = time.time()
-            while time.time() - t0 < wait_s and not _stop.is_set():
+            log.exception("loop error err=%r; retry in %.1fs", e, wait_s)
+            t_end = time.time() + wait_s
+            while time.time() < t_end and not _stop.is_set():
                 time.sleep(0.1)
     log.info("loop stopped")
 
