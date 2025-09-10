@@ -7,14 +7,38 @@ from typing import Any, Mapping, Optional
 
 import psycopg  # psycopg v3
 
+# Usamos el DSN especial para eventos (session pooler o directo)
+from app.core.db import EVENTS_DSN
+
+
+def _clean(v: Optional[str]) -> str:
+    return (v or "").strip()
+
 
 # Canal y DSN
-_CHANNEL = os.getenv("ALARM_NOTIFY_CHANNEL", "alarm_events")
-_DSN = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
+_CHANNEL = _clean(os.getenv("ALARM_NOTIFY_CHANNEL") or "alarm_events")
+_DSN = _clean(EVENTS_DSN)  # viene ya limpio desde core/db.py
 
 
 def _norm_upper(s: Optional[str]) -> str:
     return (s or "").upper()
+
+
+def _norm_op(op: Optional[str]) -> str:
+    """
+    Acepta alias y normaliza al contrato del listener:
+    'RAISE' | 'CLEAR' | 'ACK' | 'UPDATE'
+    """
+    o = _norm_upper(op)
+    if o in {"RAISE", "RAISED"}:
+        return "RAISE"
+    if o in {"CLEAR", "CLEARED"}:
+        return "CLEAR"
+    if o in {"ACK", "ACKED"}:
+        return "ACK"
+    if o in {"UPDATE", "UPDATED"}:
+        return "UPDATE"
+    return o or "UPDATE"
 
 
 def _debug(msg: str) -> None:
@@ -24,27 +48,15 @@ def _debug(msg: str) -> None:
 def publish_alarm_event(payload: Mapping[str, Any]) -> None:
     """
     Publica un evento JSON en el canal de Postgres para que lo escuche el alarm_listener.
-    Requiere que DATABASE_URL/DB_URL apunte a la MISMA DB donde corre el listener.
-
-    payload esperado (keys principales):
-      - op: 'RAISED' | 'UPDATED' | 'CLEARED'
-      - asset_type: 'tank' | 'pump' | 'valve' | ...
-      - asset_id: int
-      - code: p.ej. 'HIGH_HIGH', 'LEVEL' (se normaliza a MAYÚSCULAS)
-      - severity: 'CRITICAL' | 'WARNING' | 'INFO' (se normaliza a MAYÚSCULAS)
-      - message: str (opcional)
-      - threshold: str (opcional)
-      - value: num (opcional)
-      - alarm_id: int (opcional pero MUY recomendado para dedupe en listener)
+    Requiere que EVENTS_DSN apunte a una conexión que soporte LISTEN/NOTIFY.
     """
     if not _DSN:
-        _debug("❌ falta DATABASE_URL/DB_URL; NO se publica evento")
+        _debug("❌ falta EVENTS_DSN/DATABASE_URL; NO se publica evento")
         return
 
-    # Normalizamos los campos clave sin mutar el input original
-    norm_payload = dict(payload)
-    if "op" in norm_payload:
-        norm_payload["op"] = _norm_upper(norm_payload.get("op"))
+    # Copiamos y normalizamos sin mutar el input
+    norm_payload: dict[str, Any] = dict(payload)
+    norm_payload["op"] = _norm_op(norm_payload.get("op"))
     if "code" in norm_payload:
         norm_payload["code"] = _norm_upper(norm_payload.get("code"))
     if "severity" in norm_payload:
@@ -57,7 +69,7 @@ def publish_alarm_event(payload: Mapping[str, Any]) -> None:
         return
 
     try:
-        # Usamos autocommit para que pg_notify se emita inmediatamente
+        # autocommit=True para que pg_notify salga inmediatamente
         with psycopg.connect(_DSN, autocommit=True, application_name="alarm-publisher") as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT pg_notify(%s, %s);", (_CHANNEL, msg))
@@ -78,11 +90,9 @@ def publish_raised(
     threshold: Optional[str] = None,
     extra: Optional[Mapping[str, Any]] = None,
 ) -> None:
-    """
-    Publica un evento RAISED (alarma levantada).
-    """
-    payload = {
-        "op": "RAISED",
+    """Evento RAISE (alarma levantada)."""
+    payload: dict[str, Any] = {
+        "op": "RAISE",
         "asset_type": asset_type,
         "asset_id": asset_id,
         "code": code,
@@ -109,11 +119,9 @@ def publish_cleared(
     threshold: Optional[str] = None,
     extra: Optional[Mapping[str, Any]] = None,
 ) -> None:
-    """
-    Publica un evento CLEARED (alarma limpiada).
-    """
-    payload = {
-        "op": "CLEARED",
+    """Evento CLEAR (alarma limpia)."""
+    payload: dict[str, Any] = {
+        "op": "CLEAR",
         "asset_type": asset_type,
         "asset_id": asset_id,
         "code": code,
@@ -128,7 +136,31 @@ def publish_cleared(
     publish_alarm_event(payload)
 
 
-# (Opcional) por si querés avisar cambios de estado sin clear/raise nuevos:
+def publish_ack(
+    *,
+    alarm_id: int,
+    asset_type: str,
+    asset_id: int,
+    code: str,
+    severity: str,
+    message: str = "",
+    extra: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Evento ACK (confirmación)."""
+    payload: dict[str, Any] = {
+        "op": "ACK",
+        "asset_type": asset_type,
+        "asset_id": asset_id,
+        "code": code,
+        "severity": severity,
+        "message": message or "",
+        "alarm_id": alarm_id,
+    }
+    if extra:
+        payload.update(extra)
+    publish_alarm_event(payload)
+
+
 def publish_updated(
     *,
     alarm_id: int,
@@ -141,12 +173,9 @@ def publish_updated(
     threshold: Optional[str] = None,
     extra: Optional[Mapping[str, Any]] = None,
 ) -> None:
-    """
-    Publica un evento UPDATED (p.ej. escaló la severidad o cambió el umbral).
-    El listener por defecto suele filtrar UPDATED salvo que haya cambios relevantes.
-    """
-    payload = {
-        "op": "UPDATED",
+    """Evento UPDATE (p.ej. cambio de severidad/umbral)."""
+    payload: dict[str, Any] = {
+        "op": "UPDATE",
         "asset_type": asset_type,
         "asset_id": asset_id,
         "code": code,

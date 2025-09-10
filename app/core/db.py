@@ -5,40 +5,46 @@ from contextlib import contextmanager
 from dotenv import load_dotenv
 import psycopg
 
-# Carga .env desde la raíz del repo
+# Carga .env desde la raíz del repo (Render también inyecta envs)
 load_dotenv()
 
-def _get_raw_dsn() -> str:
+# -----------------------------
+# Helpers
+# -----------------------------
+def _clean(v: str | None) -> str:
+    # Quita espacios/saltos (\n, \r) que rompen psycopg, p.ej. "require\n"
+    return (v or "").strip()
+
+def _main_raw_dsn() -> str:
     # Prioridad: DATABASE_URL > DB_URL > default local
     return os.getenv("DATABASE_URL") or os.getenv("DB_URL") or "postgresql://postgres:postgres@localhost:5432/munirdls"
 
-def _clean_dsn(v: str) -> str:
-    # Quita espacios y saltos (\n, \r) que rompen psycopg: "require\n"
-    v = (v or "").strip()
-    return v
+def _events_raw_dsn() -> str:
+    # DSN especial para LISTEN/NOTIFY (session pooler :6543 o directo :5432)
+    # Si no está seteado, cae al DSN principal.
+    return os.getenv("EVENTS_DB_URL") or _main_raw_dsn()
 
-def _get_dsn() -> str:
-    return _clean_dsn(_get_raw_dsn())
+DSN        = _clean(_main_raw_dsn())
+EVENTS_DSN = _clean(_events_raw_dsn())
 
-DSN = _get_dsn()
-
-# Log opcional para ver el valor real (sin exponer credenciales en prod)
+# Logs opcionales (no exponen secret salvo que vos lo habilites)
 if os.getenv("DEBUG_DB_DSN") == "1":
-    # Muestra el repr para detectar \n o \r
     print(f"[DB] DSN (repr): {DSN!r}")
+if os.getenv("DEBUG_EVENTS_DSN") == "1":
+    print(f"[DB] EVENTS_DSN (repr): {EVENTS_DSN!r}")
 
-# Pool opcional (si psycopg_pool está disponible)
+# -----------------------------
+# Pool para operaciones normales (HTTP/API, repos, etc.)
+# -----------------------------
 try:
     from psycopg_pool import ConnectionPool  # type: ignore
-
-    # Parámetros conservadores; ajustá si necesitás
     pool = ConnectionPool(
         conninfo=DSN,
         min_size=1,
         max_size=10,
         max_idle=30,
-        timeout=10,           # tiempo máximo esperando una conn del pool
-        kwargs={"connect_timeout": 10},  # timeout de conexión a PG
+        timeout=10,                    # espera máx. por una conexión del pool
+        kwargs={"connect_timeout": 10} # timeout de conexión a PG
     )
 except Exception as e:
     print(f"[DB] psycopg_pool no disponible o fallo creando pool: {e}")
@@ -47,12 +53,27 @@ except Exception as e:
 @contextmanager
 def get_conn():
     """
-    Entrega una conexión limpia, usando pool si está disponible.
+    Conexión para operaciones normales de la app.
+    Usa pool si está disponible.
     """
     if pool is not None:
         with pool.connection() as conn:
             yield conn
     else:
-        # Conexión directa (sin pool). Usa el DSN ya limpiado.
-        with psycopg.connect(DSN) as conn:
+        with psycopg.connect(DSN, connect_timeout=10) as conn:
             yield conn
+
+# -----------------------------
+# Conexión dedicada para LISTEN/NOTIFY (alarm listener)
+# IMPORTANTE: esta conexión NO debe pasar por PgBouncer en modo transaction.
+# Apuntá EVENTS_DB_URL al session pooler (:6543) o a la directa (:5432).
+# -----------------------------
+@contextmanager
+def get_events_conn():
+    """
+    Conexión dedicada para el listener (LISTEN/NOTIFY).
+    - autocommit=True para que LISTEN reciba notificaciones.
+    - No usa pool.
+    """
+    with psycopg.connect(EVENTS_DSN, autocommit=True, connect_timeout=10) as conn:
+        yield conn
