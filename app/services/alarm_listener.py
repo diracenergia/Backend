@@ -5,7 +5,7 @@ import os, json, time, threading, logging, queue
 from typing import Optional, Dict, Any
 
 from app.core.db import get_conn
-from app.services import notify_alarm  # tu sender a Telegram
+from app.services import notify_alarm  # sender a Telegram
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -15,7 +15,7 @@ logging.basicConfig(
 log = logging.getLogger("alarm-listener")
 
 CHAN = os.getenv("ALARM_NOTIFY_CHANNEL", "alarm_events")
-__VERSION__ = "alist-2025-09-10T13:35Z"
+__VERSION__ = "alist-2025-09-10T13:45Z"
 
 # Estado interno
 _thread: Optional[threading.Thread] = None
@@ -61,6 +61,25 @@ def _dispatch(evt: Dict[str, Any]) -> None:
         log.exception("dispatch error err=%s evt=%r", e, evt)
 
 
+def _get_notifies_queue(conn):
+    """
+    Soporta ambas APIs:
+      - psycopg3 habitual: conn.notifies  -> queue-like
+      - otras builds:     conn.notifies() -> queue-like
+    """
+    attr = getattr(conn, "notifies", None)
+    if attr is None:
+        raise AttributeError("connection has no 'notifies'")
+    if callable(attr):
+        # tu caso actual: es una función que devuelve la cola
+        q = attr()
+        log.info("notifies source=function -> queue=%s", type(q).__name__)
+        return q
+    # caso estándar: atributo queue-like
+    log.info("notifies source=attribute -> queue=%s", type(attr).__name__)
+    return attr
+
+
 def _listen_once() -> None:
     log.info("db_conn opening channel=%s version=%s", CHAN, __VERSION__)
     with get_conn() as conn, conn.cursor() as cur:
@@ -71,26 +90,30 @@ def _listen_once() -> None:
             pass
         log.info("listen_subscribed channel=%s", CHAN)
 
+        q = _get_notifies_queue(conn)
+
         last_log = time.time()
         while not _stop.is_set():
             try:
-                notify = conn.notifies.get(timeout=5.0)  # queue-like (psycopg3)
+                notify = q.get(timeout=5.0)
             except queue.Empty:
                 now = time.time()
-                # cada ~60s logueamos que seguimos vivos
                 if now - last_log > 60:
                     log.info("idle waiting channel=%s", CHAN)
                     last_log = now
                 continue
             except Exception as e:
-                # error real leyendo la cola
                 log.exception("notifies.get error err=%s", e)
                 continue
 
             try:
-                log.info("notify_recv pid=%s payload_len=%s",
-                         getattr(notify, "pid", None), len(notify.payload))
-                evt = _decode_payload(notify.payload)
+                pid = getattr(notify, "pid", None)
+                payload = getattr(notify, "payload", None)
+                if payload is None:
+                    log.warning("notify without payload pid=%s", pid)
+                    continue
+                log.info("notify_recv pid=%s payload_len=%s", pid, len(payload))
+                evt = _decode_payload(payload)
                 if evt and _should_send(evt):
                     _dispatch(evt)
             except Exception as e:
