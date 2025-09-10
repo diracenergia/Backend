@@ -1,8 +1,6 @@
 # app/repos/tanks.py
 from typing import Any, Dict, List, Optional, Sequence
-from datetime import datetime
 from psycopg.rows import dict_row
-from psycopg import sql
 
 from app.core.db import get_conn
 
@@ -325,3 +323,35 @@ def get_tank_capacity_m3(tank_id: int) -> Optional[float]:
             return None
         cap = row[0]
         return float(cap) if cap is not None else None
+
+# =======================
+# Shim: get_config_by_id
+# =======================
+def get_config_by_id(tank_id: int) -> Dict[str, Any]:
+    """
+    DEVUELVE UMBRALES para el tanque.
+    1) Intenta leer de public.tank_config via get_tank_config(tank_id)
+    2) Si falta alguno, completa con defaults.
+    3) Expone tanto las claves de DB (low_*/high_*) como alias (very_*/low/high).
+    """
+    defaults = {
+        "low_low_pct": 10.0,
+        "low_pct":     20.0,
+        "high_pct":    80.0,
+        "high_high_pct": 90.0,
+    }
+
+    raw = get_tank_config(tank_id) or {}
+    cfg = {
+        "tank_id": tank_id,
+        "low_low_pct":  raw.get("low_low_pct")   if raw.get("low_low_pct")   is not None else defaults["low_low_pct"],
+        "low_pct":      raw.get("low_pct")       if raw.get("low_pct")       is not None else defaults["low_pct"],
+        "high_pct":     raw.get("high_pct")      if raw.get("high_pct")      is not None else defaults["high_pct"],
+        "high_high_pct":raw.get("high_high_pct") if raw.get("high_high_pct") is not None else defaults["high_high_pct"],
+    }
+    # Aliases
+    cfg["very_low"]  = cfg["low_low_pct"]
+    cfg["low"]       = cfg["low_pct"]
+    cfg["high"]      = cfg["high_pct"]
+    cfg["very_high"] = cfg["high_high_pct"]
+    return cfg
