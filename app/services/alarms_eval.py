@@ -1,16 +1,30 @@
 # app/services/alarm_events.py
 from __future__ import annotations
+import os
 import json
 from typing import Optional, Dict, Any
 from app.core.db import get_conn
 
-_CHANNEL = "alarm_events"
+# Canal de NOTIFY (configurable por env)
+_CHANNEL_DEFAULT = "alarm_events"
+_CHANNEL = os.getenv("ALARM_NOTIFY_CHANNEL", _CHANNEL_DEFAULT)
 
 def _safe_float(v) -> Optional[float]:
     try:
         return None if v is None else float(v)
     except Exception:
         return None
+
+def _norm_op(op: str) -> str:
+    return (op or "").upper()
+
+def _norm_code(code: str) -> str:
+    # códigos suelen representarse en mayúsculas
+    return (code or "LEVEL").upper()
+
+def _norm_severity(sev: str) -> str:
+    # el listener/notify soporta ambos cases; dejamos MAYÚSCULAS aquí
+    return (sev or "").upper()
 
 def _payload(
     *,
@@ -24,14 +38,15 @@ def _payload(
     value: Optional[float] = None,
     ts: Optional[str] = None,
     message: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     p: Dict[str, Any] = {
-        "op": (op or "").upper(),
+        "op": _norm_op(op),
         "asset_type": str(asset_type),
         "asset_id": int(asset_id),
-        "code": str(code or "LEVEL"),
+        "code": _norm_code(code),
         "alarm_id": int(alarm_id),
-        "severity": (severity or "").upper(),
+        "severity": _norm_severity(severity),
         "threshold": str(threshold or ""),
     }
     fv = _safe_float(value)
@@ -41,6 +56,11 @@ def _payload(
         p["ts"] = str(ts)
     if message:
         p["message"] = str(message)
+    if isinstance(extra, dict) and extra:
+        # No pisamos claves básicas
+        for k, v in extra.items():
+            if k not in p and v is not None:
+                p[k] = v
     return p
 
 def publish_alarm_event(
@@ -55,10 +75,16 @@ def publish_alarm_event(
     value: Optional[float] = None,
     ts: Optional[str] = None,
     message: Optional[str] = None,
+    channel: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    Publica un evento en el canal PostgreSQL 'alarm_events' (LISTEN/NOTIFY),
+    Publica un evento en el canal PostgreSQL (LISTEN/NOTIFY),
     con logs previos y posteriores para diagnóstico en Render.
+
+    Args:
+        channel: Si querés usar un canal distinto (default: env ALARM_NOTIFY_CHANNEL o "alarm_events")
+        extra:   Dict opcional con campos adicionales (p.ej. {"ts_raised": "...", "site": "PLANTA A"})
     """
     payload = _payload(
         op=op,
@@ -71,16 +97,20 @@ def publish_alarm_event(
         value=value,
         ts=ts,
         message=message,
+        extra=extra,
     )
+    ch = (channel or _CHANNEL)
 
     try:
-        print("[alarms-eval] ➜ NOTIFY", _CHANNEL + ":", json.dumps(payload, ensure_ascii=False))
+        print("[alarms-eval] ➜ NOTIFY", ch + ":", json.dumps(payload, ensure_ascii=False))
         with get_conn() as conn, conn.cursor() as cur:
-            # pg_notify(channel TEXT, payload TEXT)
-            cur.execute("SELECT pg_notify(%s, %s)", (_CHANNEL, json.dumps(payload)))
-        print(f"[alarms-eval] ✓ NOTIFY ok  op={payload['op']} id={payload['alarm_id']} asset={asset_type}-{asset_id}")
+            # NOTIFY se entrega en COMMIT (explícito por las dudas)
+            cur.execute("SELECT pg_notify(%s, %s)", (ch, json.dumps(payload)))
+            conn.commit()
+        print(f"[alarms-eval] ✓ NOTIFY ok  op={payload['op']} id={payload['alarm_id']} asset={asset_type}-{asset_id} ch={ch}")
     except Exception as e:
-        print(f"[alarms-eval] ⚠️ NOTIFY failed: {e}  payload={payload}")
+        # Log completo del payload para diagnóstico
+        print(f"[alarms-eval] ⚠️ NOTIFY failed: {e}  payload={payload} ch={ch}")
 
 # -------- Helpers opcionales (azúcar) --------
 
@@ -95,6 +125,8 @@ def publish_raised(
     value: Optional[float] = None,
     ts: Optional[str] = None,
     message: Optional[str] = None,
+    channel: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> None:
     publish_alarm_event(
         "RAISED",
@@ -107,6 +139,8 @@ def publish_raised(
         value=value,
         ts=ts,
         message=message,
+        channel=channel,
+        extra=extra,
     )
 
 def publish_cleared(
@@ -120,6 +154,8 @@ def publish_cleared(
     value: Optional[float] = None,
     ts: Optional[str] = None,
     message: Optional[str] = None,
+    channel: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> None:
     publish_alarm_event(
         "CLEARED",
@@ -132,6 +168,8 @@ def publish_cleared(
         value=value,
         ts=ts,
         message=message,
+        channel=channel,
+        extra=extra,
     )
 
 def publish_ack(
@@ -144,6 +182,8 @@ def publish_ack(
     threshold: str,
     ts: Optional[str] = None,
     user: Optional[str] = None,
+    channel: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> None:
     msg = f"ACK por {user}" if user else None
     publish_alarm_event(
@@ -156,4 +196,6 @@ def publish_ack(
         threshold=threshold,
         ts=ts,
         message=msg,
+        channel=channel,
+        extra=extra,
     )
