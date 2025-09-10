@@ -1,201 +1,198 @@
-# app/services/alarm_events.py
+# app/services/alarms_eval.py
 from __future__ import annotations
-import os
-import json
-from typing import Optional, Dict, Any
-from app.core.db import get_conn
+from datetime import datetime, timezone
+from typing import Optional
 
-# Canal de NOTIFY (configurable por env)
-_CHANNEL_DEFAULT = "alarm_events"
-_CHANNEL = os.getenv("ALARM_NOTIFY_CHANNEL", _CHANNEL_DEFAULT)
+# Repos (ajustá si tus módulos reales se llaman distinto)
+from app.repos import tanks as tanks_repo
+from app.repos import alarms as alarms_repo
+from app.repos import audit as audit_repo
 
-def _safe_float(v) -> Optional[float]:
-    try:
-        return None if v is None else float(v)
-    except Exception:
-        return None
+# Notificador (LISTEN/NOTIFY → listener → Telegram)
+from app.services.alarm_events import publish_raised, publish_cleared
 
-def _norm_op(op: str) -> str:
-    return (op or "").upper()
+# Mapeo de códigos → etiquetas de umbral para el payload
+_THRESH_ALIAS = {
+    "LOW_LOW": "very_low",
+    "LOW": "low",
+    "HIGH": "high",
+    "HIGH_HIGH": "very_high",
+}
 
-def _norm_code(code: str) -> str:
-    # códigos suelen representarse en mayúsculas
-    return (code or "LEVEL").upper()
+def _now():
+    return datetime.now(timezone.utc)
 
-def _norm_severity(sev: str) -> str:
-    # el listener/notify soporta ambos cases; dejamos MAYÚSCULAS aquí
-    return (sev or "").upper()
+# -------- Umbrales con fallback (evita el crash por get_config_by_id) --------
+def _get_thresholds(tank_id: int):
+    """
+    Devuelve dict con low_low_pct, low_pct, high_pct, high_high_pct.
+    Intenta get_config_by_id; si no existe, usa get_tank_config; si falta algo, defaults.
+    """
+    defaults = {"low_low_pct": 10.0, "low_pct": 20.0, "high_pct": 80.0, "high_high_pct": 90.0}
 
-def _payload(
-    *,
-    op: str,                   # "RAISED" | "CLEARED" | "ACK"
-    asset_type: str,           # "tank" | "pump"
-    asset_id: int,
-    code: str,                 # p.ej. "LEVEL"
-    alarm_id: int,
-    severity: str,             # "critical" | "warning" | (casing libre)
-    threshold: str,            # "very_high" | "high" | "low" | "very_low" | ...
-    value: Optional[float] = None,
-    ts: Optional[str] = None,
-    message: Optional[str] = None,
-    extra: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    p: Dict[str, Any] = {
-        "op": _norm_op(op),
-        "asset_type": str(asset_type),
-        "asset_id": int(asset_id),
-        "code": _norm_code(code),
-        "alarm_id": int(alarm_id),
-        "severity": _norm_severity(severity),
-        "threshold": str(threshold or ""),
+    cfg = None
+    if hasattr(tanks_repo, "get_config_by_id"):
+        try:
+            cfg = tanks_repo.get_config_by_id(tank_id)
+            print(f"[eval] thresholds via get_config_by_id tank={tank_id}: {cfg}")
+        except Exception as e:
+            print(f"[eval] get_config_by_id failed: {e}")
+
+    if cfg is None and hasattr(tanks_repo, "get_tank_config"):
+        try:
+            cfg = tanks_repo.get_tank_config(tank_id)
+            print(f"[eval] thresholds via get_tank_config tank={tank_id}: {cfg}")
+        except Exception as e:
+            print(f"[eval] get_tank_config failed: {e}")
+
+    def _get(obj, key):
+        if obj is None:
+            return defaults[key]
+        if isinstance(obj, dict):
+            return float(obj.get(key)) if obj.get(key) is not None else defaults[key]
+        return float(getattr(obj, key, defaults[key]))
+
+    th = {
+        "low_low_pct":  _get(cfg, "low_low_pct"),
+        "low_pct":      _get(cfg, "low_pct"),
+        "high_pct":     _get(cfg, "high_pct"),
+        "high_high_pct":_get(cfg, "high_high_pct"),
     }
-    fv = _safe_float(value)
-    if fv is not None:
-        p["value"] = fv
-    if ts:
-        p["ts"] = str(ts)
-    if message:
-        p["message"] = str(message)
-    if isinstance(extra, dict) and extra:
-        # No pisamos claves básicas
-        for k, v in extra.items():
-            if k not in p and v is not None:
-                p[k] = v
-    return p
+    print(f"[eval] thresholds resolved tank={tank_id}: {th}")
+    return th
 
-def publish_alarm_event(
-    op: str,
-    *,
-    asset_type: str,
-    asset_id: int,
-    code: str,
-    alarm_id: int,
-    severity: str,
-    threshold: str,
-    value: Optional[float] = None,
-    ts: Optional[str] = None,
-    message: Optional[str] = None,
-    channel: Optional[str] = None,
-    extra: Optional[Dict[str, Any]] = None,
-) -> None:
+# -------- Accesos a estado de alarmas --------
+def _get_active(asset_type: str, asset_id: int, code: str):
     """
-    Publica un evento en el canal PostgreSQL (LISTEN/NOTIFY),
-    con logs previos y posteriores para diagnóstico en Render.
+    Devuelve la alarma activa (si existe) para ese asset+code o None.
+    Debe existir alarms_repo.get_active(...). Si no existe, implementalo allí.
+    """
+    return alarms_repo.get_active(asset_type=asset_type, asset_id=asset_id, code=code)
 
-    Args:
-        channel: Si querés usar un canal distinto (default: env ALARM_NOTIFY_CHANNEL o "alarm_events")
-        extra:   Dict opcional con campos adicionales (p.ej. {"ts_raised": "...", "site": "PLANTA A"})
-    """
-    payload = _payload(
-        op=op,
+# -------- Helpers de transición con auditoría + NOTIFY --------
+def _raise(asset_type: str, asset_id: int, code: str, severity: str, message: str, value: Optional[float] = None):
+    a = alarms_repo.create(
         asset_type=asset_type,
         asset_id=asset_id,
         code=code,
-        alarm_id=alarm_id,
         severity=severity,
-        threshold=threshold,
-        value=value,
-        ts=ts,
         message=message,
-        extra=extra,
+        ts_raised=_now(),
+        is_active=True,
     )
-    ch = (channel or _CHANNEL)
-
+    audit_repo.log(
+        ts=_now(),
+        asset_type=asset_type,
+        asset_id=asset_id,
+        code=code,
+        severity=severity,
+        state="RAISED",
+        details={"message": message},
+    )
+    # NOTIFY → listener → Telegram
     try:
-        print("[alarms-eval] ➜ NOTIFY", ch + ":", json.dumps(payload, ensure_ascii=False))
-        with get_conn() as conn, conn.cursor() as cur:
-            # NOTIFY se entrega en COMMIT (explícito por las dudas)
-            cur.execute("SELECT pg_notify(%s, %s)", (ch, json.dumps(payload)))
-            conn.commit()
-        print(f"[alarms-eval] ✓ NOTIFY ok  op={payload['op']} id={payload['alarm_id']} asset={asset_type}-{asset_id} ch={ch}")
+        publish_raised(
+            asset_type=asset_type,
+            asset_id=asset_id,
+            code=code,
+            alarm_id=a.id,
+            severity=severity,
+            threshold=_THRESH_ALIAS.get(code, code.lower()),
+            value=value,
+        )
     except Exception as e:
-        # Log completo del payload para diagnóstico
-        print(f"[alarms-eval] ⚠️ NOTIFY failed: {e}  payload={payload} ch={ch}")
+        print("[WARN] notify RAISED failed:", e)
+    return a
 
-# -------- Helpers opcionales (azúcar) --------
-
-def publish_raised(
-    *,
-    asset_type: str,
-    asset_id: int,
-    code: str,
-    alarm_id: int,
-    severity: str,
-    threshold: str,
-    value: Optional[float] = None,
-    ts: Optional[str] = None,
-    message: Optional[str] = None,
-    channel: Optional[str] = None,
-    extra: Optional[Dict[str, Any]] = None,
-) -> None:
-    publish_alarm_event(
-        "RAISED",
-        asset_type=asset_type,
-        asset_id=asset_id,
-        code=code,
-        alarm_id=alarm_id,
-        severity=severity,
-        threshold=threshold,
-        value=value,
-        ts=ts,
-        message=message,
-        channel=channel,
-        extra=extra,
+def _clear(a, value: Optional[float] = None):
+    alarms_repo.clear(a.id, ts_cleared=_now())
+    audit_repo.log(
+        ts=_now(),
+        asset_type=a.asset_type,
+        asset_id=a.asset_id,
+        code=a.code,
+        severity=a.severity,
+        state="CLEARED",
     )
+    # NOTIFY → listener → Telegram
+    try:
+        publish_cleared(
+            asset_type=a.asset_type,
+            asset_id=a.asset_id,
+            code=a.code,
+            alarm_id=a.id,
+            severity=a.severity,
+            threshold=_THRESH_ALIAS.get(a.code, str(a.code).lower()),
+            value=value,
+        )
+    except Exception as e:
+        print("[WARN] notify CLEARED failed:", e)
 
-def publish_cleared(
-    *,
-    asset_type: str,
-    asset_id: int,
-    code: str,
-    alarm_id: int,
-    severity: str,
-    threshold: str,
-    value: Optional[float] = None,
-    ts: Optional[str] = None,
-    message: Optional[str] = None,
-    channel: Optional[str] = None,
-    extra: Optional[Dict[str, Any]] = None,
-) -> None:
-    publish_alarm_event(
-        "CLEARED",
-        asset_type=asset_type,
-        asset_id=asset_id,
-        code=code,
-        alarm_id=alarm_id,
-        severity=severity,
-        threshold=threshold,
-        value=value,
-        ts=ts,
-        message=message,
-        channel=channel,
-        extra=extra,
-    )
+def _escalate(old_alarm, new_code: str, new_severity: str, message: str, value: Optional[float] = None):
+    _clear(old_alarm, value=value)
+    return _raise(old_alarm.asset_type, old_alarm.asset_id, new_code, new_severity, message, value=value)
 
-def publish_ack(
-    *,
-    asset_type: str,
-    asset_id: int,
-    code: str,
-    alarm_id: int,
-    severity: str,
-    threshold: str,
-    ts: Optional[str] = None,
-    user: Optional[str] = None,
-    channel: Optional[str] = None,
-    extra: Optional[Dict[str, Any]] = None,
-) -> None:
-    msg = f"ACK por {user}" if user else None
-    publish_alarm_event(
-        "ACK",
-        asset_type=asset_type,
-        asset_id=asset_id,
-        code=code,
-        alarm_id=alarm_id,
-        severity=severity,
-        threshold=threshold,
-        ts=ts,
-        message=msg,
-        channel=channel,
-        extra=extra,
-    )
+# -------- FUNCIÓN PÚBLICA: ¡esta es la que se importa! --------
+def eval_tank_alarm(tank_id: int, level_pct: Optional[float]):
+    """
+    Evaluación de umbrales por lectura. Debe llamarse en cada sample guardado.
+    Reglas:
+      - LOW/LOW_LOW vs HIGH/HIGH_HIGH (mutuamente excluyentes).
+      - Escalado LOW→LOW_LOW y HIGH→HIGH_HIGH.
+      - Limpieza al volver a normal.
+    """
+    print(f"[ingest] eval_tank_alarm tank={tank_id} lvl={level_pct}")
+    if level_pct is None:
+        # Podrías disparar SENSOR_FAIL si querés contemplarlo
+        return
+
+    th = _get_thresholds(tank_id)
+    ll = th["low_low_pct"]
+    l  = th["low_pct"]
+    h  = th["high_pct"]
+    hh = th["high_high_pct"]
+
+    lowlow = _get_active("tank", tank_id, "LOW_LOW")
+    low    = _get_active("tank", tank_id, "LOW")
+    high   = _get_active("tank", tank_id, "HIGH")
+    highhigh = _get_active("tank", tank_id, "HIGH_HIGH")
+
+    # --- LOW_LOW ---
+    if level_pct <= ll:
+        msg = f"Nivel muy bajo ({level_pct:.1f}% <= {ll:.2f}%)"
+        if high: _clear(high, value=level_pct)
+        if highhigh: _clear(highhigh, value=level_pct)
+        if low: _escalate(low, "LOW_LOW", "critical", msg, value=level_pct)
+        elif not lowlow: _raise("tank", tank_id, "LOW_LOW", "critical", msg, value=level_pct)
+        return
+
+    # --- LOW ---
+    if level_pct <= l:
+        msg = f"Nivel bajo ({level_pct:.1f}% <= {l:.2f}%)"
+        if high: _clear(high, value=level_pct)
+        if highhigh: _clear(highhigh, value=level_pct)
+        if not low and not lowlow:  # no pises LOW_LOW
+            _raise("tank", tank_id, "LOW", "warning", msg, value=level_pct)
+        return
+
+    # --- HIGH_HIGH ---
+    if level_pct >= hh:
+        msg = f"Nivel muy alto ({level_pct:.1f}% >= {hh:.2f}%)"
+        if low: _clear(low, value=level_pct)
+        if lowlow: _clear(lowlow, value=level_pct)
+        if high: _escalate(high, "HIGH_HIGH", "critical", msg, value=level_pct)
+        elif not highhigh: _raise("tank", tank_id, "HIGH_HIGH", "critical", msg, value=level_pct)
+        return
+
+    # --- HIGH ---
+    if level_pct >= h:
+        msg = f"Nivel alto ({level_pct:.1f}% >= {h:.2f}%)"
+        if low: _clear(low, value=level_pct)
+        if lowlow: _clear(lowlow, value=level_pct)
+        if not high and not highhigh:
+            _raise("tank", tank_id, "HIGH", "warning", msg, value=level_pct)
+        return
+
+    # --- NORMAL: limpiar todas si estaban activas ---
+    for a in filter(None, [lowlow, low, high, highhigh]):
+        _clear(a, value=level_pct)
