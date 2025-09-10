@@ -1,5 +1,5 @@
 # app/services/notify_alarm.py
-from ..core.telegram import send_telegram
+from ..core.telegram import send_telegram  # si tu proyecto usa esta; si no, ajusta al módulo real
 
 _last: dict[str, float] = {}
 
@@ -15,7 +15,8 @@ def _esc(s: str) -> str:
 
 async def notify_alarm(a: dict):
   """Envía alerta a Telegram (solo critical/warning), con antiflood 5 min x equipo+severidad."""
-  if a.get("severity") not in ("critical", "warning"):
+  sev = str(a.get("severity") or "").lower()   # 👈 normaliza
+  if sev not in ("critical", "warning"):
     return
 
   equipo = "TK-" + str(a["asset_id"]) if a["asset_type"]=="tank" \
@@ -23,12 +24,13 @@ async def notify_alarm(a: dict):
         else f'{a["asset_type"]}-{a["asset_id"]}'
   code = (a.get("code") or "").upper()
   ts = a.get("ts_raised") or "—"
-  key = f'{a["asset_type"]}-{a["asset_id"]}-{a["severity"]}'
+
+  key = f'{a["asset_type"]}-{a["asset_id"]}-{sev}'  # 👈 usa la normalizada
   if not _once_every(key, 300):  # 5 min
     return
 
   text = (
-    f'<b>ALERTA {a["severity"].upper()}</b>\n'
+    f'<b>ALERTA {sev.upper()}</b>\n'
     f'<b>Equipo:</b> {_esc(equipo)}\n'
     + (f'<b>Código:</b> {_esc(code)}\n' if code else "")
     + f'<b>Mensaje:</b> {_esc(a.get("message") or "Alarma")}\n'

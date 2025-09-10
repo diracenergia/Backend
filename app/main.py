@@ -27,10 +27,6 @@ def _get_env(name: str, default: str = "") -> str:
 
 
 # ===== CORS =====
-# CORS_ALLOW_ORIGINS admite:
-#   - "*"  -> todos los orígenes (válido porque no usamos cookies/sesión)
-#   - lista coma-separada: "https://a.com,https://b.com"
-# Opcional: CORS_ALLOW_ORIGIN_REGEX para patrones (p.ej. previews de Vercel).
 _raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
 _origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
 
@@ -41,18 +37,18 @@ else:
     ALLOW_ALL_ORIGINS = False
     ALLOWED_ORIGINS = [o.strip() for o in _raw.split(",") if o.strip()]
 
-ALLOW_CREDENTIALS = False  # si pasás a cookies/sesión -> True y NO uses "*"
-ALLOW_METHODS = ["*"]      # GET, POST, PUT, PATCH, DELETE, OPTIONS...
-ALLOW_HEADERS = ["*"]      # X-API-Key, Authorization, Content-Type, etc.
+ALLOW_CREDENTIALS = False
+ALLOW_METHODS = ["*"]
+ALLOW_HEADERS = ["*"]
 
 # ===== Trusted hosts (opcional) =====
-# p.ej.: TRUSTED_HOSTS="backend-v85n.onrender.com,.vercel.app,localhost,127.0.0.1"
 _trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
 TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
 
 APP_TITLE = _get_env("APP_TITLE", "ESP32 Tank/Pump API")
 APP_VERSION = _get_env("APP_VERSION", "") or _get_env("RENDER_GIT_COMMIT", "")[:8]
 
+# >>> CREA LA APP ANTES DE INCLUIR ROUTERS <<<
 app = FastAPI(title=APP_TITLE, version=APP_VERSION or None)
 
 # Logs de arranque
@@ -69,15 +65,22 @@ if TRUSTED_HOSTS:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,          # ["*"] si _raw == "*"
+    allow_origins=ALLOWED_ORIGINS,
     allow_origin_regex=_origin_regex or None,
-    allow_credentials=ALLOW_CREDENTIALS,    # con True no podés usar "*"
+    allow_credentials=ALLOW_CREDENTIALS,
     allow_methods=ALLOW_METHODS,
     allow_headers=ALLOW_HEADERS,
 )
 
-# Compresión (útil para listas grandes / history)
 app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+# --- Montaje de UI estática (opcional) ---
+REPO_ROOT = Path(__file__).resolve().parents[1]
+WEB_DIR = REPO_ROOT / "web"
+if WEB_DIR.exists():
+    app.mount("/ui", StaticFiles(directory=str(WEB_DIR), html=True), name="ui")
+else:
+    print(f"⚠️ /ui deshabilitado: no existe {WEB_DIR}")
 
 # --- Routers TANQUES ---
 from app.routes.ingest import router as ingest_tank_router
@@ -97,9 +100,6 @@ from app.routes.commands_pumps import router as commands_pump_router
 from app.routes.alarms import router as alarms_router
 from app.routes.audit import router as audit_router
 
-# --- Otros routers (tests / utilidades) ---
-from app.routes.test_telegram import router as test_router
-
 # --- Router opcional: CRUD de metadatos de tanques (/tanks GET/POST/PUT) ---
 try:
     from app.routes.tanks import router as tanks_router
@@ -109,13 +109,12 @@ except Exception:
 # --- 🔌 WebSocket telemetry router (ruta exacta /ws/telemetry) ---
 from app.ws import router as ws_router
 
-# --- Montaje de UI estática (opcional) ---
-REPO_ROOT = Path(__file__).resolve().parents[1]
-WEB_DIR = REPO_ROOT / "web"
-if WEB_DIR.exists():
-    app.mount("/ui", StaticFiles(directory=str(WEB_DIR), html=True), name="ui")
-else:
-    print(f"⚠️ /ui deshabilitado: no existe {WEB_DIR}")
+# --- 🔹 Router de pruebas (Telegram directo + notify) ---
+#  -> Debes tener un archivo app/routes/test_routes.py con __ping_telegram y __test_alarm_notify
+from app.routes.test_routes import router as test_routes_router
+
+# --- Conexión (diagnóstico) ---
+from app.routes.conn import router as conn_router
 
 # --- Incluir Routers (TANQUES) ---
 app.include_router(ingest_tank_router)
@@ -135,12 +134,11 @@ app.include_router(commands_pump_router)
 if tanks_router:
     app.include_router(tanks_router)
 
-# --- Incluir Routers (ALARMAS / AUDIT / TEST) ---
+# --- Incluir Routers (ALARMAS / AUDIT / TEST / CONN / WS) ---
 app.include_router(alarms_router)
 app.include_router(audit_router)
-app.include_router(test_router)
-
-# --- 🔌 Incluir WebSocket router (/ws/telemetry) ---
+app.include_router(test_routes_router)   # 👈 aquí están /__ping_telegram y /__test_alarm_notify
+app.include_router(conn_router)
 app.include_router(ws_router)
 
 # --- Endpoints utilitarios ---
@@ -158,7 +156,6 @@ def root():
 
 @app.get("/favicon.ico")
 def favicon_noop():
-    # Evita 404 ruidoso si algún cliente pide favicon al backend
     return {}
 
 @app.get("/health")
@@ -197,23 +194,6 @@ def tg_env():
         "BOT_head": (token[:8] + "...") if token else "",
         "CHAT": _get_env("TELEGRAM_CHAT_ID", ""),
     }
-
-# --- Conexión (diagnóstico) ---
-from app.routes.conn import router as conn_router
-app.include_router(conn_router)
-
-# --- (Opcional) Endpoints de debug del listener / prueba de NOTIFY ---
-try:
-    from app.routes.debug_alarm import router as debug_alarm_router  # /__alarm_listener_status
-    app.include_router(debug_alarm_router)
-except Exception:
-    pass
-
-try:
-    from app.routes.test_alarm import router as test_alarm_router      # /__test_alarm_notify
-    app.include_router(test_alarm_router)
-except Exception:
-    pass
 
 # ===== Alarm Listener (LISTEN/NOTIFY → Telegram) =====
 try:
