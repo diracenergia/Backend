@@ -247,23 +247,19 @@ def listener_status():
     except Exception as e:
         return {"alive": False, "channel": None, "error": f"import_error: {e}"}
 
-    # thread vivo?
     alive = bool(getattr(al, "_thread", None) and getattr(al._thread, "is_alive", lambda: False)())
-
-    # nombre de canal (compatibilidad: CHAN vs CHANNEL)
     channel = getattr(al, "CHANNEL", None) or getattr(al, "CHAN", None)
 
-    # si en el futuro agregamos métricas, las mostramos; por ahora None
-    sent_ok = getattr(al, "SENT_OK", None)
-    send_err = getattr(al, "SEND_ERR", None)
+    sent_cache = None
+    try:
+        sent_cache = len(getattr(al, "_last_sent", []))
+    except Exception:
+        pass
 
     return {
         "alive": alive,
         "channel": channel,
-        "metrics": {
-            "sent_ok": sent_ok,
-            "send_err": send_err,
-        },
+        "sent_cache": sent_cache,
     }
 
 @app.post("/__alarm_listener_stop")
@@ -276,3 +272,39 @@ def listener_stop():
             return {"stopped": False, "error": str(e)}
     return {"stopped": False, "error": "listener no disponible"}
 
+# ===== Qué versión de alarms_eval está cargada =====
+@app.get("/__which_alarms_eval")
+def which_alarms_eval():
+    import importlib
+    try:
+        mod = importlib.import_module("app.services.alarms_eval")
+        return {
+            "file": getattr(mod, "__file__", None),
+            "version": getattr(mod, "__VERSION__", None),
+            "has_eval": hasattr(mod, "eval_tank_alarm"),
+            "is_callable": callable(getattr(mod, "eval_tank_alarm", None)),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+# ===== Qué versión de alarm_events está cargada =====
+@app.get("/__which_alarm_events")
+def which_alarm_events():
+    import importlib, inspect
+    try:
+        mod = importlib.import_module("app.services.alarm_events")
+        try:
+            src = inspect.getsource(mod._notify)
+            uses_pg = "pg_notify(" in src
+            preview = src.strip().splitlines()[:5]
+        except Exception:
+            uses_pg = None
+            preview = ["<no source>"]
+        return {
+            "file": getattr(mod, "__file__", None),
+            "version": getattr(mod, "__VERSION__", None),
+            "uses_pg_notify": uses_pg,
+            "notify_src_preview": preview
+        }
+    except Exception as e:
+        return {"error": str(e)}
