@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import logging
-from typing import Optional
 
 from ..core.telegram import send_telegram  # sender asíncrono existente
 
@@ -16,6 +15,8 @@ logging.basicConfig(
     format="ts=%(asctime)s level=%(levelname)s module=%(name)s msg=%(message)s",
 )
 log = logging.getLogger("notify-alarm")
+
+__all__ = ["notify_alarm", "notify_ack"]  # para que quede claro qué exportamos
 
 
 def _esc(s: str | None) -> str:
@@ -95,9 +96,29 @@ async def notify_alarm(a: dict) -> None:
     )
 
     try:
-        # Nota: si send_telegram retorna algo, lo logueamos; si no, confirmamos sin valor.
         result = await send_telegram(text)
         log.info("send_done status=ok result=%s", result if result is not None else "none")
     except Exception as e:
         log.exception("send_error err=%s op=%s equipo=%s code=%s", e, op, equipo, code)
-        # No relanzamos; preferimos que el listener siga funcionando.
+        # No relanzamos; dejamos que el flujo siga.
+
+
+async def notify_ack(a: dict, user: str) -> None:
+    """
+    Notificación de ACK (confirmación) simple.
+    La mantenemos para compatibilidad con módulos que la importan.
+    """
+    try:
+        equipo = _equip_label(a)
+        code = (a.get("code") or "").upper()
+        text = (
+            f'🆗 <b>ACK</b> por <b>{_esc(user)}</b>\n'
+            f'<b>Equipo:</b> {_esc(equipo)}\n'
+            + (f'<b>Código:</b> {_esc(code)}\n' if code else "")
+        )
+
+        log.info("ack_attempt user=%s equipo=%s code=%s", user, equipo, code or "-")
+        result = await send_telegram(text)
+        log.info("ack_done status=ok result=%s", result if result is not None else "none")
+    except Exception as e:
+        log.exception("ack_error err=%s user=%s", e, user)
