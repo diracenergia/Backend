@@ -32,7 +32,7 @@ def alarm_diag():
         out["listener"] = {"import_ok": False, "error": repr(e)}
 
     # --- DSN del listener (ENV)
-    dsn_env = os.getenv("DATABASE_URL") or os.getenv("DB_URL") or ""
+    dsn_env = os.getenv("DB_URL") or ""
     d = {}
     try:
         if dsn_env:
