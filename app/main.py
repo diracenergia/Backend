@@ -27,10 +27,6 @@ def _get_env(name: str, default: str = "") -> str:
 
 
 # ===== CORS =====
-# CORS_ALLOW_ORIGINS admite:
-#   - "*"  -> todos los orígenes (válido si no usás cookies/sesión)
-#   - lista coma-separada: "https://a.com,https://b.com"
-# Opcional: CORS_ALLOW_ORIGIN_REGEX para patrones (p.ej. previews).
 _raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
 _origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
 
@@ -41,12 +37,11 @@ else:
     ALLOW_ALL_ORIGINS = False
     ALLOWED_ORIGINS = [o.strip() for o in _raw.split(",") if o.strip()]
 
-ALLOW_CREDENTIALS = False  # si pasás a cookies/sesión -> True (y NO uses "*")
+ALLOW_CREDENTIALS = False
 ALLOW_METHODS = ["*"]
 ALLOW_HEADERS = ["*"]
 
 # ===== Trusted hosts (opcional) =====
-# p.ej.: TRUSTED_HOSTS="backend-v85n.onrender.com,.vercel.app,localhost,127.0.0.1"
 _trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
 TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
 
@@ -69,9 +64,9 @@ if TRUSTED_HOSTS:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,          # ["*"] si _raw == "*"
+    allow_origins=ALLOWED_ORIGINS,
     allow_origin_regex=_origin_regex or None,
-    allow_credentials=ALLOW_CREDENTIALS,    # con True no podés usar "*"
+    allow_credentials=ALLOW_CREDENTIALS,
     allow_methods=ALLOW_METHODS,
     allow_headers=ALLOW_HEADERS,
 )
@@ -100,10 +95,10 @@ try:
 except Exception:
     tanks_router = None
 
-# 🔌 WebSocket telemetry router (ruta exacta /ws/telemetry)
+# 🔌 WebSocket telemetry router
 from app.ws import router as ws_router
 
-# ===== Montaje de UI estática (opcional) =====
+# ===== Montaje de UI estática =====
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WEB_DIR = REPO_ROOT / "web"
 if WEB_DIR.exists():
@@ -134,21 +129,21 @@ if tanks_router:
 app.include_router(alarms_router)
 app.include_router(audit_router)
 
-# 🔧 Routers de test / diagnóstico (montados en try/except para no romper el startup)
+# 🔧 Routers de test / diagnóstico
 try:
-    from app.routes.test_telegram import router as test_telegram_router  # /__ping_telegram
+    from app.routes.test_telegram import router as test_telegram_router
     app.include_router(test_telegram_router)
 except Exception as e:
     print(f"⚠️ test_telegram router no disponible: {e}")
 
 try:
-    from app.routes.test_alarm import router as test_alarm_router        # /__test_alarm_notify
+    from app.routes.test_alarm import router as test_alarm_router
     app.include_router(test_alarm_router)
 except Exception as e:
     print(f"⚠️ test_alarm router no disponible: {e}")
 
 try:
-    from app.routes.debug_alarm import router as debug_alarm_router      # /__alarm_diag, /__alarm_start, /__alarm_notify_ping
+    from app.routes.debug_alarm import router as debug_alarm_router
     app.include_router(debug_alarm_router)
 except Exception as e:
     print(f"⚠️ debug_alarm router no disponible: {e}")
@@ -171,7 +166,6 @@ def root():
 
 @app.get("/favicon.ico")
 def favicon_noop():
-    # Evita 404 ruidoso si algún cliente pide favicon al backend
     return {}
 
 @app.get("/health")
@@ -190,7 +184,6 @@ def health_db():
 
 @app.get("/__config")
 def cfg_echo():
-    """Pequeño eco de configuración segura para diagnóstico."""
     return {
         "cors": {
             "allow_all": ALLOW_ALL_ORIGINS,
@@ -245,3 +238,18 @@ def _shutdown_listeners():
             print("[alarm-listener] stopped")
         except Exception as e:
             print(f"⚠️ error al detener alarm-listener: {e}")
+
+# ===== Endpoints de diagnóstico del listener =====
+@app.get("/__alarm_listener_status")
+def listener_status():
+    from app.services import alarm_listener as al
+    alive = al._thread.is_alive() if al._thread else False
+    sent_count = len(al._last_sent)
+    return {"alive": alive, "sent_cache": sent_count, "channel": al.CHAN}
+
+@app.post("/__alarm_listener_stop")
+def listener_stop():
+    if _HAS_ALARM_LISTENER and callable(stop_alarm_listener):
+        stop_alarm_listener()
+        return {"stopped": True}
+    return {"stopped": False, "error": "listener no disponible"}
