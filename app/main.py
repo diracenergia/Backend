@@ -242,14 +242,37 @@ def _shutdown_listeners():
 # ===== Endpoints de diagnóstico del listener =====
 @app.get("/__alarm_listener_status")
 def listener_status():
-    from app.services import alarm_listener as al
-    alive = al._thread.is_alive() if al._thread else False
-    sent_count = len(al._last_sent)
-    return {"alive": alive, "sent_cache": sent_count, "channel": al.CHAN}
+    try:
+        from app.services import alarm_listener as al
+    except Exception as e:
+        return {"alive": False, "channel": None, "error": f"import_error: {e}"}
+
+    # thread vivo?
+    alive = bool(getattr(al, "_thread", None) and getattr(al._thread, "is_alive", lambda: False)())
+
+    # nombre de canal (compatibilidad: CHAN vs CHANNEL)
+    channel = getattr(al, "CHANNEL", None) or getattr(al, "CHAN", None)
+
+    # si en el futuro agregamos métricas, las mostramos; por ahora None
+    sent_ok = getattr(al, "SENT_OK", None)
+    send_err = getattr(al, "SEND_ERR", None)
+
+    return {
+        "alive": alive,
+        "channel": channel,
+        "metrics": {
+            "sent_ok": sent_ok,
+            "send_err": send_err,
+        },
+    }
 
 @app.post("/__alarm_listener_stop")
 def listener_stop():
     if _HAS_ALARM_LISTENER and callable(stop_alarm_listener):
-        stop_alarm_listener()
-        return {"stopped": True}
+        try:
+            stop_alarm_listener()
+            return {"stopped": True}
+        except Exception as e:
+            return {"stopped": False, "error": str(e)}
     return {"stopped": False, "error": "listener no disponible"}
+
