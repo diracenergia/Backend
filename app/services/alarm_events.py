@@ -10,7 +10,7 @@ from decimal import Decimal
 from app.core.db import get_conn
 
 # -----------------------------------------------------------------------------
-// Logging
+# Logging
 # -----------------------------------------------------------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -20,8 +20,7 @@ logging.basicConfig(
 log = logging.getLogger("alarm-events")
 
 CHANNEL = os.getenv("ALARM_NOTIFY_CHANNEL", "alarm_events")
-__VERSION__ = "ae-2025-09-10T12:55Z"  # 👈 banner de versión para saber qué archivo cargó
-
+__VERSION__ = "ae-2025-09-10T13:15Z"
 log.info("alarm-events loaded file=%s version=%s channel=%s", __file__, __VERSION__, CHANNEL)
 
 
@@ -39,9 +38,8 @@ def _to_jsonable(obj):
 
 def _notify(payload: dict):
     """
-    Publica a través de pg_notify(nombre_canal, payload_text).
-    Evita el error de NOTIFY con parámetros bind ($1).
-    Hace commit tras publicar para garantizar entrega inmediata.
+    Publica a través de SELECT pg_notify(nombre_canal, payload_text).
+    Evita NOTIFY con %s (que rompe en psycopg v3) y hace commit explícito.
     """
     try:
         safe = _to_jsonable(payload)
@@ -54,14 +52,10 @@ def _notify(payload: dict):
         )
 
         with get_conn() as conn, conn.cursor() as cur:
-            # ✅ Forma compatible con binds en psycopg v3:
-            # SELECT pg_notify(channel_name, payload_text)
             cur.execute("SELECT pg_notify(%s, %s)", (CHANNEL, text))
-            # 👇 Asegura que se envíe la notificación si la conexión no está en autocommit
             try:
-                conn.commit()
+                conn.commit()  # por si la conexión no está en autocommit
             except Exception:
-                # si el get_conn ya usa autocommit, no pasa nada
                 pass
 
         log.info("notify done channel=%s size=%s", CHANNEL, size)
