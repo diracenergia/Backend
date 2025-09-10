@@ -1,15 +1,11 @@
 # app/services/alarm_events.py
 from __future__ import annotations
 
-import os
-import json
-import logging
-
+import os, json, logging
+from datetime import date, datetime
+from decimal import Decimal
 from app.core.db import get_conn
 
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -19,12 +15,23 @@ log = logging.getLogger("alarm-events")
 
 CHANNEL = os.getenv("ALARM_NOTIFY_CHANNEL", "alarm_events")
 
+def _to_jsonable(obj):
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat().replace("+00:00", "Z")
+    if isinstance(obj, dict):
+        return {k: _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_jsonable(v) for v in obj]
+    return obj
+
 def _notify(payload: dict):
     try:
-        text = json.dumps(payload)
+        safe = _to_jsonable(payload)
+        text = json.dumps(safe)
         size = len(text)
-        log.info("notify start channel=%s size=%s op=%s keys=%s",
-                 CHANNEL, size, payload.get("op"), list(payload.keys()))
+        log.info("notify start channel=%s size=%s op=%s keys=%s", CHANNEL, size, safe.get("op"), list(safe.keys()))
         with get_conn() as conn, conn.cursor() as cur:
             cur.execute(f'NOTIFY "{CHANNEL}", %s;', (text,))
         log.info("notify done channel=%s size=%s", CHANNEL, size)
