@@ -119,7 +119,7 @@ def _clear_one(alarm_id: int, *, asset_type: str, asset_id: int, code: str,
         publish_cleared(
             asset_type=asset_type, asset_id=asset_id, code=code,
             message=message or "", severity=severity_db, value=value,
-            threshold=None, ts_cleared=ts,
+            threshold=None,
         )
         log.info("clear_one published op=CLEARED asset=%s-%s code=%s ts=%s",
                  asset_type, asset_id, code, ts)
@@ -227,13 +227,12 @@ def eval_tank_alarm(tank_id: int, level_pct: Optional[float]) -> Optional[int]:
     try:
         publish_raised(
             asset_type="tank",
-            asset_id=tank_id,
-            code=alarm_code_upper,
-            message=message,
-            severity=severity_db_lower,
-            value=level_f,
+             asset_id=tank_id,
+             code=alarm_code_upper,
+             message=message,
+             severity=severity_db_lower,
+             value=level_f,
             threshold=threshold_alias,
-            ts_raised=ts,
         )
         log.info("publish ok op=RAISED tank_id=%s code=%s ts=%s", tank_id, alarm_code_upper, ts)
     except Exception as e:

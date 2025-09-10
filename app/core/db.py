@@ -1,6 +1,8 @@
 # app/core/db.py
 import os
+import socket
 from contextlib import contextmanager
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 import psycopg
@@ -20,7 +22,7 @@ def _main_raw_dsn() -> str:
     return os.getenv("DATABASE_URL") or os.getenv("DB_URL") or "postgresql://postgres:postgres@localhost:5432/munirdls"
 
 def _events_raw_dsn() -> str:
-    # DSN especial para LISTEN/NOTIFY (session pooler :6543 o directo :5432)
+    # DSN especial para LISTEN/NOTIFY.
     # Si no está seteado, cae al DSN principal.
     return os.getenv("EVENTS_DB_URL") or _main_raw_dsn()
 
@@ -43,8 +45,8 @@ try:
         min_size=1,
         max_size=10,
         max_idle=30,
-        timeout=10,                    # espera máx. por una conexión del pool
-        kwargs={"connect_timeout": 10} # timeout de conexión a PG
+        timeout=10,                     # espera máx. por una conexión del pool
+        kwargs={"connect_timeout": 10}  # timeout de conexión a PG
     )
 except Exception as e:
     print(f"[DB] psycopg_pool no disponible o fallo creando pool: {e}")
@@ -66,7 +68,8 @@ def get_conn():
 # -----------------------------
 # Conexión dedicada para LISTEN/NOTIFY (alarm listener)
 # IMPORTANTE: esta conexión NO debe pasar por PgBouncer en modo transaction.
-# Apuntá EVENTS_DB_URL al session pooler (:6543) o a la directa (:5432).
+# Apuntá EVENTS_DB_URL a un pooler en *session* o directo :5432 (sslmode=require).
+# Soporte de fallback IPv4 cuando el host resuelve a IPv6 y la red no lo soporta.
 # -----------------------------
 @contextmanager
 def get_events_conn():
@@ -75,5 +78,21 @@ def get_events_conn():
     - autocommit=True para que LISTEN reciba notificaciones.
     - No usa pool.
     """
-    with psycopg.connect(EVENTS_DSN, autocommit=True, connect_timeout=10) as conn:
-        yield conn
+    try:
+        with psycopg.connect(EVENTS_DSN, autocommit=True, connect_timeout=10) as conn:
+            yield conn
+            return
+    except psycopg.OperationalError as e:
+        # Fallback IPv4 si el host resolvió a IPv6 y la red no lo soporta
+        if ("Network is unreachable" in str(e) or "No route to host" in str(e)) and os.getenv("DB_FORCE_IPV4") == "1":
+            u = urlparse(EVENTS_DSN)
+            host = u.hostname
+            try:
+                ipv4 = socket.getaddrinfo(host, None, family=socket.AF_INET)[0][4][0]
+                with psycopg.connect(EVENTS_DSN, autocommit=True, connect_timeout=10, hostaddr=ipv4) as conn:
+                    yield conn
+                    return
+            except Exception:
+                pass
+        # Relevantar la excepción original si no hubo fallback
+        raise
