@@ -2,20 +2,7 @@
 from __future__ import annotations
 import os, time, threading, logging
 from typing import Optional, Dict, Any
-
 from app.core.db import get_conn
-
-# --- Sender de Telegram: usa el módulo local si existe; sino, POST directo ---
-try:
-    from app.services.telegram import send as tg_send  # tu función síncrona
-except Exception:
-    import requests
-    def tg_send(text: str):
-        token = os.environ["TELEGRAM_BOT_TOKEN"]
-        chat  = os.environ["TELEGRAM_CHAT_ID"]
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        r = requests.post(url, json={"chat_id": chat, "text": text, "parse_mode": "HTML"}, timeout=10)
-        r.raise_for_status()
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -24,9 +11,50 @@ logging.basicConfig(
 )
 log = logging.getLogger("alarm-poller")
 
+DEBUG_TG = os.getenv("TELEGRAM_DEBUG", "false").lower() in ("1", "true", "yes")
+
+# --- Sender de Telegram con LOGS ---
+try:
+    from app.services.telegram import send as _tg_send  # si tenés un sender propio
+    def tg_send(text: str):
+        if DEBUG_TG:
+            log.info("tg_send(local) preview len=%s", len(text))
+        _tg_send(text)
+        if DEBUG_TG:
+            log.info("tg_send(local) OK")
+except Exception:
+    import requests
+
+    def tg_send(text: str):
+        token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        chat  = os.environ.get("TELEGRAM_CHAT_ID")
+        if not token or not chat:
+            raise RuntimeError("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID")
+
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat, "text": text, "parse_mode": "HTML"}
+
+        if DEBUG_TG:
+            log.info("tg_send(HTTP) url=%s chat=%s len=%s", url, chat, len(text))
+            log.info("tg_send(HTTP) payload_head=%s", str(payload)[:200])
+
+        r = requests.post(url, json=payload, timeout=12)
+
+        body = None
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text[:500]}
+
+        if DEBUG_TG or r.status_code != 200 or not body.get("ok", False):
+            log.info("tg_send(HTTP) status=%s body=%s", r.status_code, body)
+
+        if r.status_code != 200 or not body.get("ok", False):
+            raise RuntimeError(f"Telegram fail status={r.status_code} body={body}")
+
+# ---- Config poller ----
 _thread: Optional[threading.Thread] = None
 _stop = threading.Event()
-
 BATCH = int(os.getenv("ALARM_POLL_BATCH", "50"))
 SLEEP_EMPTY = float(os.getenv("ALARM_POLL_SLEEP_EMPTY", "1.0"))
 SLEEP_BUSY  = float(os.getenv("ALARM_POLL_SLEEP_BUSY",  "0.2"))
@@ -60,24 +88,34 @@ def _process_once() -> int:
         cur.execute(sql, (BATCH,))
         rows = cur.fetchall()
         if not rows:
+            if DEBUG_TG:
+                log.debug("no_pending")
             return 0
 
         cols = [d[0] for d in cur.description]
+        log.info("pending=%s", len(rows))
+
         sent = 0
         for r in rows:
             a = dict(zip(cols, r))
             try:
-                tg_send(_fmt_alarm(a))  # síncrono
+                preview = f"{a['asset_type']}:{a['asset_id']}|{(a.get('code') or '').upper()}|{(a.get('severity') or '').upper()}"
+                log.info("sending alarm_id=%s %s", a["id"], preview)
+
+                tg_send(_fmt_alarm(a))  # envío
+
                 cur.execute("update public.alarms set tg_notified_at = now() where id = %s", (a["id"],))
                 sent += 1
+                log.info("sent_ok alarm_id=%s", a["id"])
             except Exception as e:
                 log.exception("telegram_error alarm_id=%s err=%s", a["id"], e)
 
         conn.commit()
+        log.info("cycle_done sent=%s", sent)
         return sent
 
 def _loop():
-    log.info("poller start batch=%s", BATCH)
+    log.info("poller start batch=%s only_active=%s", BATCH, ONLY_ACTIVE)
     while not _stop.is_set():
         try:
             n = _process_once()
