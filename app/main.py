@@ -6,9 +6,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
-from app.routes import test_routes
-app.include_router(test_routes.router)
-
 
 # --- Config centralizada con fallback a .env ---
 try:
