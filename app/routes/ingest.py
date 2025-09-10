@@ -8,6 +8,7 @@ from app.schemas.ingest import TankIngestIn, TankIngestOut
 from app.repos import tanks as repo
 from app.core.security import device_id_dep
 from app.services.alarms_eval import eval_tank_alarm  # debe existir
+from app.repos.presence import bump_presence  # ✅ presencia online/offline
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
@@ -29,6 +30,7 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
     - Inserta (tank_id, level_percent, volume_l, temperature_c, raw_json, device_id).
     - Mapea errores de DB a 400 (FK/Checks) o 500 (otros).
     - Evalúa alarmas en best-effort (no bloquea la respuesta).
+    - Hace bump de presencia del device.
     """
     # 1) Elegir device_id (preferimos el autenticado para evitar spoof)
     dev_from_auth = (auth or {}).get("device_id")
@@ -72,7 +74,14 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
             detail="ingest failed",
         )
 
-    # 4) Evaluación de alarmas (best-effort)
+    # 4) Bump de presencia (no crítico)
+    try:
+        if device_id_db:
+            bump_presence(device_id_db)
+    except Exception as e:
+        print(f"[presence] bump failed: {e}")
+
+    # 5) Evaluación de alarmas (best-effort)
     try:
         lvl = _get_level_percent(saved)
         print(f"[ingest] eval_tank_alarm tank={payload.tank_id} lvl={lvl}")
