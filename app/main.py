@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi import Body
 
 # --- Config centralizada con fallback a .env ---
 try:
@@ -88,6 +89,10 @@ from app.routes.commands_pumps import router as commands_pump_router
 
 from app.routes.alarms import router as alarms_router
 from app.routes.audit import router as audit_router
+
+from app.routes.diag_listener import router as diag_listener_router
+app.include_router(diag_listener_router)
+
 
 # Router opcional: CRUD de metadatos de tanques
 try:
@@ -308,3 +313,16 @@ def which_alarm_events():
         }
     except Exception as e:
         return {"error": str(e)}
+
+@app.post("/__diag_publish")
+def __diag_publish(payload: dict = Body(...)):
+    """
+    Empuja un evento al canal 'alarm_events' usando alarm_events._notify(payload).
+    Sirve para testear el listener/Telegram sin depender del router aparte.
+    """
+    try:
+        from app.services import alarm_events
+        alarm_events._notify(payload)
+        return {"ok": True, "published": payload}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"publish failed: {e}")
