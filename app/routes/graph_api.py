@@ -3,40 +3,71 @@ from fastapi import APIRouter, HTTPException
 from typing import Optional, Literal
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
-from app.core.db import pool
 from pydantic import BaseModel
+
+# usa el mismo helper que /health/db
+from app.core.db import get_conn
 
 router = APIRouter()
 
 # ----- Topología -----
 @router.get("/graph/nodes")
 def graph_nodes():
-    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute("SELECT type, asset_id, name, code FROM v_asset_nodes ORDER BY type, name;")
-        return cur.fetchall()
+    try:
+        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("""
+                SELECT type, asset_id, name, code
+                FROM v_asset_nodes
+                ORDER BY type, name;
+            """)
+            return cur.fetchall()
+    except Exception as e:
+        # Log visible en Render logs y mensaje claro al cliente
+        print(f"[graph_nodes] {e}")
+        raise HTTPException(status_code=500, detail=f"graph_nodes failed: {e}")
 
 @router.get("/graph/edges")
 def graph_edges():
-    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute("""
-            SELECT id, from_type, from_id, from_name, from_code,
-                   to_type,   to_id,   to_name,   to_code,
-                   pipe_diameter_mm, length_m, is_active
-            FROM v_topology_edges
-            ORDER BY id;
-        """)
-        return cur.fetchall()
+    try:
+        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("""
+                SELECT id, from_type, from_id, from_name, from_code,
+                       to_type,   to_id,   to_name,   to_code,
+                       pipe_diameter_mm, length_m, is_active
+                FROM v_topology_edges
+                ORDER BY id;
+            """)
+            return cur.fetchall()
+    except Exception as e:
+        print(f"[graph_edges] {e}")
+        raise HTTPException(status_code=500, detail=f"graph_edges failed: {e}")
+
+# (Opcional) diagnóstico rápido de DB/vistas:
+# @router.get("/graph/_diag")
+# def graph_diag():
+#     try:
+#         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+#             cur.execute("SELECT current_database() AS db, current_schema() AS schema;")
+#             info = cur.fetchone()
+#             cur.execute("""
+#                 SELECT to_regclass('public.v_asset_nodes') AS v_nodes,
+#                        to_regclass('public.v_topology_edges') AS v_edges;
+#             """)
+#             exists = cur.fetchone()
+#             return {"ok": True, "db": info, "views": exists}
+#     except Exception as e:
+#         raise HTTPException(500, f"diag failed: {e}")
 
 # ----- Pumps -----
 @router.get("/pumps")
 def list_pumps():
-    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute("SELECT id, name FROM pumps ORDER BY id;")
         return cur.fetchall()
 
 @router.get("/pumps/{pump_id}/latest")
 def pump_latest(pump_id: int):
-    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute("SELECT * FROM v_pump_latest WHERE pump_id=%s;", (pump_id,))
         row = cur.fetchone()
         if not row:
@@ -56,7 +87,7 @@ def pump_command(pump_id: int, body: PumpCommandIn):
     elif body.cmd.upper() in ("AUTO","MAN"):
         payload = {"mode": "auto" if body.cmd.upper()=="AUTO" else "manual"}
 
-    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute("""
             INSERT INTO pump_commands (pump_id, cmd, payload, requested_by)
             VALUES (%s, %s, %s, %s)
@@ -67,13 +98,13 @@ def pump_command(pump_id: int, body: PumpCommandIn):
 # ----- Tanks -----
 @router.get("/tanks")
 def list_tanks():
-    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute("SELECT id, name FROM tanks ORDER BY id;")
         return cur.fetchall()
 
 @router.get("/tanks/{tank_id}/latest")
 def tank_latest(tank_id: int):
-    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute("SELECT * FROM v_tank_latest WHERE tank_id=%s;", (tank_id,))
         row = cur.fetchone()
         if not row:
@@ -87,7 +118,7 @@ class TankCommandIn(BaseModel):
 
 @router.post("/tanks/{tank_id}/command")
 def tank_command(tank_id: int, body: TankCommandIn):
-    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute("""
             INSERT INTO tank_commands (tank_id, cmd, payload, requested_by)
             VALUES (%s, %s, %s, %s)
@@ -98,7 +129,7 @@ def tank_command(tank_id: int, body: TankCommandIn):
 # ----- Alarms -----
 @router.get("/alarms")
 def list_alarms(active: Optional[bool] = None):
-    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         if active is True:
             cur.execute("SELECT * FROM alarms WHERE is_active=TRUE ORDER BY ts_raised DESC LIMIT 500;")
         elif active is False:
