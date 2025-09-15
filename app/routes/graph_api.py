@@ -68,10 +68,12 @@ def list_pumps():
 @router.get("/pumps/{pump_id}/latest")
 def pump_latest(pump_id: int):
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute("SELECT * FROM v_pump_latest WHERE pump_id=%s;", (pump_id,))
+        # ⬇️ usar la vista full
+        cur.execute("SELECT * FROM v_pump_latest_full WHERE pump_id=%s;", (pump_id,))
         row = cur.fetchone()
         if not row:
-            raise HTTPException(404, "Pump or reading not found")
+            # si la bomba no existe → 404 real
+            raise HTTPException(404, "Pump not found")
         return row
 
 class PumpCommandIn(BaseModel):
@@ -105,6 +107,13 @@ def list_tanks():
 @router.get("/tanks/{tank_id}/latest")
 def tank_latest(tank_id: int):
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        # si querés el mismo comportamiento para tanques:
+        # cur.execute("SELECT * FROM v_tank_latest_full WHERE tank_id=%s;", (tank_id,))
+        # row = cur.fetchone()
+        # if not row: raise HTTPException(404, "Tank not found")
+        # return row
+
+        # o dejá tu versión actual si ya te sirve:
         cur.execute("SELECT * FROM v_tank_latest WHERE tank_id=%s;", (tank_id,))
         row = cur.fetchone()
         if not row:
