@@ -7,6 +7,10 @@ from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi import Body
+from app.routes.graph_api import router as graph_router
+
+app.include_router(graph_router)  # opcional: prefix="/infra"
+
 
 # --- Config centralizada con fallback a .env ---
 try:
@@ -132,6 +136,10 @@ if tanks_router:
 # Alarmas / Auditoría
 app.include_router(alarms_router)
 app.include_router(audit_router)
+
+# 🔌 NUEVO: Infra / Graph API
+app.include_router(graph_router, prefix="/infra")  # ✅ ahora sí, después de crear app
+
 
 # 🔧 Routers de test / diagnóstico
 try:
