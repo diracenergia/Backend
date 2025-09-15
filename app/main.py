@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi import Body
 from app.routes.graph_api import router as graph_router
 
-app.include_router(graph_router)  # opcional: prefix="/infra"
+
 
 
 # --- Config centralizada con fallback a .env ---
@@ -139,7 +139,6 @@ app.include_router(audit_router)
 
 # 🔌 NUEVO: Infra / Graph API
 app.include_router(graph_router, prefix="/infra")  # ✅ ahora sí, después de crear app
-
 
 # 🔧 Routers de test / diagnóstico
 try:
