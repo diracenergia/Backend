@@ -8,6 +8,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi import Body
 from app.routes.graph_api import router as graph_router
+from app.routes.locations import router as locations_router
 
 
 
@@ -139,6 +140,11 @@ app.include_router(audit_router)
 
 # 🔌 NUEVO: Infra / Graph API
 app.include_router(graph_router, prefix="/infra")  # ✅ ahora sí, después de crear app
+
+
+app.include_router(graph_router, prefix="/infra")   # graph_api sin prefix interno
+app.include_router(locations_router)                # locations ya trae prefix="/infra"
+
 
 # 🔧 Routers de test / diagnóstico
 try:
