@@ -1,17 +1,16 @@
 # app/main.py
 import os
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi import Body
+from fastapi.responses import JSONResponse
+
+# Routers de infraestructura
 from app.routes.graph_api import router as graph_router
 from app.routes.locations import router as locations_router
-
-
-
 
 # --- Config centralizada con fallback a .env ---
 try:
@@ -79,6 +78,20 @@ app.add_middleware(
 
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
+# ===== Contexto multi-tenant (RLS) =====
+# Este middleware evalúa la dependencia tenant_ctx_dep al inicio de cada request
+# para setear ContextVars (user/org/rol) que app/core/db.py usa con SET LOCAL app.*.
+from app.core.tenancy import tenant_ctx_dep
+
+@app.middleware("http")
+async def _tenant_context_middleware(request, call_next):
+    try:
+        # Lee X-Org-Id / X-User-Id de headers y los deja en ContextVars
+        await tenant_ctx_dep(request)
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
+    return await call_next(request)
+
 # ===== Routers principales =====
 from app.routes.ingest import router as ingest_tank_router
 from app.routes.latest import router as latest_tank_router
@@ -139,31 +152,8 @@ app.include_router(alarms_router)
 app.include_router(audit_router)
 
 # 🔌 NUEVO: Infra / Graph API
-app.include_router(graph_router, prefix="/infra")  # ✅ ahora sí, después de crear app
-
-
-app.include_router(graph_router, prefix="/infra")   # graph_api sin prefix interno
+app.include_router(graph_router, prefix="/infra")   # graph_api
 app.include_router(locations_router)                # locations ya trae prefix="/infra"
-
-# 🔧 Routers de test / diagnóstico
-# 🔧 Routers de test / diagnóstico
-try:
-    from app.routes.test_telegram import router as test_telegram_router
-    app.include_router(test_telegram_router)
-except Exception as e:
-    print(f"⚠️ test_telegram router no disponible: {e}")
-
-try:
-    from app.routes.test_alarm import router as test_alarm_router
-    app.include_router(test_alarm_router)
-except Exception as e:
-    print(f"⚠️ test_alarm router no disponible: {e}")
-
-try:
-    from app.routes.debug_alarm import router as debug_alarm_router
-    app.include_router(debug_alarm_router)
-except Exception as e:
-    print(f"⚠️ debug_alarm router no disponible: {e}")
 
 # 🔌 WebSocket
 app.include_router(ws_router)

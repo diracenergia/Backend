@@ -36,6 +36,41 @@ if os.getenv("DEBUG_EVENTS_DSN") == "1":
     print(f"[DB] EVENTS_DSN (repr): {EVENTS_DSN!r}")
 
 # -----------------------------
+# Contexto multi-tenant (org/user/role) para RLS
+# -----------------------------
+# Importamos perezosamente para no romper si aún no creaste tenancy.py,
+# pero en producción debería existir.
+try:
+    from app.core.tenancy import get_context  # devuelve (user_id, org_id, role)
+except Exception:  # pragma: no cover
+    def get_context():
+        return (None, None, None)
+
+def _apply_rls_context(conn: "psycopg.Connection") -> None:
+    """
+    Asegura una transacción abierta y setea variables de sesión
+    scopeadas a la TX actual: app.org_id, app.user_id, app.role.
+    """
+    user_id, org_id, role = (None, None, None)
+    try:
+        user_id, org_id, role = get_context()
+    except Exception:
+        # Si no hay contexto, no seteamos nada (RLS devolverá 0 filas)
+        pass
+
+    # SET LOCAL requiere estar dentro de una transacción
+    with conn.cursor() as cur:
+        # Si ya hay transacción activa, BEGIN no rompe; en psycopg3
+        # una transacción comienza al primer comando; preferimos forzarla:
+        cur.execute("BEGIN")
+        if org_id is not None:
+            cur.execute("SET LOCAL app.org_id = %s", (int(org_id),))
+        if user_id is not None:
+            cur.execute("SET LOCAL app.user_id = %s", (int(user_id),))
+        if role is not None:
+            cur.execute("SET LOCAL app.role = %s", (str(role),))
+
+# -----------------------------
 # Pool para operaciones normales (HTTP/API, repos, etc.)
 # -----------------------------
 try:
@@ -57,12 +92,17 @@ def get_conn():
     """
     Conexión para operaciones normales de la app.
     Usa pool si está disponible.
+    - Abre una transacción y setea SET LOCAL app.* (RLS/tenancy).
+    - Tus repos pueden seguir haciendo conn.cursor(...) y conn.commit().
+    - Si olvidan commit, al cerrar la conexión se hará rollback (seguro).
     """
     if pool is not None:
         with pool.connection() as conn:
+            _apply_rls_context(conn)
             yield conn
     else:
         with psycopg.connect(DSN, connect_timeout=10) as conn:
+            _apply_rls_context(conn)
             yield conn
 
 # -----------------------------
@@ -77,6 +117,8 @@ def get_events_conn():
     Conexión dedicada para el listener (LISTEN/NOTIFY).
     - autocommit=True para que LISTEN reciba notificaciones.
     - No usa pool.
+    - No setea SET LOCAL por defecto (no lo necesitás para escuchar),
+      pero podés agregarlo si tu listener consulta tablas multi-tenant.
     """
     try:
         with psycopg.connect(EVENTS_DSN, autocommit=True, connect_timeout=10) as conn:
