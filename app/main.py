@@ -145,7 +145,7 @@ app.include_router(graph_router, prefix="/infra")  # ✅ ahora sí, después de 
 app.include_router(graph_router, prefix="/infra")   # graph_api sin prefix interno
 app.include_router(locations_router)                # locations ya trae prefix="/infra"
 
-
+# 🔧 Routers de test / diagnóstico
 # 🔧 Routers de test / diagnóstico
 try:
     from app.routes.test_telegram import router as test_telegram_router
