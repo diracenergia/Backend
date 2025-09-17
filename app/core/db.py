@@ -106,21 +106,19 @@ def _apply_rls_context(conn: "psycopg.Connection") -> None:
 
 # -----------------------------
 # Pool para operaciones normales (HTTP/API, repos, etc.)
+## -----------------------------
+# Pool para operaciones normales (HTTP/API, repos, etc.)
 # -----------------------------
 pool = None
 try:
     if ConnectionPool is not None:
-        _pool_kwargs: dict = {"connect_timeout": 10}
-        if MAIN_IPV4:
-            _pool_kwargs["hostaddr"] = MAIN_IPV4
-
         pool = ConnectionPool(
-            conninfo=DSN,
+            conninfo=DSN,          # DSN debe incluir ?sslmode=require&channel_binding=disable si usás pooler
             min_size=1,
             max_size=10,
             max_idle=30,
-            timeout=10,             # espera máx. por una conexión del pool
-            kwargs=_pool_kwargs,    # kwargs hacia psycopg.connect(...)
+            timeout=10,            # espera máx. para obtener una conexión del pool
+            kwargs={"connect_timeout": 10},  # pasa tal cual a psycopg.connect(...)
         )
 except Exception as e:
     print(f"[DB] psycopg_pool no disponible o fallo creando pool: {e}")
@@ -133,22 +131,16 @@ def get_conn():
     Usa pool si está disponible.
     - Abre una transacción y setea SET LOCAL app.* (RLS/tenancy).
     - Tus repos pueden usar conn.cursor() y hacer commit/rollback cuando quieran.
-    - Si olvidan commit, al cerrar la conexión el driver hace rollback (seguro).
+    - Si olvidan commit, al cerrar la conexión el driver hace rollback.
     """
     if pool is not None:
         with pool.connection() as conn:
             _apply_rls_context(conn)
             yield conn
     else:
-        if MAIN_IPV4:
-            with psycopg.connect(DSN, connect_timeout=10) as conn:
-
-                _apply_rls_context(conn)
-                yield conn
-        else:
-            with psycopg.connect(DSN, connect_timeout=10) as conn:
-                _apply_rls_context(conn)
-                yield conn
+        with psycopg.connect(DSN, connect_timeout=10) as conn:
+            _apply_rls_context(conn)
+            yield conn
 
 # -----------------------------
 # Conexión dedicada para LISTEN/NOTIFY (alarm listener)
