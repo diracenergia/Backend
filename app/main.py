@@ -79,18 +79,31 @@ app.add_middleware(
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # ===== Contexto multi-tenant (RLS) =====
-# Este middleware evalúa la dependencia tenant_ctx_dep al inicio de cada request
-# para setear ContextVars (user/org/rol) que app/core/db.py usa con SET LOCAL app.*.
+# Bypass en paths públicos; el resto exige X-Org-Id (y opcional X-User-Id)
 from app.core.tenancy import tenant_ctx_dep
+
+# Rutas públicas que NO requieren tenant
+_PUBLIC_PATHS = {
+    "/", "/health", "/health/db", "/favicon.ico",
+    "/__config", "/openapi.json", "/docs", "/redoc",
+    "/__alarm_poller_status", "/__which_alarms_eval", "/__which_alarm_events",
+}
+# Prefijos públicos (estáticos, UI, websockets si aplica)
+_PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws")
 
 @app.middleware("http")
 async def _tenant_context_middleware(request, call_next):
+    path = request.url.path
+    # Dejar pasar paths/prefijos públicos sin X-Org-Id
+    if path in _PUBLIC_PATHS or any(path.startswith(p) for p in _PUBLIC_PREFIXES):
+        return await call_next(request)
+    # Para el resto, inyectar contexto tenant (puede lanzar 400 si falta el header)
     try:
-        # Lee X-Org-Id / X-User-Id de headers y los deja en ContextVars
         await tenant_ctx_dep(request)
     except HTTPException as e:
         return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
     return await call_next(request)
+
 
 # ===== Routers principales =====
 from app.routes.ingest import router as ingest_tank_router
