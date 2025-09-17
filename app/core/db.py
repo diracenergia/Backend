@@ -87,22 +87,24 @@ def _apply_rls_context(conn: "psycopg.Connection") -> None:
     """
     Asegura una transacción abierta y setea variables de sesión
     scopeadas a la TX actual: app.org_id, app.user_id, app.role.
+    Usamos set_config(..., ..., true) porque SET LOCAL no soporta bind params.
     """
     try:
         user_id, org_id, role = get_context()
     except Exception:
         user_id = org_id = role = None
 
-    # Si no hay contexto, igual abrimos TX si hace falta: las policies RLS
-    # harán que SELECT devuelva 0 filas y INSERT/UPDATE fallen si corresponden.
     with conn.cursor() as cur:
         _begin_if_idle(cur)
+
+        # IMPORTANTE: set_config recibe strings
         if org_id is not None:
-            cur.execute("SET LOCAL app.org_id = %s", (int(org_id),))
+            cur.execute("SELECT set_config('app.org_id', %s, true)", (str(int(org_id)),))
         if user_id is not None:
-            cur.execute("SET LOCAL app.user_id = %s", (int(user_id),))
+            cur.execute("SELECT set_config('app.user_id', %s, true)", (str(int(user_id)),))
         if role is not None:
-            cur.execute("SET LOCAL app.role = %s", (str(role),))
+            cur.execute("SELECT set_config('app.role', %s, true)", (str(role),))
+
 
 # -----------------------------
 # Pool para operaciones normales (HTTP/API, repos, etc.)
