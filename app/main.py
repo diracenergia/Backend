@@ -93,7 +93,7 @@ _PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws")
 
 @app.middleware("http")
 async def _tenant_context_middleware(request, call_next):
-    # ✅ No validar tenant en preflight
+    # ✅ Dejar pasar preflight de CORS
     if request.method == "OPTIONS":
         return await call_next(request)
 
@@ -101,13 +101,19 @@ async def _tenant_context_middleware(request, call_next):
     if path in _PUBLIC_PATHS or any(path.startswith(p) for p in _PUBLIC_PREFIXES):
         return await call_next(request)
 
-    # ✅ Para el resto, sí validá tenant/autenticación
+    # ✅ Pasar headers como STRINGS (no Header(...))
     try:
-        await tenant_ctx_dep(request)
+        await tenant_ctx_dep(
+            request,
+            authorization=request.headers.get("authorization"),
+            x_org_id=request.headers.get("x-org-id"),
+            x_user_id=request.headers.get("x-user-id"),
+            x_role=request.headers.get("x-role"),
+        )
     except HTTPException as e:
         return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
-    return await call_next(request)
 
+    return await call_next(request)
 
 
 # ===== Routers principales =====
