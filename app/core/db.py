@@ -141,7 +141,8 @@ def get_conn():
             yield conn
     else:
         if MAIN_IPV4:
-            with psycopg.connect(DSN, connect_timeout=10, hostaddr=MAIN_IPV4) as conn:
+            with psycopg.connect(DSN, connect_timeout=10) as conn:
+
                 _apply_rls_context(conn)
                 yield conn
         else:
