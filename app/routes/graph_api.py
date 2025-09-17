@@ -1,4 +1,4 @@
-# app/routes/graph_api.py (o donde tengas el router)
+# app/routes/graph_api.py
 from fastapi import APIRouter, HTTPException, Request
 from psycopg.rows import dict_row
 from app.core.db import get_conn
@@ -9,11 +9,9 @@ router = APIRouter()
 def graph_nodes(request: Request):
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-            # Si manejás multi-tenant por header
             org_id = request.headers.get("X-Org-Id")
             if org_id:
                 cur.execute("SET LOCAL app.org_id = %s", (org_id,))
-
             cur.execute("""
                 SELECT
                   type,
@@ -36,7 +34,6 @@ def graph_edges(request: Request):
             org_id = request.headers.get("X-Org-Id")
             if org_id:
                 cur.execute("SET LOCAL app.org_id = %s", (org_id,))
-
             cur.execute("""
                 SELECT id, from_type, from_id, from_name, from_code,
                        to_type,   to_id,   to_name,   to_code,
@@ -61,9 +58,9 @@ def graph_all(request: Request):
             cur.execute("""SELECT * FROM v_topology_edges WHERE is_active ORDER BY id;""")
             raw_edges = cur.fetchall()
 
+        # IDs únicos: <type>:<code> si hay code; si no, <type>_<asset_id>
         nodes = []
         for r in raw_nodes:
-            # UID único: si hay code => "<type>:<code>", sino "<type>_<asset_id>"
             nid = f'{r["type"]}:{r["code"]}' if r["code"] else f'{r["type"]}_{r["asset_id"]}'
             node = {"id": nid, "type": r["type"], "name": r["name"]}
             if r["type"] == "tank":
