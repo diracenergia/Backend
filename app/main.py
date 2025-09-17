@@ -93,16 +93,21 @@ _PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws")
 
 @app.middleware("http")
 async def _tenant_context_middleware(request, call_next):
+    # ✅ No validar tenant en preflight
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
     path = request.url.path
-    # Dejar pasar paths/prefijos públicos sin X-Org-Id
     if path in _PUBLIC_PATHS or any(path.startswith(p) for p in _PUBLIC_PREFIXES):
         return await call_next(request)
-    # Para el resto, inyectar contexto tenant (puede lanzar 400 si falta el header)
+
+    # ✅ Para el resto, sí validá tenant/autenticación
     try:
         await tenant_ctx_dep(request)
     except HTTPException as e:
         return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
     return await call_next(request)
+
 
 
 # ===== Routers principales =====
