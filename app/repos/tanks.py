@@ -355,3 +355,150 @@ def get_config_by_id(tank_id: int) -> Dict[str, Any]:
     cfg["high"]      = cfg["high_pct"]
     cfg["very_high"] = cfg["high_high_pct"]
     return cfg
+
+
+# ======================================================
+# ESTADOS DESDE ALARMAS (Option B)  - NUEVO
+# ======================================================
+def list_tank_status_from_alarms(user_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    Devuelve el estado de cada tanque a partir de:
+      - v_tank_latest_full (has_data, level_percent, ts)
+      - alarms LEVEL activas por tanque (asset_type='tank', code='LEVEL')
+    Regla de color:
+      - 'disconnected' si has_data = false
+      - 'critical' si hay alarma activa con severidad critical
+      - 'warning' si hay alarma activa con severidad warning o info
+      - 'ok' en el resto
+    Si pasás user_id, filtra por dueño del tanque.
+    """
+    base = """
+        WITH last AS (
+          SELECT s.tank_id, s.tank_name, s.ts, s.level_percent, s.has_data, t.user_id
+          FROM public.v_tank_latest_full s
+          LEFT JOIN public.tanks t ON t.id = s.tank_id
+        ),
+        active_alarm AS (
+          SELECT
+            a.asset_id AS tank_id,
+            MAX(CASE a.severity
+                  WHEN 'critical' THEN 3
+                  WHEN 'warning'  THEN 2
+                  WHEN 'info'     THEN 1
+                  ELSE 0
+                END) AS severity_rank
+          FROM public.alarms a
+          WHERE a.asset_type = 'tank'
+            AND a.code = 'LEVEL'
+            AND a.is_active = TRUE
+          GROUP BY a.asset_id
+        )
+        SELECT
+          l.tank_id,
+          l.tank_name,
+          l.ts,
+          l.level_percent,
+          l.has_data,
+          CASE
+            WHEN l.has_data IS FALSE THEN 'disconnected'
+            WHEN COALESCE(aa.severity_rank, 0) = 3 THEN 'critical'
+            WHEN COALESCE(aa.severity_rank, 0) IN (1,2) THEN 'warning'
+            ELSE 'ok'
+          END AS status,
+          CASE
+            WHEN l.has_data IS FALSE THEN '#9CA3AF'  -- gris
+            WHEN COALESCE(aa.severity_rank, 0) = 3 THEN '#EF4444'  -- rojo (opcional)
+            WHEN COALESCE(aa.severity_rank, 0) IN (1,2) THEN '#F59E0B'  -- amarillo
+            ELSE '#10B981'  -- verde
+          END AS color_hex
+        FROM last l
+        LEFT JOIN active_alarm aa ON aa.tank_id = l.tank_id
+        {where}
+        ORDER BY l.tank_id;
+    """
+    where = "WHERE l.user_id = %s" if user_id is not None else ""
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        if user_id is not None:
+            cur.execute(base.format(where=where), (user_id,))
+        else:
+            cur.execute(base.format(where=where))
+        return cur.fetchall()
+
+# -------------------------
+# (Opcional) crear la vista
+# -------------------------
+def create_view_tank_status_from_alarms() -> None:
+    """
+    Crea/actualiza la vista v_tank_status_from_alarms (si preferís resolver vía vista).
+    Podés llamarla en una migración simple o al inicio de la app.
+    """
+    sql_q = """
+    CREATE OR REPLACE VIEW public.v_tank_status_from_alarms AS
+    WITH last AS (
+      SELECT
+        s.tank_id,
+        s.tank_name,
+        s.ts,
+        s.level_percent,
+        s.has_data
+      FROM public.v_tank_latest_full s
+    ),
+    active_alarm AS (
+      SELECT
+        a.asset_id AS tank_id,
+        MAX(CASE a.severity
+              WHEN 'critical' THEN 3
+              WHEN 'warning'  THEN 2
+              WHEN 'info'     THEN 1
+              ELSE 0
+            END) AS severity_rank
+      FROM public.alarms a
+      WHERE a.asset_type = 'tank'
+        AND a.code = 'LEVEL'
+        AND a.is_active = TRUE
+      GROUP BY a.asset_id
+    )
+    SELECT
+      l.tank_id,
+      l.tank_name,
+      l.ts,
+      l.level_percent,
+      l.has_data,
+      CASE
+        WHEN l.has_data IS FALSE THEN 'disconnected'
+        WHEN COALESCE(aa.severity_rank, 0) = 3 THEN 'critical'
+        WHEN COALESCE(aa.severity_rank, 0) IN (1,2) THEN 'warning'
+        ELSE 'ok'
+      END AS status,
+      CASE
+        WHEN l.has_data IS FALSE THEN '#9CA3AF'
+        WHEN COALESCE(aa.severity_rank, 0) = 3 THEN '#EF4444'
+        WHEN COALESCE(aa.severity_rank, 0) IN (1,2) THEN '#F59E0B'
+        ELSE '#10B981'
+      END AS color_hex
+    FROM last l
+    LEFT JOIN active_alarm aa ON aa.tank_id = l.tank_id
+    ORDER BY l.tank_id;
+    """
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql_q)
+        conn.commit()
+
+# -------------------------
+# (Opcional) índices útiles
+# -------------------------
+def ensure_indexes_for_alarm_status() -> None:
+    """
+    Crea índices sugeridos para acelerar el lookup de alarmas LEVEL activas por tanque.
+    Idempotente con IF NOT EXISTS.
+    """
+    sqls = [
+        """
+        CREATE INDEX IF NOT EXISTS idx_alarms_tank_level_active
+          ON public.alarms (asset_type, code, is_active, asset_id);
+        """,
+    ]
+    with get_conn() as conn, conn.cursor() as cur:
+        for q in sqls:
+            cur.execute(q)
+        conn.commit()

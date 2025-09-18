@@ -1,10 +1,10 @@
 # app/schemas/tanks.py
-from typing import Optional, Dict, Any, Literal
+from typing import Optional, Dict, Any, Literal, List
 from pydantic import BaseModel, Field
 from datetime import datetime
 
 # -----------------------
-# Tanques (metadatos) — por si algún router los usa
+# Tanques (metadatos)
 # -----------------------
 class TankBase(BaseModel):
     name: str = Field(..., min_length=1, max_length=64)
@@ -30,7 +30,7 @@ class TankOut(TankBase):
 # -----------------------
 # Comandos a tanques (tabla: public.tank_commands)
 # -----------------------
-# Valores válidos según tu CHECK constraint:
+# Valores válidos según CHECK:
 #   cmd IN ('SET_VALVE','SET_LEAK','SET_NOISE','SET_TANK_LEVEL','SCENARIO','SET_PERIODS')
 #   status IN ('queued','sent','acked','failed','expired')
 
@@ -53,3 +53,20 @@ class TankCommandOut(BaseModel):
     ts_acked: Optional[datetime] = None
     status: StatusLiteral
     error: Optional[str] = None
+
+# -----------------------
+# Status de tanques (desde alarmas)
+# -----------------------
+TankStatusLiteral = Literal["disconnected", "warning", "critical", "ok"]
+
+class TankStatusOut(BaseModel):
+    tank_id: int
+    tank_name: str
+    ts: Optional[datetime] = None
+    level_percent: Optional[float] = Field(None, ge=0, le=100)
+    has_data: bool
+    status: TankStatusLiteral
+    color_hex: str = Field(..., description="Color sugerido para pintar el tanque (e.g. #9CA3AF)")
+
+# Si querés tipar la lista para el endpoint de listado:
+# TankStatusList = List[TankStatusOut]
