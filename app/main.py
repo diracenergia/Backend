@@ -7,6 +7,9 @@ from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
+from app.routes.kpi import router as kpi_router
+
+
 
 # Routers de infraestructura
 from app.routes.graph_api import router as graph_router
@@ -234,6 +237,10 @@ def tg_env():
         "BOT_head": (token[:8] + "...") if token else "",
         "CHAT": _get_env("TELEGRAM_CHAT_ID", ""),
     }
+
+
+
+app.include_router(kpi_router)
 
 # ===== Conexión (diagnóstico) =====
 try:
