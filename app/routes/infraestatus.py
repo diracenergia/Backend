@@ -1,8 +1,10 @@
-# src/routers/infraestatus.py
 from fastapi import APIRouter, HTTPException
-from asyncpg import Connection
+import psycopg
 from typing import List
 from pydantic import BaseModel
+
+# Configura tu URL de conexión a la base de datos
+DATABASE_URL = "postgresql://postgres:password@localhost/dbname"  # Cambia esto a tu URL de conexión real
 
 # Modelo de respuesta
 class TankStatusResponse(BaseModel):
@@ -16,7 +18,7 @@ class TankStatusResponse(BaseModel):
     status: str
 
 # Consulta para obtener el estado de los tanques
-async def get_tank_status(connection: Connection) -> List[TankStatusResponse]:
+def get_tank_status() -> List[TankStatusResponse]:
     query = """
     SELECT 
         t.id,
@@ -42,26 +44,34 @@ async def get_tank_status(connection: Connection) -> List[TankStatusResponse]:
     WHERE
         t.org_id = 1;
     """
-    rows = await connection.fetch(query)
-    
-    return [TankStatusResponse(
-        id=row["id"],
-        name=row["name"],
-        level_percent=row["level_percent"],
-        low_pct=row["low_pct"],
-        low_low_pct=row["low_low_pct"],
-        high_pct=row["high_pct"],
-        high_high_pct=row["high_high_pct"],
-        status=row["status"]
-    ) for row in rows]
+    # Establecemos la conexión con la base de datos
+    with psycopg.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute(query)
+            rows = cur.fetchall()
+
+    # Procesamos los resultados y los retornamos
+    return [
+        TankStatusResponse(
+            id=row[0],
+            name=row[1],
+            level_percent=row[2],
+            low_pct=row[3],
+            low_low_pct=row[4],
+            high_pct=row[5],
+            high_high_pct=row[6],
+            status=row[7]
+        )
+        for row in rows
+    ]
 
 # Crear el router
 router = APIRouter()
 
 # Endpoint para obtener los estados de los tanques
 @router.get("/tank_statuses", response_model=List[TankStatusResponse])
-async def tank_statuses(connection: Connection):
+async def tank_statuses():
     try:
-        return await get_tank_status(connection)
+        return get_tank_status()
     except Exception as e:
         raise HTTPException(status_code=500, detail="Error al obtener los datos de los tanques")
