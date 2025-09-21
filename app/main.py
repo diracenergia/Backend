@@ -1,13 +1,28 @@
 # app/main.py
 import os
+import sys
+import time
+import json
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
+
+# ===== LOGGING GLOBAL =====
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("rdls")
+logger.info(f"[boot] LOG_LEVEL={LOG_LEVEL}")
 
 # ===== Routers propios =====
 from app.routes.kpi import router as kpi_router
@@ -63,6 +78,50 @@ def _get_env(name: str, default: str = "") -> str:
 APP_TITLE = _get_env("APP_TITLE", "ESP32 Tank/Pump API")
 APP_VERSION = _get_env("APP_VERSION", "") or _get_env("RENDER_GIT_COMMIT", "")[:8]
 app = FastAPI(title=APP_TITLE, version=APP_VERSION or None)
+
+# ===== Middleware de LOG de request/response (antes de tenancy para ver TODO) =====
+class LoggingMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app):
+        super().__init__(app)
+        self._log = logging.getLogger("rdls.http")
+
+    async def dispatch(self, request: Request, call_next):
+        t0 = time.time()
+        hdr = request.headers
+
+        # headers “seguros” (sin exponer secretos)
+        safe_headers = {
+            "x-org-id": hdr.get("x-org-id"),
+            "x-device-id": hdr.get("x-device-id"),
+            "x-api-key-present": bool(hdr.get("x-api-key")),
+            "authorization-present": bool(hdr.get("authorization")),
+            "content-type": hdr.get("content-type"),
+        }
+
+        # Sólo muestreamos body de ingest para no saturar
+        body_text = None
+        if (request.url.path, request.method) in {
+            ("/ingest/tank", "POST"),
+            ("/ingest/pump", "POST"),
+        }:
+            try:
+                body_bytes = await request.body()
+                body_text = body_bytes.decode("utf-8")[:2000]  # truncado
+            except Exception as e:
+                body_text = f"<no-body: {e}>"
+
+        self._log.info(f"[REQ] {request.method} {request.url.path} {safe_headers} body={body_text}")
+
+        try:
+            response = await call_next(request)
+            dt = (time.time() - t0) * 1000
+            self._log.info(f"[RES] {request.method} {request.url.path} status={response.status_code} {dt:.1f}ms")
+            return response
+        except Exception:
+            self._log.exception(f"[ERR] {request.method} {request.url.path} crashed")
+            raise
+
+app.add_middleware(LoggingMiddleware)
 
 # ===== CORS =====
 _raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
@@ -133,6 +192,7 @@ async def _tenant_context_middleware(request: Request, call_next):
             x_role=request.headers.get("x-role"),
         )
     except HTTPException as e:
+        logger.warning(f"[tenant] reject {path} -> {e.status_code} {e.detail}")
         return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
 
     return await call_next(request)
