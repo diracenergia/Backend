@@ -128,8 +128,7 @@ class LoggingMiddleware(BaseHTTPMiddleware):
 app.add_middleware(LoggingMiddleware)
 
 # ===== CORS =====
-_raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174,https://frontend-app.onrender.com").strip()
-
+_raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
 _origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
 
 if _raw == "*":
