@@ -1,3 +1,4 @@
+# app/routes/ingest.py
 from typing import Any, Optional, Dict
 import logging
 import importlib
@@ -96,7 +97,7 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
     try:
         hdr_info = {
             "strict": getattr(auth, "strict", None) if not isinstance(auth, dict) else auth.get("strict"),
-            "api_key_present": True if (isinstance(auth, dict) and auth.get("api_key")) else hasattr(auth, "api_key"),
+            "api_key_present": bool((isinstance(auth, dict) and auth.get("api_key")) or getattr(auth, "api_key", None)),
             "header_device": (auth.get("device_id") if isinstance(auth, dict) else getattr(auth, "device_id", None)),
         }
     except Exception:
@@ -116,12 +117,17 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
         dev_from_auth = None
 
     dev_from_payload = getattr(payload, "device_id", None)
-    device_id_db = _to_int_or_none(dev_from_auth) or _to_int_or_none(dev_from_payload)
+
+    # 👉 normalizamos: DB y repo esperan texto; si vino int lo pasamos a str
+    device_id_int = _to_int_or_none(dev_from_auth) or _to_int_or_none(dev_from_payload)
+    device_id_db: Optional[str] = str(device_id_int) if device_id_int is not None else (
+        str(dev_from_payload) if dev_from_payload not in (None, "") else None
+    )
 
     # 2) Extras opcionales
     volume_l = getattr(payload, "volume_l", None)
     temperature_c = getattr(payload, "temperature_c", None)
-    raw_json = getattr(payload, "raw_json", None)   # <-- nombre correcto
+    raw_json = getattr(payload, "raw_json", None)   # nombre correcto
 
     # 3) Insert con manejo de errores fino
     try:
@@ -129,7 +135,7 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
             tank_id=payload.tank_id,
             level_percent=payload.level_percent,
             ts=getattr(payload, "ts", None),  # usa ts del payload si viene; si no, NOW() en DB
-            device_id=device_id_db,           # FK a devices.id (INT)
+            device_id=device_id_db,           # <-- ya string
             volume_l=volume_l,
             temperature_c=temperature_c,
             raw_json=raw_json,
@@ -172,22 +178,19 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
     except Exception as e:
         log.warning("[WARN] alarm eval failed: %s", e)
 
-    # 6) Respuesta JSON-safe (evita serializar objetos del driver/ORM)
+    # 6) Respuesta JSON-safe
     saved_dict = _saved_as_dict(saved)
 
-    # Construimos el modelo de salida con defaults seguros
     out = TankIngestOut(
         id=saved_dict.get("id"),
         tank_id=saved_dict.get("tank_id", payload.tank_id),
-        # normalizamos a str si vino INT desde DB
-        device_id=(str(saved_dict.get("device_id")) if saved_dict.get("device_id") is not None
-                   else (str(device_id_db) if device_id_db is not None else None)),
-        ts=saved_dict.get("ts"),  # si DB hizo NOW(), debería venir seteado
+        device_id=saved_dict.get("device_id", device_id_db),
+        ts=saved_dict.get("ts"),
         level_percent=saved_dict.get("level_percent", payload.level_percent),
         volume_l=saved_dict.get("volume_l"),
         temperature_c=saved_dict.get("temperature_c"),
         raw_json=saved_dict.get("raw_json"),
     )
 
-    log.info("[ingest/tank] OK id=%s tank=%s lvl=%.2f", out.id, out.tank_id, out.level_percent)
+    log.info("[ingest/tank] OK id=%s tank=%s lvl=%.2f dev=%s", out.id, out.tank_id, out.level_percent, out.device_id)
     return jsonable_encoder(out)
