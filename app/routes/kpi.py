@@ -60,7 +60,6 @@ def kpi_overview(
     Devuelve el paquete completo para una ubicación:
     - summary30d (si no hay datos: ceros)
     - assets, latest, timeseries, analytics30d, topology, alarms
-
     Sólo devuelve 404 si la location NO existe.
     """
     win = _window_to_interval(window)
@@ -292,7 +291,7 @@ def kpi_locations(
 
 
 # ------------------------------------------------------------
-# 3) BY-LOCATION — tabla agregada del widget
+# 3) BY-LOCATION — tabla agregada del widget (con fallback)
 # ------------------------------------------------------------
 @router.get("/by-location")
 def kpi_by_location(
@@ -300,24 +299,67 @@ def kpi_by_location(
 ) -> List[Dict[str, Any]]:
     with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
         _set_org(cur, x_org_id)
-        cur.execute(
-            """
-            SELECT
-              location_id,
-              location_code,
-              location_name,
-              COALESCE(assets_total, 0)            AS assets_total,
-              COALESCE(tanks_count, 0)             AS tanks_count,
-              COALESCE(pumps_count, 0)             AS pumps_count,
-              COALESCE(valves_count, 0)            AS valves_count,
-              COALESCE(manifolds_count, 0)         AS manifolds_count,
-              COALESCE(alarms_active, 0)           AS alarms_active,
-              COALESCE(alarms_critical_active, 0)  AS alarms_critical_active,
-              COALESCE(pumps_on_now, 0)            AS pumps_on_now,
-              COALESCE(ROUND((kwh_30d)::numeric, 2), 0) AS kwh_30d,
-              NULLIF(avg_level_pct_30d, NULL)::float AS avg_level_pct_30d
-            FROM public.v_by_location_kpi
-            ORDER BY location_name;
-            """
-        )
-        return [dict(r) for r in cur.fetchall()]
+
+        # Intento 1: usar la vista consolidada (tipos bien casteados a float/int)
+        try:
+            cur.execute(
+                """
+                SELECT
+                  location_id,
+                  location_code,
+                  location_name,
+                  COALESCE(assets_total, 0)             AS assets_total,
+                  COALESCE(tanks_count, 0)              AS tanks_count,
+                  COALESCE(pumps_count, 0)              AS pumps_count,
+                  COALESCE(valves_count, 0)             AS valves_count,
+                  COALESCE(manifolds_count, 0)          AS manifolds_count,
+                  COALESCE(alarms_active, 0)            AS alarms_active,
+                  COALESCE(alarms_critical_active, 0)   AS alarms_critical_active,
+                  COALESCE(pumps_on_now, 0)             AS pumps_on_now,
+                  CASE WHEN kwh_30d IS NULL THEN 0 ELSE (kwh_30d)::float END AS kwh_30d,
+                  (avg_level_pct_30d)::float AS avg_level_pct_30d
+                FROM public.v_by_location_kpi
+                ORDER BY location_name;
+                """
+            )
+            return [dict(r) for r in cur.fetchall()]
+        except Exception as e:
+            # Fallback minimalista si la vista no existe o cambió de forma
+            # (evita 500 y te permite ver algo en el front)
+            print(f"[kpi/by-location] WARNING: usando fallback por error en vista v_by_location_kpi: {e}")
+
+            cur.execute(
+                """
+                WITH locs AS (
+                  SELECT id AS location_id, code AS location_code, name AS location_name
+                  FROM public.locations
+                ),
+                counts AS (
+                  SELECT al.location_id,
+                         SUM(CASE WHEN al.asset_type='tank' THEN 1 ELSE 0 END) AS tanks_count,
+                         SUM(CASE WHEN al.asset_type='pump' THEN 1 ELSE 0 END) AS pumps_count,
+                         SUM(CASE WHEN al.asset_type='valve' THEN 1 ELSE 0 END) AS valves_count,
+                         SUM(CASE WHEN al.asset_type='manifold' THEN 1 ELSE 0 END) AS manifolds_count
+                  FROM public.asset_locations al
+                  GROUP BY al.location_id
+                )
+                SELECT
+                  l.location_id,
+                  l.location_code,
+                  l.location_name,
+                  COALESCE(c.tanks_count,0)+COALESCE(c.pumps_count,0)+COALESCE(c.valves_count,0)+COALESCE(c.manifolds_count,0) AS assets_total,
+                  COALESCE(c.tanks_count,0)     AS tanks_count,
+                  COALESCE(c.pumps_count,0)     AS pumps_count,
+                  COALESCE(c.valves_count,0)    AS valves_count,
+                  COALESCE(c.manifolds_count,0) AS manifolds_count,
+                  0 AS alarms_active,
+                  0 AS alarms_critical_active,
+                  0 AS pumps_on_now,
+                  0.0::float AS kwh_30d,
+                  NULL::float AS avg_level_pct_30d
+                FROM locs l
+                LEFT JOIN counts c ON c.location_id=l.location_id
+                ORDER BY l.location_name;
+                """
+            )
+            return [dict(r) for r in cur.fetchall()]
