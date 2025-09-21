@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 import psycopg
 from typing import List
-from pydantic import BaseModel
 
 # Configura tu URL de conexión a la base de datos
 DATABASE_URL = "postgresql://postgres:password@localhost/dbname"  # Cambia esto a tu URL de conexión real

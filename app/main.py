@@ -16,6 +16,8 @@ from fastapi.responses import JSONResponse
 from app.routes.control import control_router
 
 
+
+
 # ===== LOGGING GLOBAL =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -59,6 +61,8 @@ from app.ws import router as ws_router
 
 # Visor en vivo (WS /viz/ws y GET /viz/state)
 from app.routes.live_view import viz_router
+from app.routes.infraestatus import router as infraestatus_router
+
 
 # ===== Config centralizada (pydantic Settings) con fallback a .env =====
 try:
@@ -251,6 +255,9 @@ app.include_router(ws_router)
 
 # KPI
 app.include_router(kpi_router)
+
+# INFRA
+app.include_router(infraestatus_router, prefix="/infraestatus", tags=["infraestatus"])
 
 # Visor en vivo (estado + websocket)
 app.include_router(viz_router)
