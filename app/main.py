@@ -13,10 +13,9 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
-from app.routes.live_view import viz_router
 
 # ===== LOGGING GLOBAL =====
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()from app.routes.live_view import viz_router
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
@@ -55,6 +54,9 @@ from app.routes.diag_listener import router as diag_listener_router
 
 # WebSocket
 from app.ws import router as ws_router
+
+# Visor en vivo (WS /viz/ws y GET /viz/state)
+from app.routes.live_view import viz_router
 
 # ===== Config centralizada (pydantic Settings) con fallback a .env =====
 try:
@@ -245,6 +247,7 @@ app.include_router(ws_router)
 # KPI
 app.include_router(kpi_router)
 
+# Visor en vivo (estado + websocket)
 app.include_router(viz_router)
 
 # ===== Endpoints utilitarios =====
