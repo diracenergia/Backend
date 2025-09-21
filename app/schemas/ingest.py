@@ -1,4 +1,3 @@
-# app/schemas/ingest.py
 from __future__ import annotations
 from typing import Optional, Any, Dict
 from datetime import datetime
@@ -31,4 +30,6 @@ class TankIngestOut(BaseModel):
     volume_l: Optional[float] = None
     temperature_c: Optional[float] = None
     raw_json: Optional[Dict[str, Any]] = None
+    inflow_lpm: Optional[float] = None  # Agregado
+    outflow_lpm: Optional[float] = None  # Agregado
     ok: bool = True
