@@ -13,10 +13,18 @@ from app.repos import tanks as repo
 from app.core.security import device_id_dep
 from app.repos.presence import bump_presence  # presencia online/offline
 
+# >>> NEW: cache para “visor en vivo” (no romper si aún no existe)
+try:
+    from app.routes.live_view import apply_tank_ingest  # actualiza cache para /viz/ws y /viz/state
+except Exception:
+    def apply_tank_ingest(_: Dict[str, Any]) -> None:
+        pass
+
 log = logging.getLogger("rdls.ingest")
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
 SHOW_ERRORS = os.getenv("SHOW_ERRORS", "0") in ("1", "true", "True")
+
 
 def _get_level_percent(saved: Any) -> Optional[float]:
     if saved is None:
@@ -27,6 +35,7 @@ def _get_level_percent(saved: Any) -> Optional[float]:
         return saved.model_dump().get("level_percent")
     return getattr(saved, "level_percent", None)
 
+
 def _saved_as_dict(saved: Any) -> Dict[str, Any]:
     if saved is None:
         return {}
@@ -35,13 +44,17 @@ def _saved_as_dict(saved: Any) -> Dict[str, Any]:
     if hasattr(saved, "model_dump"):
         return saved.model_dump()
     out = {}
+    # >>> extendido con inflow/outflow si tu repo los persiste
     for k in (
         "id", "tank_id", "device_id", "ts",
-        "level_percent", "volume_l", "temperature_c", "raw_json",
+        "level_percent", "volume_l", "temperature_c",
+        "inflow_lpm", "outflow_lpm",
+        "raw_json",
     ):
         if hasattr(saved, k):
             out[k] = getattr(saved, k)
     return out
+
 
 def _to_int_or_none(v) -> Optional[int]:
     if v is None:
@@ -52,6 +65,7 @@ def _to_int_or_none(v) -> Optional[int]:
         return int(str(v).strip())
     except Exception:
         return None
+
 
 def _get_eval_fn():
     try:
@@ -66,6 +80,7 @@ def _get_eval_fn():
     except Exception as e:
         log.exception("import eval_tank_alarm failed err=%s", e)
         return None
+
 
 @router.post("/tank", response_model=TankIngestOut, status_code=status.HTTP_201_CREATED)
 def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
@@ -100,13 +115,19 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
     temperature_c = getattr(payload, "temperature_c", None)
     raw_json = getattr(payload, "raw_json", None)
 
+    # (opcionales si vienen del simulador)
+    inflow_lpm = getattr(payload, "inflow_lpm", None) if hasattr(payload, "inflow_lpm") else None
+    outflow_lpm = getattr(payload, "outflow_lpm", None) if hasattr(payload, "outflow_lpm") else None
+
     # 3) Insert con manejo de errores fino
     try:
         log.info(
-            "[ingest/tank] INSERT params tank_id=%s lvl=%.2f ts=%s device_id=%s vol=%s temp=%s raw=%s",
+            "[ingest/tank] INSERT params tank_id=%s lvl=%.2f ts=%s device_id=%s vol=%s temp=%s inflow=%s outflow=%s raw=%s",
             payload.tank_id, payload.level_percent, getattr(payload, "ts", None),
-            device_id_db, volume_l, temperature_c, (list(raw_json.keys()) if isinstance(raw_json, dict) else raw_json)
+            device_id_db, volume_l, temperature_c, inflow_lpm, outflow_lpm,
+            (list(raw_json.keys()) if isinstance(raw_json, dict) else raw_json)
         )
+        # Nota: si tu repo aún no guarda inflow/outflow, no los pases; quedan solo en el visor
         saved = repo.insert_tank_reading(
             tank_id=payload.tank_id,
             level_percent=payload.level_percent,
@@ -115,6 +136,7 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
             volume_l=volume_l,
             temperature_c=temperature_c,
             raw_json=raw_json,
+            # inflow_lpm=inflow_lpm, outflow_lpm=outflow_lpm,  # ← habilitalos si tu tabla los tiene
         )
     except psy_errors.ForeignKeyViolation as e:
         log.warning("[ingest/tank] FK violation tank_id=%s device_id=%s err=%s", payload.tank_id, device_id_db, e)
@@ -141,6 +163,26 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
             detail="ingest failed",
         )
 
+    # 3.5) Actualizar “visor en vivo” (best-effort; no falla la ingesta si algo sale mal)
+    try:
+        # armamos el dict a publicar usando lo guardado y completando con inflow/outflow si no están en DB
+        saved_dict = _saved_as_dict(saved)
+        publish = {
+            "tank_id": saved_dict.get("tank_id", payload.tank_id),
+            "level_percent": saved_dict.get("level_percent", payload.level_percent),
+            "ts": saved_dict.get("ts") or getattr(payload, "ts", None),
+            "device_id": saved_dict.get("device_id") or (str(device_id_db) if device_id_db is not None else None),
+            "volume_l": saved_dict.get("volume_l"),
+            "temperature_c": saved_dict.get("temperature_c"),
+            "raw_json": saved_dict.get("raw_json"),
+            # priorizamos lo que vino en el payload si el repo no lo devolvió
+            "inflow_lpm": saved_dict.get("inflow_lpm", inflow_lpm),
+            "outflow_lpm": saved_dict.get("outflow_lpm", outflow_lpm),
+        }
+        apply_tank_ingest(publish)
+    except Exception as e:
+        log.warning("[viz] apply_tank_ingest failed: %s", e)
+
     # 4) Bump de presencia (no crítico)
     try:
         if device_id_db:
@@ -160,7 +202,7 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
     except Exception as e:
         log.warning("[WARN] alarm eval failed: %s", e)
 
-    # 6) Respuesta JSON-safe
+    # 6) Respuesta JSON-safe (sumamos inflow/outflow si existen)
     saved_dict = _saved_as_dict(saved)
     out = TankIngestOut(
         id=saved_dict.get("id"),
@@ -171,7 +213,10 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
         level_percent=saved_dict.get("level_percent", payload.level_percent),
         volume_l=saved_dict.get("volume_l"),
         temperature_c=saved_dict.get("temperature_c"),
+        inflow_lpm=saved_dict.get("inflow_lpm", inflow_lpm),
+        outflow_lpm=saved_dict.get("outflow_lpm", outflow_lpm),
         raw_json=saved_dict.get("raw_json"),
     )
-    log.info("[ingest/tank] OK id=%s tank=%s lvl=%.2f", out.id, out.tank_id, out.level_percent)
+    log.info("[ingest/tank] OK id=%s tank=%s lvl=%.2f inflow=%s outflow=%s",
+             out.id, out.tank_id, out.level_percent, out.inflow_lpm, out.outflow_lpm)
     return jsonable_encoder(out)
