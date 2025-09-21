@@ -1,16 +1,7 @@
 from fastapi import APIRouter, HTTPException
-import psycopg
+from app.core.db import database  # Importar la conexión global
 from typing import List
 from pydantic import BaseModel
-import logging
-import traceback
-
-# Configura tu URL de conexión a la base de datos
-DATABASE_URL = "postgresql://postgres:Diract2020*1M@db.qcytvuwnzdwlsnsvryxh.supabase.co:5432/postgres?sslmode=require"
-
-# Configurar el logger
-logger = logging.getLogger("infraestatus")
-logger.setLevel(logging.DEBUG)
 
 # Modelo de respuesta
 class TankStatusResponse(BaseModel):
@@ -24,7 +15,7 @@ class TankStatusResponse(BaseModel):
     status: str
 
 # Consulta para obtener el estado de los tanques
-def get_tank_status() -> List[TankStatusResponse]:
+async def get_tank_status() -> List[TankStatusResponse]:
     query = """
     SELECT 
         t.id,
@@ -51,30 +42,23 @@ def get_tank_status() -> List[TankStatusResponse]:
         t.org_id = 1;
     """
     try:
-        # Establecemos la conexión con la base de datos
-        with psycopg.connect(DATABASE_URL) as conn:
-            with conn.cursor() as cur:
-                cur.execute(query)
-                rows = cur.fetchall()
+        # Usamos la conexión global para ejecutar la consulta
+        rows = await database.fetch_all(query)
 
-        # Procesamos los resultados y los retornamos
         return [
             TankStatusResponse(
-                id=row[0],
-                name=row[1],
-                level_percent=row[2],
-                low_pct=row[3],
-                low_low_pct=row[4],
-                high_pct=row[5],
-                high_high_pct=row[6],
-                status=row[7]
+                id=row["id"],
+                name=row["name"],
+                level_percent=row["level_percent"],
+                low_pct=row["low_pct"],
+                low_low_pct=row["low_low_pct"],
+                high_pct=row["high_pct"],
+                high_high_pct=row["high_high_pct"],
+                status=row["status"]
             )
             for row in rows
         ]
     except Exception as e:
-        # Captura el error y loggea detalles adicionales
-        logger.error(f"Database query failed: {str(e)}")
-        logger.error(traceback.format_exc())  # Log del traceback completo
         raise HTTPException(status_code=500, detail=f"Database query failed: {str(e)}")
 
 # Crear el router
@@ -84,8 +68,6 @@ router = APIRouter()
 @router.get("/tank_statuses", response_model=List[TankStatusResponse])
 async def tank_statuses():
     try:
-        return get_tank_status()
+        return await get_tank_status()
     except Exception as e:
-        logger.error(f"Error al obtener los datos de los tanques: {str(e)}")
-        logger.error(traceback.format_exc())  # Log del traceback completo
         raise HTTPException(status_code=500, detail=f"Error al obtener los datos de los tanques: {str(e)}")
