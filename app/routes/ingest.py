@@ -1,4 +1,3 @@
-# app/routes/ingest.py
 from typing import Any, Optional, Dict
 import logging
 import importlib
@@ -12,7 +11,7 @@ from app.repos import tanks as repo
 from app.core.security import device_id_dep
 from app.repos.presence import bump_presence  # presencia online/offline
 
-log = logging.getLogger("ingest")
+log = logging.getLogger("rdls.ingest")
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
@@ -42,7 +41,6 @@ def _saved_as_dict(saved: Any) -> Dict[str, Any]:
     out = {}
     for k in (
         "id",
-        "org_id",
         "tank_id",
         "device_id",
         "ts",
@@ -94,10 +92,20 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
     - Evalúa alarmas y bump de presencia en best-effort.
     """
 
+    # 0) Log de entrada (sin exponer secrets)
+    try:
+        hdr_info = {
+            "strict": getattr(auth, "strict", None) if not isinstance(auth, dict) else auth.get("strict"),
+            "api_key_present": True if (isinstance(auth, dict) and auth.get("api_key")) else hasattr(auth, "api_key"),
+            "header_device": (auth.get("device_id") if isinstance(auth, dict) else getattr(auth, "device_id", None)),
+        }
+    except Exception:
+        hdr_info = {}
+    log.debug("[ingest] headers=%s body=%s", hdr_info, payload.model_dump())
+
     # 1) Elegir device_id (preferimos el autenticado para evitar spoof)
     dev_from_auth = None
     try:
-        # device_id_dep puede retornar dict/pydantic/objeto simple
         if isinstance(auth, dict):
             dev_from_auth = auth.get("device_id")
         elif hasattr(auth, "device_id"):
@@ -113,7 +121,7 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
     # 2) Extras opcionales
     volume_l = getattr(payload, "volume_l", None)
     temperature_c = getattr(payload, "temperature_c", None)
-    raw_json = getattr(payload, "extra", None)
+    raw_json = getattr(payload, "raw_json", None)   # <-- nombre correcto
 
     # 3) Insert con manejo de errores fino
     try:
@@ -127,11 +135,13 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
             raw_json=raw_json,
         )
     except psy_errors.ForeignKeyViolation:
+        log.warning("[ingest/tank] FK violation tank_id=%s device_id=%s", payload.tank_id, device_id_db)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="invalid tank_id or device_id (foreign key)",
         )
     except psy_errors.CheckViolation as e:
+        log.warning("[ingest/tank] check violation: %s", e)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"payload violates constraint: {e}",
@@ -154,10 +164,9 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
     try:
         lvl = _get_level_percent(saved)
         log.info("[ingest] eval_tank_alarm tank=%s lvl=%s", payload.tank_id, lvl)
-
         eval_fn = _get_eval_fn()
         if not eval_fn:
-            log.warning("[ingest] eval_tank_alarm no disponible; ver logs de 'ingest'")
+            log.warning("[ingest] eval_tank_alarm no disponible; ver logs de 'rdls.ingest'")
         else:
             eval_fn(payload.tank_id, lvl)
     except Exception as e:
@@ -169,16 +178,16 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
     # Construimos el modelo de salida con defaults seguros
     out = TankIngestOut(
         id=saved_dict.get("id"),
-        org_id=saved_dict.get("org_id"),
         tank_id=saved_dict.get("tank_id", payload.tank_id),
-        device_id=saved_dict.get("device_id", device_id_db),
+        # normalizamos a str si vino INT desde DB
+        device_id=(str(saved_dict.get("device_id")) if saved_dict.get("device_id") is not None
+                   else (str(device_id_db) if device_id_db is not None else None)),
         ts=saved_dict.get("ts"),  # si DB hizo NOW(), debería venir seteado
         level_percent=saved_dict.get("level_percent", payload.level_percent),
         volume_l=saved_dict.get("volume_l"),
         temperature_c=saved_dict.get("temperature_c"),
         raw_json=saved_dict.get("raw_json"),
-        ok=True,
     )
 
-    # FastAPI ya serializa pydantic, pero usamos jsonable_encoder por seguridad si hiciera falta
+    log.info("[ingest/tank] OK id=%s tank=%s lvl=%.2f", out.id, out.tank_id, out.level_percent)
     return jsonable_encoder(out)

@@ -1,8 +1,10 @@
-# app/repos/tanks.py
 from typing import Any, Dict, List, Optional, Sequence
+import logging
 from psycopg.rows import dict_row
 
 from app.core.db import get_conn
+
+log = logging.getLogger("repo.tanks")
 
 # =======================
 # Constantes de columnas
@@ -30,10 +32,14 @@ def list_tanks(user_id: Optional[int] = None) -> List[Dict[str, Any]]:
     where = "WHERE user_id = %s" if user_id is not None else ""
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         if user_id is not None:
+            log.debug("list_tanks user_id=%s", user_id)
             cur.execute(base.format(where=where), (user_id,))
         else:
+            log.debug("list_tanks (all)")
             cur.execute(base.format(where=where))
-        return cur.fetchall()
+        rows = cur.fetchall()
+        log.info("list_tanks -> %s rows", len(rows))
+        return rows
 
 def get_tank(tank_id: int) -> Dict[str, Any]:
     sql_q = f"""
@@ -42,6 +48,7 @@ def get_tank(tank_id: int) -> Dict[str, Any]:
         WHERE id = %s;
     """
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        log.debug("get_tank id=%s", tank_id)
         cur.execute(sql_q, (tank_id,))
         return cur.fetchone() or {}
 
@@ -65,9 +72,12 @@ def create_tank(data: Dict[str, Any]) -> Dict[str, Any]:
         data.get("diameter_m"),
     )
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        log.debug("create_tank params=%s", params)
         cur.execute(sql_q, params)
+        row = cur.fetchone() or {}
         conn.commit()
-        return cur.fetchone() or {}
+        log.info("create_tank OK id=%s", row.get("id"))
+        return row
 
 def update_tank(tank_id: int, data: Dict[str, Any]) -> Dict[str, Any]:
     sql_q = f"""
@@ -95,9 +105,12 @@ def update_tank(tank_id: int, data: Dict[str, Any]) -> Dict[str, Any]:
         tank_id,
     )
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        log.debug("update_tank id=%s params=%s", tank_id, params)
         cur.execute(sql_q, params)
+        row = cur.fetchone() or {}
         conn.commit()
-        return cur.fetchone() or {}
+        log.info("update_tank OK id=%s", row.get("id"))
+        return row
 
 # =======================
 # Configs (tank_config)
@@ -109,6 +122,7 @@ def get_tank_config(tank_id: int) -> Dict[str, Any]:
         WHERE tank_id = %s;
     """
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        log.debug("get_tank_config tank_id=%s", tank_id)
         cur.execute(sql_q, (tank_id,))
         return cur.fetchone() or {}
 
@@ -138,15 +152,14 @@ def upsert_tank_config(
     """
     params = (tank_id, low_pct, low_low_pct, high_pct, high_high_pct, updated_by)
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        log.debug("upsert_tank_config params=%s", params)
         cur.execute(sql_q, params)
+        row = cur.fetchone() or {}
         conn.commit()
-        return cur.fetchone() or {}
+        log.info("upsert_tank_config OK tank_id=%s", row.get("tank_id"))
+        return row
 
 def list_tanks_with_config_view() -> List[Dict[str, Any]]:
-    """
-    Usa la vista v_tanks_with_config (no trae material/fluid/install_year salvo que
-    la hayas extendido). Si querés “ficha técnica” completa, usá list_tanks_with_config().
-    """
     sql_q = """
         SELECT id, name, capacity_m3, height_m, diameter_m,
                location_text, created_at, low_pct, low_low_pct, high_pct, high_high_pct
@@ -155,12 +168,11 @@ def list_tanks_with_config_view() -> List[Dict[str, Any]]:
     """
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(sql_q)
-        return cur.fetchall()
+        rows = cur.fetchall()
+        log.info("list_tanks_with_config_view -> %s rows", len(rows))
+        return rows
 
 def list_tanks_with_config() -> List[Dict[str, Any]]:
-    """
-    JOIN directo tanks + tank_config → incluye material, fluid, install_year para la ficha técnica.
-    """
     sql_q = """
         SELECT
           t.id, t.name, t.location_text, t.created_at,
@@ -173,12 +185,11 @@ def list_tanks_with_config() -> List[Dict[str, Any]]:
     """
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(sql_q)
-        return cur.fetchall()
+        rows = cur.fetchall()
+        log.info("list_tanks_with_config -> %s rows", len(rows))
+        return rows
 
 def get_tank_with_config(tank_id: int) -> Dict[str, Any]:
-    """
-    Una sola fila de tank + config (útil si querés la ficha técnica de un tanque puntual).
-    """
     sql_q = """
         SELECT
           t.id, t.name, t.location_text, t.created_at,
@@ -191,7 +202,9 @@ def get_tank_with_config(tank_id: int) -> Dict[str, Any]:
     """
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(sql_q, (tank_id,))
-        return cur.fetchone() or {}
+        row = cur.fetchone() or {}
+        log.debug("get_tank_with_config tank_id=%s found=%s", tank_id, bool(row))
+        return row
 
 # =======================
 # Lecturas (tank_readings)
@@ -205,7 +218,7 @@ def insert_tank_reading(
     level_percent: float,
     *,
     ts: Optional[str] = None,            # ISO-8601 opcional; si None, DB usa default (UTC)
-    device_id: Optional[str] = None,     # <-- string
+    device_id: Optional[int] = None,     # <-- INT para FK (consistente con router)
     volume_l: Optional[float] = None,
     temperature_c: Optional[float] = None,
     raw_json: Optional[dict] = None,
@@ -233,18 +246,17 @@ def insert_tank_reading(
     sql_q = f"""
         INSERT INTO public.tank_readings ({",".join(cols)})
         VALUES ({placeholders})
-        RETURNING {",".join(READING_COLS)};
+        RETURNING {",".join(READING_COLS)};  -- id,tank_id,ts,level_percent,volume_l,temperature_c,device_id,raw_json
     """
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        log.debug("insert_tank_reading cols=%s vals=%s", cols, vals)
         cur.execute(sql_q, tuple(vals))
+        row = cur.fetchone() or {}
         conn.commit()
-        return cur.fetchone() or {}
+        log.info("insert_tank_reading OK id=%s tank=%s lvl=%.2f", row.get("id"), row.get("tank_id"), row.get("level_percent", -1))
+        return row
 
 def latest_tank_row(tank_id: int) -> Dict[str, Any]:
-    """
-    Última lectura por tiempo (ts DESC) y como desempate id DESC.
-    Calcula volume_l al LEER si no fue medido (usando capacity_m3 del tanque).
-    """
     sql_q = """
         SELECT
           r.id, r.tank_id, r.ts, r.level_percent, r.temperature_c, r.device_id, r.raw_json,
@@ -277,9 +289,6 @@ def history_tank_rows(
     limit: int = 500,
     offset: int = 0,
 ) -> List[Dict[str, Any]]:
-    """
-    Historial con volume_l calculado al LEER si no fue medido (capacity_m3 del tanque).
-    """
     base = """
         SELECT
           r.id, r.tank_id, r.ts, r.level_percent, r.temperature_c, r.device_id, r.raw_json,
@@ -328,19 +337,12 @@ def get_tank_capacity_m3(tank_id: int) -> Optional[float]:
 # Shim: get_config_by_id
 # =======================
 def get_config_by_id(tank_id: int) -> Dict[str, Any]:
-    """
-    DEVUELVE UMBRALES para el tanque.
-    1) Intenta leer de public.tank_config via get_tank_config(tank_id)
-    2) Si falta alguno, completa con defaults.
-    3) Expone tanto las claves de DB (low_*/high_*) como alias (very_*/low/high).
-    """
     defaults = {
         "low_low_pct": 10.0,
         "low_pct":     20.0,
         "high_pct":    80.0,
         "high_high_pct": 90.0,
     }
-
     raw = get_tank_config(tank_id) or {}
     cfg = {
         "tank_id": tank_id,
@@ -356,22 +358,10 @@ def get_config_by_id(tank_id: int) -> Dict[str, Any]:
     cfg["very_high"] = cfg["high_high_pct"]
     return cfg
 
-
 # ======================================================
 # ESTADOS DESDE ALARMAS (Option B)  - NUEVO
 # ======================================================
 def list_tank_status_from_alarms(user_id: Optional[int] = None) -> List[Dict[str, Any]]:
-    """
-    Devuelve el estado de cada tanque a partir de:
-      - v_tank_latest_full (has_data, level_percent, ts)
-      - alarms LEVEL activas por tanque (asset_type='tank', code='LEVEL')
-    Regla de color:
-      - 'disconnected' si has_data = false
-      - 'critical' si hay alarma activa con severidad critical
-      - 'warning' si hay alarma activa con severidad warning o info
-      - 'ok' en el resto
-    Si pasás user_id, filtra por dueño del tanque.
-    """
     base = """
         WITH last AS (
           SELECT s.tank_id, s.tank_name, s.ts, s.level_percent, s.has_data, t.user_id
@@ -406,10 +396,10 @@ def list_tank_status_from_alarms(user_id: Optional[int] = None) -> List[Dict[str
             ELSE 'ok'
           END AS status,
           CASE
-            WHEN l.has_data IS FALSE THEN '#9CA3AF'  -- gris
-            WHEN COALESCE(aa.severity_rank, 0) = 3 THEN '#EF4444'  -- rojo (opcional)
-            WHEN COALESCE(aa.severity_rank, 0) IN (1,2) THEN '#F59E0B'  -- amarillo
-            ELSE '#10B981'  -- verde
+            WHEN l.has_data IS FALSE THEN '#9CA3AF'
+            WHEN COALESCE(aa.severity_rank, 0) = 3 THEN '#EF4444'
+            WHEN COALESCE(aa.severity_rank, 0) IN (1,2) THEN '#F59E0B'
+            ELSE '#10B981'
           END AS color_hex
         FROM last l
         LEFT JOIN active_alarm aa ON aa.tank_id = l.tank_id
@@ -424,14 +414,7 @@ def list_tank_status_from_alarms(user_id: Optional[int] = None) -> List[Dict[str
             cur.execute(base.format(where=where))
         return cur.fetchall()
 
-# -------------------------
-# (Opcional) crear la vista
-# -------------------------
 def create_view_tank_status_from_alarms() -> None:
-    """
-    Crea/actualiza la vista v_tank_status_from_alarms (si preferís resolver vía vista).
-    Podés llamarla en una migración simple o al inicio de la app.
-    """
     sql_q = """
     CREATE OR REPLACE VIEW public.v_tank_status_from_alarms AS
     WITH last AS (
@@ -484,14 +467,7 @@ def create_view_tank_status_from_alarms() -> None:
         cur.execute(sql_q)
         conn.commit()
 
-# -------------------------
-# (Opcional) índices útiles
-# -------------------------
 def ensure_indexes_for_alarm_status() -> None:
-    """
-    Crea índices sugeridos para acelerar el lookup de alarmas LEVEL activas por tanque.
-    Idempotente con IF NOT EXISTS.
-    """
     sqls = [
         """
         CREATE INDEX IF NOT EXISTS idx_alarms_tank_level_active
