@@ -2,9 +2,15 @@ from fastapi import APIRouter, HTTPException
 import psycopg
 from typing import List
 from pydantic import BaseModel
+import logging
+import traceback
 
 # Configura tu URL de conexión a la base de datos
 DATABASE_URL = "postgresql://postgres:Diract2020*1M@db.qcytvuwnzdwlsnsvryxh.supabase.co:5432/postgres?sslmode=require"
+
+# Configurar el logger
+logger = logging.getLogger("infraestatus")
+logger.setLevel(logging.DEBUG)
 
 # Modelo de respuesta
 class TankStatusResponse(BaseModel):
@@ -66,7 +72,9 @@ def get_tank_status() -> List[TankStatusResponse]:
             for row in rows
         ]
     except Exception as e:
-        # Captura el error y lo muestra en detalle
+        # Captura el error y loggea detalles adicionales
+        logger.error(f"Database query failed: {str(e)}")
+        logger.error(traceback.format_exc())  # Log del traceback completo
         raise HTTPException(status_code=500, detail=f"Database query failed: {str(e)}")
 
 # Crear el router
@@ -78,5 +86,6 @@ async def tank_statuses():
     try:
         return get_tank_status()
     except Exception as e:
-        # Mostrar detalles más específicos sobre el error
+        logger.error(f"Error al obtener los datos de los tanques: {str(e)}")
+        logger.error(traceback.format_exc())  # Log del traceback completo
         raise HTTPException(status_code=500, detail=f"Error al obtener los datos de los tanques: {str(e)}")
