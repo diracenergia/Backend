@@ -14,7 +14,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from app.routes.control import control_router
-from app.routers.infraestatus import router as infraestatus_router
+
 
 # ===== LOGGING GLOBAL =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -254,7 +254,7 @@ app.include_router(kpi_router)
 
 # Visor en vivo (estado + websocket)
 app.include_router(viz_router)
-app.include_router(infraestatus_router, prefix="/infraestatus", tags=["infraestatus"])
+
 
 # ===== Endpoints utilitarios =====
 from app.core.db import get_conn
