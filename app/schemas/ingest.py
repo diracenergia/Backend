@@ -1,37 +1,34 @@
 # app/schemas/ingest.py
-from typing import Optional, Dict, Any, Annotated, Union
-from pydantic import BaseModel, Field
+from __future__ import annotations
+from typing import Optional, Any, Dict
 from datetime import datetime
+from pydantic import BaseModel, Field, field_validator
 
-Pct = Annotated[float, Field(ge=0, le=100)]
-NonNegFloat = Annotated[float, Field(ge=0)]
-# Aceptamos letras, números y separadores típicos para device IDs
-DeviceId = Annotated[str, Field(min_length=1, pattern=r"^[A-Za-z0-9._:\-]+$")]
-
+# ---------- IN ----------
 class TankIngestIn(BaseModel):
-    tank_id: Annotated[int, Field(ge=1, description="ID del tanque")]
-    level_percent: Pct = Field(..., description="Nivel en %")
-    ts: Optional[datetime] = Field(
-        None, description="Timestamp; si no viene, la DB usa now()"
-    )
-    # Permitimos int o str; Pydantic lo normaliza a str en el Out si hiciera falta
-    device_id: Optional[Union[DeviceId, int]] = Field(
-        None, description="ID lógico del device (opcional; si no, se toma de X-Device-Id)"
-    )
-    volume_l: Optional[NonNegFloat] = Field(None, description="Volumen en litros (opcional)")
-    temperature_c: Optional[float] = Field(None, ge=-50, le=150, description="Temperatura en °C (opcional)")
-    raw_json: Optional[Dict[str, Any]] = Field(None, description="Payload bruto opcional")
-
-    model_config = {
-        "extra": "ignore",  # ignora campos desconocidos en el POST
-    }
-
-class TankIngestOut(BaseModel):
-    id: int
-    tank_id: int
-    ts: datetime
-    level_percent: float
-    volume_l: Optional[NonNegFloat] = None
+    tank_id: int = Field(..., ge=1)
+    level_percent: float = Field(..., ge=0.0, le=100.0)
+    ts: Optional[datetime] = None           # ISO 8601 opcional
+    device_id: Optional[str] = None         # si viene, lo usamos como fallback
+    volume_l: Optional[float] = None
     temperature_c: Optional[float] = None
-    device_id: Optional[str] = None  # string en la salida
     raw_json: Optional[Dict[str, Any]] = None
+
+    @field_validator("device_id")
+    @classmethod
+    def _dev_as_str(cls, v):
+        if v is None:
+            return v
+        return str(v).strip()
+
+# ---------- OUT ----------
+class TankIngestOut(BaseModel):
+    id: Optional[int] = None
+    tank_id: int
+    device_id: Optional[str] = None
+    ts: Optional[datetime] = None
+    level_percent: float
+    volume_l: Optional[float] = None
+    temperature_c: Optional[float] = None
+    raw_json: Optional[Dict[str, Any]] = None
+    ok: bool = True
