@@ -33,29 +33,23 @@ def get_org_id() -> Optional[int]:
 def get_role() -> Optional[str]:
     return _current_role.get()
 
-def require_org() -> int:
-    org_id = get_org_id()
-    if org_id is None:
-        raise HTTPException(400, "Falta X-Org-Id")
-    return int(org_id)
+# ==== Config ====
+# En producción podés poner TENANCY_ENFORCE_ORG=1 para volver a exigirlo
+ENFORCE_ORG = os.getenv("TENANCY_ENFORCE_ORG", "0").lower() in ("1", "true")
+DEFAULT_ORG_ID_RAW = os.getenv("TENANCY_DEFAULT_ORG_ID", "1")
+try:
+    DEFAULT_ORG_ID: Optional[int] = int(str(DEFAULT_ORG_ID_RAW))
+except Exception:
+    # si querés manejar strings, podrías cambiar el tipo a Optional[Any]
+    DEFAULT_ORG_ID = 1
 
-def require_user() -> int:
-    user_id = get_user_id()
-    if user_id is None:
-        raise HTTPException(401, "Falta usuario (X-User-Id o token)")
-    return int(user_id)
+VERIFY_JWT = os.getenv("TENANCY_VERIFY_JWT", "0").lower() in ("1", "true")
+JWT_AUD     = os.getenv("TENANCY_JWT_AUD")
+JWT_ISS     = os.getenv("TENANCY_JWT_ISS")
+JWT_ALGO    = os.getenv("TENANCY_JWT_ALGO", "RS256")
 
-# ==== Utilidades de Auth/JWT (opcional) ====
-VERIFY_JWT = os.getenv("TENANCY_VERIFY_JWT", "0") in ("1", "true", "True")
-JWT_AUD     = os.getenv("TENANCY_JWT_AUD")   # opcional
-JWT_ISS     = os.getenv("TENANCY_JWT_ISS")   # opcional
-JWT_ALGO    = os.getenv("TENANCY_JWT_ALGO", "RS256")  # si verificás firma
-
+# ==== JWT util ====
 def _parse_bearer_token(authorization: Optional[str]) -> Dict[str, Any]:
-    """
-    Devuelve el payload del JWT si hay Authorization: Bearer ... .
-    Por defecto NO verifica firma (útil en dev). Activá TENANCY_VERIFY_JWT=1 para verificar.
-    """
     if not authorization:
         return {}
     auth = authorization.strip()
@@ -90,7 +84,7 @@ def _coerce_int(value: Any) -> Optional[int]:
     except Exception:
         return None
 
-# --------- Dependencia usable desde middleware ----------
+# --------- Dependencia usada desde middleware ----------
 async def tenant_ctx_dep(
     request: Request,
     authorization: Optional[str] = None,
@@ -99,14 +93,13 @@ async def tenant_ctx_dep(
     x_role: Optional[str] = None,
 ):
     """
-    Se invoca *manualmente* desde el middleware. Por eso recibimos strings.
-    Si algún parámetro viene en None, lo tomamos de request.headers.
-    Prioridad (de mayor a menor):
+    Prioridad:
       1) Headers: X-Org-Id, X-User-Id, X-Role
-      2) JWT Bearer (claims sugeridas: sub=user_id, active_org_id, role)
-    Requiere SIEMPRE org_id. user_id puede ser opcional según tus rutas.
+      2) JWT Bearer: sub/user_id, active_org_id/org_id, role
+      3) Query string (útil para WebSocket): org_id, user_id, role
+    Si ENFORCE_ORG=0, usa DEFAULT_ORG_ID cuando no venga.
     """
-    # Completar desde headers si faltan
+    # headers
     if authorization is None:
         authorization = request.headers.get("authorization")
     if x_org_id is None:
@@ -116,42 +109,57 @@ async def tenant_ctx_dep(
     if x_role is None:
         x_role = request.headers.get("x-role")
 
-    # 1) Intentar headers
     hdr_org = _coerce_int(x_org_id)
     hdr_usr = _coerce_int(x_user_id)
     role    = (x_role or None)
 
-    # 2) Si falta algo, intentar token
+    # jwt
+    claims: Dict[str, Any] = {}
     if hdr_org is None or hdr_usr is None or role is None:
         claims = _parse_bearer_token(authorization)
-        jwt_user = _coerce_int(claims.get("sub") or claims.get("user_id"))
-        jwt_org  = _coerce_int(claims.get("active_org_id") or claims.get("org_id"))
-        jwt_role = None
-        if isinstance(claims.get("roles"), dict):
-            # si hay un mapa org->role
-            try:
-                jwt_role = claims["roles"].get(str(jwt_org))
-            except Exception:
-                jwt_role = None
-        if jwt_role is None:
-            jwt_role = claims.get("role")
+    jwt_user = _coerce_int(claims.get("sub") or claims.get("user_id"))
+    jwt_org  = _coerce_int(claims.get("active_org_id") or claims.get("org_id"))
+    jwt_role = claims.get("role")
 
-        # Mezclar: header tiene prioridad
-        user_id = hdr_usr if hdr_usr is not None else jwt_user
-        org_id  = hdr_org if hdr_org is not None else jwt_org
-        role    = role if role is not None else (jwt_role if isinstance(jwt_role, str) else None)
-    else:
-        user_id = hdr_usr
-        org_id  = hdr_org
+    # query
+    q = request.query_params
+    q_org  = _coerce_int(q.get("org_id"))
+    q_user = _coerce_int(q.get("user_id"))
+    q_role = q.get("role")
 
-    # 3) Validaciones mínimas
+    # resolver finales con prioridad: header > query > jwt
+    user_id = hdr_usr if hdr_usr is not None else (q_user if q_user is not None else jwt_user)
+    org_id  = hdr_org if hdr_org is not None else (q_org  if q_org  is not None else jwt_org)
+    role    = role    if role    is not None else (q_role if q_role is not None else jwt_role)
+
+    # En este modo NO exigimos org: usamos default si falta
     if org_id is None:
-        raise HTTPException(400, "Falta X-Org-Id (o active_org_id en token)")
-    if int(org_id) <= 0:
-        raise HTTPException(400, "X-Org-Id inválido")
+        if ENFORCE_ORG:
+            raise HTTPException(400, "Falta X-Org-Id (o active_org_id en token)")
+        org_id = DEFAULT_ORG_ID
 
-    # 4) Guardar en ContextVars
+    # Guardar contexto
     set_context(user_id=user_id, org_id=org_id, role=role)
-
-    # 5) Opcional: devolver info útil para debug
     return {"user_id": user_id, "org_id": org_id, "role": role}
+
+# ==== Helpers de requerimiento (suaves) ====
+def require_org() -> int:
+    """
+    En modo no estricto, devuelve el org actual o el DEFAULT,
+    sin lanzar excepción.
+    """
+    org_id = get_org_id()
+    if org_id is None:
+        # si llegaste acá sin contexto, devolvemos default
+        return int(DEFAULT_ORG_ID) if DEFAULT_ORG_ID is not None else 0
+    return int(org_id)
+
+def require_user() -> int:
+    """
+    Si usás login de usuario/contraseña para otras rutas, podés dejar esta validación.
+    Para la demo/simulación no suele usarse.
+    """
+    user_id = get_user_id()
+    if user_id is None:
+        raise HTTPException(401, "Falta usuario (X-User-Id o token)")
+    return int(user_id)
