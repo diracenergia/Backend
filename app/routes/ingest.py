@@ -2,6 +2,7 @@
 from typing import Any, Optional, Dict
 import logging
 import importlib
+import os
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.encoders import jsonable_encoder
@@ -13,9 +14,9 @@ from app.core.security import device_id_dep
 from app.repos.presence import bump_presence  # presencia online/offline
 
 log = logging.getLogger("rdls.ingest")
-
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
+SHOW_ERRORS = os.getenv("SHOW_ERRORS", "0") in ("1", "true", "True")
 
 def _get_level_percent(saved: Any) -> Optional[float]:
     if saved is None:
@@ -26,34 +27,21 @@ def _get_level_percent(saved: Any) -> Optional[float]:
         return saved.model_dump().get("level_percent")
     return getattr(saved, "level_percent", None)
 
-
 def _saved_as_dict(saved: Any) -> Dict[str, Any]:
-    """
-    Normaliza lo que devuelva el repo (row/Record/pydantic/dict)
-    a un dict con tipos JSON-seguros.
-    """
     if saved is None:
         return {}
     if isinstance(saved, dict):
         return saved
     if hasattr(saved, "model_dump"):
         return saved.model_dump()
-    # objeto con attrs
     out = {}
     for k in (
-        "id",
-        "tank_id",
-        "device_id",
-        "ts",
-        "level_percent",
-        "volume_l",
-        "temperature_c",
-        "raw_json",
+        "id", "tank_id", "device_id", "ts",
+        "level_percent", "volume_l", "temperature_c", "raw_json",
     ):
         if hasattr(saved, k):
             out[k] = getattr(saved, k)
     return out
-
 
 def _to_int_or_none(v) -> Optional[int]:
     if v is None:
@@ -65,11 +53,7 @@ def _to_int_or_none(v) -> Optional[int]:
     except Exception:
         return None
 
-
 def _get_eval_fn():
-    """
-    Import perezoso para no tumbar la app si app.services.alarms_eval tiene un error.
-    """
     try:
         mod = importlib.import_module("app.services.alarms_eval")
         fn = getattr(mod, "eval_tank_alarm", None)
@@ -83,21 +67,13 @@ def _get_eval_fn():
         log.exception("import eval_tank_alarm failed err=%s", e)
         return None
 
-
 @router.post("/tank", response_model=TankIngestOut, status_code=status.HTTP_201_CREATED)
 def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
-    """
-    - Prioriza el device_id autenticado (header X-Device-Id / API key); si no hay, usa el del payload.
-    - Inserta (tank_id, level_percent, ts, device_id, volume_l, temperature_c, raw_json).
-    - FK/Checks → 400; otros errores → 500.
-    - Evalúa alarmas y bump de presencia en best-effort.
-    """
-
     # 0) Log de entrada (sin exponer secrets)
     try:
         hdr_info = {
-            "strict": getattr(auth, "strict", None) if not isinstance(auth, dict) else auth.get("strict"),
-            "api_key_present": bool((isinstance(auth, dict) and auth.get("api_key")) or getattr(auth, "api_key", None)),
+            "strict": (auth.get("strict") if isinstance(auth, dict) else getattr(auth, "strict", None)),
+            "api_key_present": True if (isinstance(auth, dict) and auth.get("api_key")) else hasattr(auth, "api_key"),
             "header_device": (auth.get("device_id") if isinstance(auth, dict) else getattr(auth, "device_id", None)),
         }
     except Exception:
@@ -117,31 +93,31 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
         dev_from_auth = None
 
     dev_from_payload = getattr(payload, "device_id", None)
-
-    # 👉 normalizamos: DB y repo esperan texto; si vino int lo pasamos a str
-    device_id_int = _to_int_or_none(dev_from_auth) or _to_int_or_none(dev_from_payload)
-    device_id_db: Optional[str] = str(device_id_int) if device_id_int is not None else (
-        str(dev_from_payload) if dev_from_payload not in (None, "") else None
-    )
+    device_id_db = _to_int_or_none(dev_from_auth) or _to_int_or_none(dev_from_payload)
 
     # 2) Extras opcionales
     volume_l = getattr(payload, "volume_l", None)
     temperature_c = getattr(payload, "temperature_c", None)
-    raw_json = getattr(payload, "raw_json", None)   # nombre correcto
+    raw_json = getattr(payload, "raw_json", None)
 
     # 3) Insert con manejo de errores fino
     try:
+        log.info(
+            "[ingest/tank] INSERT params tank_id=%s lvl=%.2f ts=%s device_id=%s vol=%s temp=%s raw=%s",
+            payload.tank_id, payload.level_percent, getattr(payload, "ts", None),
+            device_id_db, volume_l, temperature_c, (list(raw_json.keys()) if isinstance(raw_json, dict) else raw_json)
+        )
         saved = repo.insert_tank_reading(
             tank_id=payload.tank_id,
             level_percent=payload.level_percent,
-            ts=getattr(payload, "ts", None),  # usa ts del payload si viene; si no, NOW() en DB
-            device_id=device_id_db,           # <-- ya string
+            ts=getattr(payload, "ts", None),
+            device_id=device_id_db,
             volume_l=volume_l,
             temperature_c=temperature_c,
             raw_json=raw_json,
         )
-    except psy_errors.ForeignKeyViolation:
-        log.warning("[ingest/tank] FK violation tank_id=%s device_id=%s", payload.tank_id, device_id_db)
+    except psy_errors.ForeignKeyViolation as e:
+        log.warning("[ingest/tank] FK violation tank_id=%s device_id=%s err=%s", payload.tank_id, device_id_db, e)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="invalid tank_id or device_id (foreign key)",
@@ -153,7 +129,13 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
             detail=f"payload violates constraint: {e}",
         )
     except Exception as e:
-        log.exception("[ingest/tank] DB insert failed err=%s", e)
+        log.exception("[ingest/tank] DB insert failed type=%s err=%s", e.__class__.__name__, e)
+        if SHOW_ERRORS:
+            # 🔥 SOLO PARA DEBUG: revelar la causa exacta
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"ingest failed: {e.__class__.__name__}: {e}",
+            )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="ingest failed",
@@ -180,17 +162,16 @@ def ingest_tank(payload: TankIngestIn, auth=Depends(device_id_dep)):
 
     # 6) Respuesta JSON-safe
     saved_dict = _saved_as_dict(saved)
-
     out = TankIngestOut(
         id=saved_dict.get("id"),
         tank_id=saved_dict.get("tank_id", payload.tank_id),
-        device_id=saved_dict.get("device_id", device_id_db),
+        device_id=(str(saved_dict.get("device_id")) if saved_dict.get("device_id") is not None
+                   else (str(device_id_db) if device_id_db is not None else None)),
         ts=saved_dict.get("ts"),
         level_percent=saved_dict.get("level_percent", payload.level_percent),
         volume_l=saved_dict.get("volume_l"),
         temperature_c=saved_dict.get("temperature_c"),
         raw_json=saved_dict.get("raw_json"),
     )
-
-    log.info("[ingest/tank] OK id=%s tank=%s lvl=%.2f dev=%s", out.id, out.tank_id, out.level_percent, out.device_id)
+    log.info("[ingest/tank] OK id=%s tank=%s lvl=%.2f", out.id, out.tank_id, out.level_percent)
     return jsonable_encoder(out)
