@@ -13,6 +13,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
+from app.routes.control import control_router
 
 # ===== LOGGING GLOBAL =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -167,6 +168,9 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # ===== Contexto multi-tenant (RLS) =====
 from app.core.tenancy import tenant_ctx_dep
+
+
+app.include_router(control_router)
 
 _PUBLIC_PATHS = {
     "/", "/health", "/health/db", "/favicon.ico",
