@@ -13,9 +13,10 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
+from app.routes.live_view import viz_router
 
 # ===== LOGGING GLOBAL =====
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()from app.routes.live_view import viz_router
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
@@ -243,6 +244,8 @@ app.include_router(ws_router)
 
 # KPI
 app.include_router(kpi_router)
+
+app.include_router(viz_router)
 
 # ===== Endpoints utilitarios =====
 from app.core.db import get_conn
