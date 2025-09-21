@@ -170,7 +170,7 @@ _PUBLIC_PATHS = {
     "/__config", "/openapi.json", "/docs", "/redoc",
     "/__alarm_poller_status", "/__which_alarms_eval", "/__which_alarm_events",
 }
-_PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws")
+_PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws", "/ingest", "/infra")
 
 @app.middleware("http")
 async def _tenant_context_middleware(request: Request, call_next):
