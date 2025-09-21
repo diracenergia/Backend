@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
 import psycopg
 from typing import List
+from pydantic import BaseModel
 
 # Configura tu URL de conexión a la base de datos
 DATABASE_URL = "postgresql://postgres:Diract2020*1M@db.qcytvuwnzdwlsnsvryxh.supabase.co:5432/postgres?sslmode=require"
@@ -44,26 +44,30 @@ def get_tank_status() -> List[TankStatusResponse]:
     WHERE
         t.org_id = 1;
     """
-    # Establecemos la conexión con la base de datos
-    with psycopg.connect(DATABASE_URL) as conn:
-        with conn.cursor() as cur:
-            cur.execute(query)
-            rows = cur.fetchall()
+    try:
+        # Establecemos la conexión con la base de datos
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(query)
+                rows = cur.fetchall()
 
-    # Procesamos los resultados y los retornamos
-    return [
-        TankStatusResponse(
-            id=row[0],
-            name=row[1],
-            level_percent=row[2],
-            low_pct=row[3],
-            low_low_pct=row[4],
-            high_pct=row[5],
-            high_high_pct=row[6],
-            status=row[7]
-        )
-        for row in rows
-    ]
+        # Procesamos los resultados y los retornamos
+        return [
+            TankStatusResponse(
+                id=row[0],
+                name=row[1],
+                level_percent=row[2],
+                low_pct=row[3],
+                low_low_pct=row[4],
+                high_pct=row[5],
+                high_high_pct=row[6],
+                status=row[7]
+            )
+            for row in rows
+        ]
+    except Exception as e:
+        # Captura el error y lo muestra en detalle
+        raise HTTPException(status_code=500, detail=f"Database query failed: {str(e)}")
 
 # Crear el router
 router = APIRouter()
@@ -74,4 +78,5 @@ async def tank_statuses():
     try:
         return get_tank_status()
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Error al obtener los datos de los tanques")
+        # Mostrar detalles más específicos sobre el error
+        raise HTTPException(status_code=500, detail=f"Error al obtener los datos de los tanques: {str(e)}")
