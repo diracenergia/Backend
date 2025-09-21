@@ -4,7 +4,7 @@ import psycopg
 from typing import List
 
 # Configura tu URL de conexión a la base de datos
-DATABASE_URL = "postgresql://postgres:password@localhost/dbname"  # Cambia esto a tu URL de conexión real
+DATABASE_URL = "postgresql://postgres:Diract2020*1M@db.qcytvuwnzdwlsnsvryxh.supabase.co:5432/postgres?sslmode=require"
 
 # Modelo de respuesta
 class TankStatusResponse(BaseModel):
