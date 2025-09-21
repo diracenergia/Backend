@@ -1,23 +1,48 @@
 # app/main.py
 import os
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Body
+
+from fastapi import FastAPI, HTTPException, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
+
+# ===== Routers propios =====
 from app.routes.kpi import router as kpi_router
 
+# Infra
+from app.routes.graph_api import router as graph_router       # <- lo montamos con prefix="/infra"
+from app.routes.locations import router as locations_router   # ya trae prefix="/infra"
 
+# Tanks (ingesta / latest / history / configs / commands)
+from app.routes.ingest import router as ingest_tank_router
+from app.routes.latest import router as latest_tank_router
+from app.routes.history import router as history_tank_router
+from app.routes.configs import router as configs_tank_router
+from app.routes.commands_tanks import router as commands_tank_router
 
-# Routers de infraestructura
-from app.routes.graph_api import router as graph_router
-from app.routes.locations import router as locations_router
+# Pumps (ingesta / latest / history / configs / commands)
+from app.routes.ingest_pump import router as ingest_pump_router
+from app.routes.latest_pump import router as latest_pump_router
+from app.routes.history_pump import router as history_pump_router
+from app.routes.configs_pump import router as configs_pump_router
+from app.routes.commands_pumps import router as commands_pump_router
 
-# --- Config centralizada con fallback a .env ---
+# Alarmas / Auditoría
+from app.routes.alarms import router as alarms_router
+from app.routes.audit import router as audit_router
+
+# Diag listener
+from app.routes.diag_listener import router as diag_listener_router
+
+# WebSocket
+from app.ws import router as ws_router
+
+# ===== Config centralizada (pydantic Settings) con fallback a .env =====
 try:
-    from app.core.config import settings  # opcional (pydantic settings)
+    from app.core.config import settings  # opcional
 except Exception:
     settings = None
     try:
@@ -34,6 +59,11 @@ def _get_env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
+# ===== App metadata =====
+APP_TITLE = _get_env("APP_TITLE", "ESP32 Tank/Pump API")
+APP_VERSION = _get_env("APP_VERSION", "") or _get_env("RENDER_GIT_COMMIT", "")[:8]
+app = FastAPI(title=APP_TITLE, version=APP_VERSION or None)
+
 # ===== CORS =====
 _raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
 _origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
@@ -49,26 +79,10 @@ ALLOW_CREDENTIALS = False
 ALLOW_METHODS = ["*"]
 ALLOW_HEADERS = ["*"]
 
-# ===== Trusted hosts (opcional) =====
-_trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
-TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
-
-APP_TITLE = _get_env("APP_TITLE", "ESP32 Tank/Pump API")
-APP_VERSION = _get_env("APP_VERSION", "") or _get_env("RENDER_GIT_COMMIT", "")[:8]
-
-app = FastAPI(title=APP_TITLE, version=APP_VERSION or None)
-
-# Logs de arranque
 print("[CORS] allow_all          =", ALLOW_ALL_ORIGINS)
 print("[CORS] allow_origins      =", ALLOWED_ORIGINS)
 print("[CORS] allow_origin_regex =", _origin_regex or "(none)")
 print("[CORS] allow_credentials  =", ALLOW_CREDENTIALS)
-if TRUSTED_HOSTS:
-    print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
-
-# ===== Middlewares =====
-if TRUSTED_HOSTS:
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
 
 app.add_middleware(
     CORSMiddleware,
@@ -79,24 +93,29 @@ app.add_middleware(
     allow_headers=ALLOW_HEADERS,
 )
 
+# ===== Trusted hosts (opcional) =====
+_trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
+TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
+if TRUSTED_HOSTS:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
+    print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
+
+# ===== Compresión =====
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # ===== Contexto multi-tenant (RLS) =====
-# Bypass en paths públicos; el resto exige X-Org-Id (y opcional X-User-Id)
 from app.core.tenancy import tenant_ctx_dep
 
-# Rutas públicas que NO requieren tenant
 _PUBLIC_PATHS = {
     "/", "/health", "/health/db", "/favicon.ico",
     "/__config", "/openapi.json", "/docs", "/redoc",
     "/__alarm_poller_status", "/__which_alarms_eval", "/__which_alarm_events",
 }
-# Prefijos públicos (estáticos, UI, websockets si aplica)
 _PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws")
 
 @app.middleware("http")
-async def _tenant_context_middleware(request, call_next):
-    # ✅ Dejar pasar preflight de CORS
+async def _tenant_context_middleware(request: Request, call_next):
+    # Preflight CORS: dejar pasar
     if request.method == "OPTIONS":
         return await call_next(request)
 
@@ -104,8 +123,8 @@ async def _tenant_context_middleware(request, call_next):
     if path in _PUBLIC_PATHS or any(path.startswith(p) for p in _PUBLIC_PREFIXES):
         return await call_next(request)
 
-    # ✅ Pasar headers como STRINGS (no Header(...))
     try:
+        # Pasamos headers tal cual
         await tenant_ctx_dep(
             request,
             authorization=request.headers.get("authorization"),
@@ -118,36 +137,7 @@ async def _tenant_context_middleware(request, call_next):
 
     return await call_next(request)
 
-
-# ===== Routers principales =====
-from app.routes.ingest import router as ingest_tank_router
-from app.routes.latest import router as latest_tank_router
-from app.routes.history import router as history_tank_router
-from app.routes.configs import router as configs_tank_router
-from app.routes.commands_tanks import router as commands_tank_router
-
-from app.routes.ingest_pump import router as ingest_pump_router
-from app.routes.latest_pump import router as latest_pump_router
-from app.routes.history_pump import router as history_pump_router
-from app.routes.configs_pump import router as configs_pump_router
-from app.routes.commands_pumps import router as commands_pump_router
-
-from app.routes.alarms import router as alarms_router
-from app.routes.audit import router as audit_router
-
-from app.routes.diag_listener import router as diag_listener_router
-app.include_router(diag_listener_router)
-
-# Router opcional: CRUD de metadatos de tanques
-try:
-    from app.routes.tanks import router as tanks_router
-except Exception:
-    tanks_router = None
-
-# 🔌 WebSocket telemetry router
-from app.ws import router as ws_router
-
-# ===== Montaje de UI estática =====
+# ===== Montaje de UI estática (/ui) =====
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WEB_DIR = REPO_ROOT / "web"
 if WEB_DIR.exists():
@@ -156,6 +146,9 @@ else:
     print(f"⚠️ /ui deshabilitado: no existe {WEB_DIR}")
 
 # ===== Incluir Routers =====
+# Diag listener
+app.include_router(diag_listener_router)
+
 # Tanques
 app.include_router(ingest_tank_router)
 app.include_router(latest_tank_router)
@@ -171,19 +164,25 @@ app.include_router(configs_pump_router)
 app.include_router(commands_pump_router)
 
 # CRUD Tanques (opcional)
-if tanks_router:
+try:
+    from app.routes.tanks import router as tanks_router
     app.include_router(tanks_router)
+except Exception as e:
+    print(f"⚠️ tanks router no disponible: {e}")
 
 # Alarmas / Auditoría
 app.include_router(alarms_router)
 app.include_router(audit_router)
 
-# 🔌 NUEVO: Infra / Graph API
-app.include_router(graph_router, prefix="/infra")   # graph_api
-app.include_router(locations_router)                # locations ya trae prefix="/infra"
+# Infra / Graph API
+app.include_router(graph_router, prefix="/infra", tags=["infra-graph"])  # <- clave para /infra/graph
+app.include_router(locations_router)  # ya tiene prefix="/infra"
 
-# 🔌 WebSocket
+# WebSocket
 app.include_router(ws_router)
+
+# KPI
+app.include_router(kpi_router)
 
 # ===== Endpoints utilitarios =====
 from app.core.db import get_conn
@@ -200,6 +199,7 @@ def root():
 
 @app.get("/favicon.ico")
 def favicon_noop():
+    # Evita 404s ruidosos del navegador si no hay favicon
     return {}
 
 @app.get("/health")
@@ -237,10 +237,6 @@ def tg_env():
         "BOT_head": (token[:8] + "...") if token else "",
         "CHAT": _get_env("TELEGRAM_CHAT_ID", ""),
     }
-
-
-
-app.include_router(kpi_router)
 
 # ===== Conexión (diagnóstico) =====
 try:
