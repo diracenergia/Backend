@@ -3,23 +3,31 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Header, Query
+from fastapi import APIRouter, Header, HTTPException, Query
 from psycopg.rows import dict_row
 
 from app.core.db import get_conn
 
 router = APIRouter(prefix="/kpi", tags=["kpi"])
 
+# ------------------------------------------------------------
+# Ventanas aceptadas para series
+# ------------------------------------------------------------
 WINDOWS = {"24h": "24 hours", "7d": "7 days", "30d": "30 days"}
+
+
 def _window_to_interval(window: str) -> str:
     return WINDOWS.get(window, "7 days")
 
 
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
 # Helpers
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
 def _set_org(cur, org_id: Optional[int]) -> None:
-    """Opcional: fija app.org_id para que las vistas filtren por organización."""
+    """
+    Opcional: fija app.org_id para que las vistas filtren por organización.
+    Requiere que tus vistas usen current_setting('app.org_id', true).
+    """
     if org_id:
         cur.execute("SELECT set_config('app.org_id', %s, false);", (str(org_id),))
 
@@ -32,12 +40,16 @@ def _get_location_meta(cur, loc_id: int) -> Optional[Dict[str, Any]]:
     row = cur.fetchone()
     if not row:
         return None
-    return {"id": int(row["id"]), "code": row["code"], "name": row["name"]}
+    return {
+        "id": int(row["id"]),
+        "code": row["code"],
+        "name": row["name"],
+    }
 
 
-# -------------------------------------------------------------------
-# 1) OVERVIEW (tolerante)
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
+# 1) OVERVIEW — paquete por ubicación (tolerante a falta de datos)
+# ------------------------------------------------------------
 @router.get("/overview")
 def kpi_overview(
     loc_id: int,
@@ -48,31 +60,33 @@ def kpi_overview(
     Devuelve el paquete completo para una ubicación:
     - summary30d (si no hay datos: ceros)
     - assets, latest, timeseries, analytics30d, topology, alarms
-    Nunca tira 404 por falta de lecturas: sólo si la location no existe.
+
+    Sólo devuelve 404 si la location NO existe.
     """
     win = _window_to_interval(window)
 
     with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
         _set_org(cur, x_org_id)
 
-        # Intentar traer el summary 30d; si no existe, igual devolvemos esqueleto.
+        # Summary (puede no existir si aún no hay lecturas)
         cur.execute(
             "SELECT * FROM public.v_location_summary_30d WHERE location_id=%s;",
             (loc_id,),
         )
         summary = cur.fetchone()
 
-        # Metadatos mínimos de la location (si no está, ahí sí error)
+        # Metadatos mínimos de la location
         loc_meta = (
-            {"id": summary["location_id"], "code": summary["location_code"], "name": summary["location_name"]}
+            {
+                "id": int(summary["location_id"]),
+                "code": summary["location_code"],
+                "name": summary["location_name"],
+            }
             if summary
             else _get_location_meta(cur, loc_id)
         )
         if not loc_meta:
-            # ubicación inexistente
-            return {
-                "detail": f"location {loc_id} not found"
-            }
+            raise HTTPException(status_code=404, detail=f"location {loc_id} not found")
 
         # Activos en la ubicación
         cur.execute(
@@ -85,12 +99,12 @@ def kpi_overview(
             (loc_id,),
         )
         assets_rows = cur.fetchall()
-        assets = {"tanks": [], "pumps": [], "valves": [], "manifolds": []}
+        assets: Dict[str, Any] = {"tanks": [], "pumps": [], "valves": [], "manifolds": []}
         tank_ids: List[int] = []
         pump_ids: List[int] = []
         for r in assets_rows:
-            item = {"id": int(r["asset_id"]), "name": r["name"], "code": r["code"]}
             t = r["asset_type"]
+            item = {"id": int(r["asset_id"]), "name": r["name"], "code": r["code"]}
             if t == "tank":
                 assets["tanks"].append(item)
                 tank_ids.append(item["id"])
@@ -102,7 +116,7 @@ def kpi_overview(
             elif t == "manifold":
                 assets["manifolds"].append(item)
 
-        # Latest
+        # Últimas lecturas
         latest: Dict[str, Any] = {"tanks": [], "pumps": []}
         if tank_ids:
             cur.execute(
@@ -124,7 +138,7 @@ def kpi_overview(
             )
             latest["pumps"] = [dict(r) for r in cur.fetchall()]
 
-        # Series (ventana)
+        # Series por ventana
         timeseries: Dict[str, Any] = {"tanks": {}, "pumps": {}}
         if tank_ids:
             cur.execute(
@@ -138,10 +152,10 @@ def kpi_overview(
                 """,
                 (tank_ids,),
             )
-            tmp: Dict[int, Any] = {}
+            tmp_t: Dict[int, Any] = {}
             for r in cur.fetchall():
                 tid = int(r["tank_id"])
-                d = tmp.setdefault(
+                d = tmp_t.setdefault(
                     tid,
                     {"timestamps": [], "level_percent": [], "volume_l": [], "temperature_c": []},
                 )
@@ -150,7 +164,7 @@ def kpi_overview(
                     d["level_percent"].append(float(r["level_percent"]) if r["level_percent"] is not None else None)
                     d["volume_l"].append(float(r["volume_l"]) if r["volume_l"] is not None else None)
                     d["temperature_c"].append(float(r["temperature_c"]) if r["temperature_c"] is not None else None)
-            for tid, d in tmp.items():
+            for tid, d in tmp_t.items():
                 timeseries["tanks"][str(tid)] = d
 
         if pump_ids:
@@ -165,14 +179,14 @@ def kpi_overview(
                 """,
                 (pump_ids,),
             )
-            tmp: Dict[int, Any] = {}
+            tmp_p: Dict[int, Any] = {}
             for r in cur.fetchall():
                 pid = int(r["pump_id"])
-                d = tmp.setdefault(pid, {"timestamps": [], "is_on": []})
+                d = tmp_p.setdefault(pid, {"timestamps": [], "is_on": []})
                 if r["ts"] is not None:
                     d["timestamps"].append(r["ts"].isoformat())
                     d["is_on"].append(bool(r["is_on"]) if r["is_on"] is not None else None)
-            for pid, d in tmp.items():
+            for pid, d in tmp_p.items():
                 timeseries["pumps"][str(pid)] = d
 
         # Analytics 30d
@@ -208,7 +222,7 @@ def kpi_overview(
                     float(r["avg_level_pct_30d"]) if r["avg_level_pct_30d"] is not None else None
                 )
 
-        # Topología
+        # Topología (completa)
         cur.execute("SELECT * FROM public.v_asset_nodes;")
         nodes = [dict(r) for r in cur.fetchall()]
         cur.execute("SELECT * FROM public.v_topology_edges;")
@@ -219,7 +233,8 @@ def kpi_overview(
             """
             SELECT a.*
             FROM public.alarms a
-            JOIN public.asset_locations al ON al.asset_type=a.asset_type AND al.asset_id=a.asset_id
+            JOIN public.asset_locations al
+              ON al.asset_type=a.asset_type AND al.asset_id=a.asset_id
             WHERE a.is_active IS TRUE AND al.location_id=%s
             ORDER BY a.ts_raised DESC
             LIMIT 200;
@@ -228,7 +243,7 @@ def kpi_overview(
         )
         alarms = [dict(r) for r in cur.fetchall()]
 
-        # Si no había summary, devolvemos uno "en blanco" para no romper el front.
+        # Summary por defecto si no había datos
         summary30d = (
             dict(summary)
             if summary
@@ -263,24 +278,22 @@ def kpi_overview(
         }
 
 
-# -------------------------------------------------------------------
-# 2) LOCATIONS (para el combo del front)
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
+# 2) LOCATIONS — para el combo del front
+# ------------------------------------------------------------
 @router.get("/locations")
 def kpi_locations(
     x_org_id: Optional[int] = Header(default=None, convert_underscores=False),
 ) -> List[Dict[str, Any]]:
     with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
         _set_org(cur, x_org_id)
-        cur.execute(
-            "SELECT id, code, name FROM public.locations ORDER BY name;"
-        )
+        cur.execute("SELECT id, code, name FROM public.locations ORDER BY name;")
         return [dict(r) for r in cur.fetchall()]
 
 
-# -------------------------------------------------------------------
-# 3) BY-LOCATION (tabla del widget)
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
+# 3) BY-LOCATION — tabla agregada del widget
+# ------------------------------------------------------------
 @router.get("/by-location")
 def kpi_by_location(
     x_org_id: Optional[int] = Header(default=None, convert_underscores=False),
@@ -293,15 +306,16 @@ def kpi_by_location(
               location_id,
               location_code,
               location_name,
-              assets_total,
-              tanks_count,
-              pumps_count,
-              valves_count,
-              manifolds_count,
-              alarms_active,
-              alarms_critical_active,
-              COALESCE(pumps_on_now, 0) AS pumps_on_now,
-              COALESCE(ROUND(kwh_30d::numeric, 2), 0) AS kwh_30d
+              COALESCE(assets_total, 0)            AS assets_total,
+              COALESCE(tanks_count, 0)             AS tanks_count,
+              COALESCE(pumps_count, 0)             AS pumps_count,
+              COALESCE(valves_count, 0)            AS valves_count,
+              COALESCE(manifolds_count, 0)         AS manifolds_count,
+              COALESCE(alarms_active, 0)           AS alarms_active,
+              COALESCE(alarms_critical_active, 0)  AS alarms_critical_active,
+              COALESCE(pumps_on_now, 0)            AS pumps_on_now,
+              COALESCE(ROUND((kwh_30d)::numeric, 2), 0) AS kwh_30d,
+              NULLIF(avg_level_pct_30d, NULL)::float AS avg_level_pct_30d
             FROM public.v_by_location_kpi
             ORDER BY location_name;
             """
