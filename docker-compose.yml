@@ -58,8 +58,7 @@ services:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/munirdls
 
       # CORS
-      CORS_ALLOW_ORIGINS: http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174
-
+      CORS_ALLOW_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
 
       # MQTT
       MQTT_HOST: mosquitto
@@ -109,7 +108,7 @@ services:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/munirdls
 
       # CORS
-      CORS_ALLOW_ORIGINS: http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174
+      CORS_ALLOW_ORIGINS: http://localhost:5173,*
 
       # MQTT
       MQTT_HOST: mosquitto
