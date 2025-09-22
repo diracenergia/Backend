@@ -2,6 +2,10 @@ from fastapi import APIRouter, HTTPException
 from app.core.db import get_conn  # Usamos get_conn para obtener la conexión
 from typing import List
 from pydantic import BaseModel
+import logging
+
+# Configurar logging para depuración
+logger = logging.getLogger(__name__)
 
 # Modelo de respuesta
 class TankStatusResponse(BaseModel):
@@ -44,7 +48,9 @@ async def get_tank_status() -> List[TankStatusResponse]:
     try:
         # Usamos get_conn para obtener la conexión
         async with get_conn() as conn:
+            logger.info("Database connection established.")
             rows = await conn.fetch(query)
+            logger.info(f"Query executed successfully, fetched {len(rows)} rows.")
 
         return [
             TankStatusResponse(
@@ -60,6 +66,7 @@ async def get_tank_status() -> List[TankStatusResponse]:
             for row in rows
         ]
     except Exception as e:
+        logger.error(f"Error executing query: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Database query failed: {str(e)}")
 
 # Crear el router
