@@ -10,312 +10,308 @@ from app.core.db import get_conn
 
 router = APIRouter(prefix="/kpi", tags=["kpi"])
 
-# ------------------------------------------------------------
-# Ventanas aceptadas para series
-# ------------------------------------------------------------
-WINDOWS = {"24h": "24 hours", "7d": "7 days", "30d": "30 days"}
-
-
-def _window_to_interval(window: str) -> str:
-    return WINDOWS.get(window, "7 days")
-
-
-# ------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # Helpers
-# ------------------------------------------------------------
-def _set_org(cur, org_id: Optional[int]) -> None:
+# ------------------------------------------------------------------------------
+def _require_org_id(x_org_id: Optional[int]) -> int:
+    if x_org_id is None:
+        raise HTTPException(status_code=400, detail="X-Org-Id header is required")
+    return int(x_org_id)
+
+
+# ------------------------------------------------------------------------------
+# 0) Time buckets (eje común: últimas 24h, por hora, TZ America/Argentina/Buenos_Aires)
+# ------------------------------------------------------------------------------
+@router.get("/time-buckets/hourly-24h")
+def kpi_time_buckets_hourly_24h() -> List[Dict[str, Any]]:
     """
-    Opcional: fija app.org_id para que las vistas filtren por organización.
-    Requiere que tus vistas usen current_setting('app.org_id', true).
+    Devuelve los buckets horarios locales de las últimas 24 horas (incluida la hora actual).
+    Útil para alinear los gráficos de bombas y tanques.
     """
-    if org_id:
-        cur.execute("SELECT set_config('app.org_id', %s, false);", (str(org_id),))
-
-
-def _get_location_meta(cur, loc_id: int) -> Optional[Dict[str, Any]]:
-    cur.execute(
-        "SELECT id, code, name FROM public.locations WHERE id=%s LIMIT 1;",
-        (loc_id,),
-    )
-    row = cur.fetchone()
-    if not row:
-        return None
-    return {
-        "id": int(row["id"]),
-        "code": row["code"],
-        "name": row["name"],
-    }
-
-
-# ------------------------------------------------------------
-# 1) OVERVIEW — paquete por ubicación (tolerante a falta de datos)
-# ------------------------------------------------------------
-@router.get("/overview")
-def kpi_overview(
-    loc_id: int,
-    window: str = Query("7d", pattern="^(24h|7d|30d)$"),
-    x_org_id: Optional[int] = Header(default=None, convert_underscores=False),
-) -> Dict[str, Any]:
-    """
-    Devuelve el paquete completo para una ubicación:
-    - summary30d (si no hay datos: ceros)
-    - assets, latest, timeseries, analytics30d, topology, alarms
-    Sólo devuelve 404 si la location NO existe.
-    """
-    win = _window_to_interval(window)
-
     with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
-        _set_org(cur, x_org_id)
-
-        # Summary (puede no existir si aún no hay lecturas)
-        cur.execute(
-            "SELECT * FROM public.v_location_summary_30d WHERE location_id=%s;",
-            (loc_id,),
-        )
-        summary = cur.fetchone()
-
-        # Metadatos mínimos de la location
-        loc_meta = (
-            {
-                "id": int(summary["location_id"]),
-                "code": summary["location_code"],
-                "name": summary["location_name"],
-            }
-            if summary
-            else _get_location_meta(cur, loc_id)
-        )
-        if not loc_meta:
-            raise HTTPException(status_code=404, detail=f"location {loc_id} not found")
-
-        # Activos en la ubicación
         cur.execute(
             """
-            SELECT type AS asset_type, asset_id, name, code
-            FROM public.v_asset_nodes_loc
-            WHERE location_id=%s
-            ORDER BY asset_type, name;
-            """,
-            (loc_id,),
+            SELECT local_hour
+            FROM public.v_time_spine_hour_24h_local
+            ORDER BY local_hour;
+            """
         )
-        assets_rows = cur.fetchall()
-        assets: Dict[str, Any] = {"tanks": [], "pumps": [], "valves": [], "manifolds": []}
-        tank_ids: List[int] = []
-        pump_ids: List[int] = []
-        for r in assets_rows:
-            t = r["asset_type"]
-            item = {"id": int(r["asset_id"]), "name": r["name"], "code": r["code"]}
-            if t == "tank":
-                assets["tanks"].append(item)
-                tank_ids.append(item["id"])
-            elif t == "pump":
-                assets["pumps"].append(item)
-                pump_ids.append(item["id"])
-            elif t == "valve":
-                assets["valves"].append(item)
-            elif t == "manifold":
-                assets["manifolds"].append(item)
+        return [dict(r) for r in cur.fetchall()]
 
-        # Últimas lecturas
-        latest: Dict[str, Any] = {"tanks": [], "pumps": []}
-        if tank_ids:
-            cur.execute(
-                "SELECT * FROM public.v_tank_latest_full WHERE tank_id = ANY(%s) ORDER BY tank_id;",
-                (tank_ids,),
-            )
-            latest["tanks"] = [dict(r) for r in cur.fetchall()]
-        if pump_ids:
-            cur.execute(
-                """
-                SELECT p.id AS pump_id, p.name AS pump_name, p.rated_kw, v.ts, v.is_on, v.flow_lpm, v.pressure_bar,
-                       v.voltage_v, v.current_a, v.control_mode, v.manual_lockout, v.raw_json, v.has_data
-                FROM public.pumps p
-                LEFT JOIN public.v_pump_latest_full v ON v.pump_id = p.id
-                WHERE p.id = ANY(%s)
-                ORDER BY p.id;
-                """,
-                (pump_ids,),
-            )
-            latest["pumps"] = [dict(r) for r in cur.fetchall()]
 
-        # Series por ventana
-        timeseries: Dict[str, Any] = {"tanks": {}, "pumps": {}}
-        if tank_ids:
-            cur.execute(
-                f"""
-                SELECT t.id AS tank_id, tr.ts, tr.level_percent, tr.volume_l, tr.temperature_c
-                FROM public.tanks t
-                LEFT JOIN public.tank_readings tr
-                  ON tr.tank_id=t.id AND tr.ts >= (now() - INTERVAL '{win}')
-                WHERE t.id = ANY(%s)
-                ORDER BY t.id, tr.ts;
-                """,
-                (tank_ids,),
-            )
-            tmp_t: Dict[int, Any] = {}
-            for r in cur.fetchall():
-                tid = int(r["tank_id"])
-                d = tmp_t.setdefault(
-                    tid,
-                    {"timestamps": [], "level_percent": [], "volume_l": [], "temperature_c": []},
-                )
-                if r["ts"] is not None:
-                    d["timestamps"].append(r["ts"].isoformat())
-                    d["level_percent"].append(float(r["level_percent"]) if r["level_percent"] is not None else None)
-                    d["volume_l"].append(float(r["volume_l"]) if r["volume_l"] is not None else None)
-                    d["temperature_c"].append(float(r["temperature_c"]) if r["temperature_c"] is not None else None)
-            for tid, d in tmp_t.items():
-                timeseries["tanks"][str(tid)] = d
-
-        if pump_ids:
-            cur.execute(
-                f"""
-                SELECT p.id AS pump_id, pr.ts, pr.is_on
-                FROM public.pumps p
-                LEFT JOIN public.pump_readings pr
-                  ON pr.pump_id=p.id AND pr.ts >= (now() - INTERVAL '{win}')
-                WHERE p.id = ANY(%s)
-                ORDER BY p.id, pr.ts;
-                """,
-                (pump_ids,),
-            )
-            tmp_p: Dict[int, Any] = {}
-            for r in cur.fetchall():
-                pid = int(r["pump_id"])
-                d = tmp_p.setdefault(pid, {"timestamps": [], "is_on": []})
-                if r["ts"] is not None:
-                    d["timestamps"].append(r["ts"].isoformat())
-                    d["is_on"].append(bool(r["is_on"]) if r["is_on"] is not None else None)
-            for pid, d in tmp_p.items():
-                timeseries["pumps"][str(pid)] = d
-
-        # Analytics 30d
-        analytics30d: Dict[str, Any] = {
-            "pump_uptime_pct": {},
-            "pump_kwh_30d": {},
-            "tank_avg_level_pct_30d": {},
-        }
-        if pump_ids:
-            cur.execute(
-                "SELECT pump_id, uptime_percent FROM public.v_pump_uptime_30d WHERE pump_id = ANY(%s);",
-                (pump_ids,),
-            )
-            for r in cur.fetchall():
-                analytics30d["pump_uptime_pct"][str(int(r["pump_id"]))] = (
-                    float(r["uptime_percent"]) if r["uptime_percent"] is not None else None
-                )
-            cur.execute(
-                "SELECT pump_id, kwh_30d FROM public.v_pump_energy_30d WHERE pump_id = ANY(%s);",
-                (pump_ids,),
-            )
-            for r in cur.fetchall():
-                analytics30d["pump_kwh_30d"][str(int(r["pump_id"]))] = (
-                    float(r["kwh_30d"]) if r["kwh_30d"] is not None else None
-                )
-        if tank_ids:
-            cur.execute(
-                "SELECT tank_id, avg_level_pct_30d FROM public.v_tank_level_avg_30d WHERE tank_id = ANY(%s);",
-                (tank_ids,),
-            )
-            for r in cur.fetchall():
-                analytics30d["tank_avg_level_pct_30d"][str(int(r["tank_id"]))] = (
-                    float(r["avg_level_pct_30d"]) if r["avg_level_pct_30d"] is not None else None
-                )
-
-        # Topología (completa)
-        cur.execute("SELECT * FROM public.v_asset_nodes;")
-        nodes = [dict(r) for r in cur.fetchall()]
-        cur.execute("SELECT * FROM public.v_topology_edges;")
-        edges = [dict(r) for r in cur.fetchall()]
-
-        # Alarmas activas en la ubicación
+# ------------------------------------------------------------------------------
+# 1) Bombas — actividad = "tuvo lectura" (sin usar is_on)
+# ------------------------------------------------------------------------------
+@router.get("/pumps/activity/hourly-24h")
+def kpi_pumps_activity_hourly_24h(
+    x_org_id: Optional[int] = Header(default=None, convert_underscores=False),
+    location_id: Optional[int] = Query(None),
+) -> List[Dict[str, Any]]:
+    """
+    Conteo de bombas con lectura por hora y por localidad, últimas 24h.
+    """
+    org_id = _require_org_id(x_org_id)
+    with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
-            SELECT a.*
-            FROM public.alarms a
-            JOIN public.asset_locations al
-              ON al.asset_type=a.asset_type AND al.asset_id=a.asset_id
-            WHERE a.is_active IS TRUE AND al.location_id=%s
-            ORDER BY a.ts_raised DESC
-            LIMIT 200;
+            SELECT *
+            FROM public.v_pumps_activity_hour_24h_loc_sync
+            WHERE org_id = %s
+              AND (%s::bigint IS NULL OR location_id = %s)
+            ORDER BY location_name, local_hour;
             """,
-            (loc_id,),
+            (org_id, location_id, location_id),
         )
-        alarms = [dict(r) for r in cur.fetchall()]
+        return [dict(r) for r in cur.fetchall()]
 
-        # Summary por defecto si no había datos
-        summary30d = (
-            dict(summary)
-            if summary
-            else {
-                "location_id": loc_meta["id"],
-                "location_code": loc_meta["code"],
-                "location_name": loc_meta["name"],
-                "assets_total": 0,
-                "tanks_count": 0,
-                "pumps_count": 0,
-                "valves_count": 0,
-                "manifolds_count": 0,
-                "alarms_active": 0,
-                "alarms_critical_active": 0,
-                "avg_flow_lpm_30d": None,
-                "avg_pressure_bar_30d": None,
-                "avg_level_pct_30d": None,
-                "pump_readings_30d": 0,
-                "tank_readings_30d": 0,
-            }
+
+# ------------------------------------------------------------------------------
+# 2) Tanques — nivel promedio (horario sincronizado)
+# ------------------------------------------------------------------------------
+@router.get("/tanks/level-avg/hourly-24h/by-location")
+def kpi_tanks_level_avg_hourly_24h_by_location(
+    x_org_id: Optional[int] = Header(default=None, convert_underscores=False),
+    location_id: Optional[int] = Query(None),
+) -> List[Dict[str, Any]]:
+    """
+    Nivel promedio de tanques agregado por localidad, por hora, últimas 24h.
+    """
+    org_id = _require_org_id(x_org_id)
+    with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT *
+            FROM public.v_tank_level_avg_hour_24h_loc_sync
+            WHERE org_id = %s
+              AND (%s::bigint IS NULL OR location_id = %s)
+            ORDER BY location_name, local_hour;
+            """,
+            (org_id, location_id, location_id),
         )
-
-        return {
-            "location": loc_meta,
-            "summary30d": summary30d,
-            "assets": assets,
-            "latest": latest,
-            "timeseries": timeseries,
-            "analytics30d": analytics30d,
-            "topology": {"nodes": nodes, "edges": edges},
-            "alarms": alarms,
-        }
+        return [dict(r) for r in cur.fetchall()]
 
 
-# ------------------------------------------------------------
-# 2) LOCATIONS — para el combo del front
-# ------------------------------------------------------------
+@router.get("/tanks/level-avg/hourly-24h/by-tank")
+def kpi_tanks_level_avg_hourly_24h_by_tank(
+    x_org_id: Optional[int] = Header(default=None, convert_underscores=False),
+    location_id: Optional[int] = Query(None),
+) -> List[Dict[str, Any]]:
+    """
+    Nivel promedio de tanques por tanque (detalle), por hora, últimas 24h.
+    """
+    org_id = _require_org_id(x_org_id)
+    with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT *
+            FROM public.v_tank_level_avg_hour_24h_tank_sync
+            WHERE org_id = %s
+              AND (%s::bigint IS NULL OR location_id = %s)
+            ORDER BY location_name, tank_name, local_hour;
+            """,
+            (org_id, location_id, location_id),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ------------------------------------------------------------------------------
+# 3) Inventario por localidad
+# ------------------------------------------------------------------------------
+@router.get("/totals/by-location")
+def kpi_totals_by_location(
+    x_org_id: Optional[int] = Header(default=None, convert_underscores=False),
+    location_id: Optional[int] = Query(None),
+) -> List[Dict[str, Any]]:
+    """
+    Totales de bombas y tanques por localidad.
+    """
+    org_id = _require_org_id(x_org_id)
+    with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT *
+            FROM public.v_totals_by_location
+            WHERE org_id = %s
+              AND (%s::bigint IS NULL OR location_id = %s)
+            ORDER BY location_name;
+            """,
+            (org_id, location_id, location_id),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ------------------------------------------------------------------------------
+# 4) Uptime de bombas (30 días)
+# ------------------------------------------------------------------------------
+@router.get("/uptime/pumps/30d/by-location")
+def kpi_uptime_pumps_30d_by_location(
+    x_org_id: Optional[int] = Header(default=None, convert_underscores=False),
+    location_id: Optional[int] = Query(None),
+) -> List[Dict[str, Any]]:
+    """
+    Uptime promedio 30 días por localidad (promedio de bombas).
+    """
+    org_id = _require_org_id(x_org_id)
+    with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT *
+            FROM public.v_pump_uptime_30d_loc
+            WHERE org_id = %s
+              AND (%s::bigint IS NULL OR location_id = %s)
+            ORDER BY location_name;
+            """,
+            (org_id, location_id, location_id),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+@router.get("/uptime/pumps/30d/by-pump")
+def kpi_uptime_pumps_30d_by_pump(
+    x_org_id: Optional[int] = Header(default=None, convert_underscores=False),
+    location_id: Optional[int] = Query(None),
+) -> List[Dict[str, Any]]:
+    """
+    Uptime 30 días por bomba (detalle).
+    """
+    org_id = _require_org_id(x_org_id)
+    with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT *
+            FROM public.v_pump_uptime_30d_pump
+            WHERE org_id = %s
+              AND (%s::bigint IS NULL OR location_id = %s)
+            ORDER BY location_name, pump_name;
+            """,
+            (org_id, location_id, location_id),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ------------------------------------------------------------------------------
+# 5) Alarmas activas por severidad y localidad (en vivo)
+# ------------------------------------------------------------------------------
+@router.get("/alarms/active/by-severity")
+def kpi_alarms_active_by_severity(
+    x_org_id: Optional[int] = Header(default=None, convert_underscores=False),
+    location_id: Optional[int] = Query(None),
+) -> List[Dict[str, Any]]:
+    """
+    Alarmas activas agrupadas por severidad y localidad.
+    """
+    org_id = _require_org_id(x_org_id)
+    with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT *
+            FROM public.v_alarms_active_by_sev_loc
+            WHERE org_id = %s
+              AND (%s::bigint IS NULL OR location_id = %s)
+            ORDER BY location_name, severity;
+            """,
+            (org_id, location_id, location_id),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ------------------------------------------------------------------------------
+# 6) Frescura de datos (últimas lecturas por localidad)
+# ------------------------------------------------------------------------------
+@router.get("/latest-ts/by-location")
+def kpi_latest_ts_by_location(
+    x_org_id: Optional[int] = Header(default=None, convert_underscores=False),
+    location_id: Optional[int] = Query(None),
+) -> List[Dict[str, Any]]:
+    """
+    Última lectura de bombas y tanques por localidad.
+    """
+    org_id = _require_org_id(x_org_id)
+    with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT *
+            FROM public.v_latest_ts_by_location
+            WHERE org_id = %s
+              AND (%s::bigint IS NULL OR location_id = %s)
+            ORDER BY location_name;
+            """,
+            (org_id, location_id, location_id),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ------------------------------------------------------------------------------
+# 7) Cobertura de lecturas de tanques (30 días)
+# ------------------------------------------------------------------------------
+@router.get("/tanks/coverage/30d")
+def kpi_tanks_coverage_30d(
+    x_org_id: Optional[int] = Header(default=None, convert_underscores=False),
+    location_id: Optional[int] = Query(None),
+) -> List[Dict[str, Any]]:
+    """
+    Por tanque: horas con lectura en 30 días y % de cobertura respecto de 720 horas.
+    """
+    org_id = _require_org_id(x_org_id)
+    with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT *
+            FROM public.v_tank_coverage_30d
+            WHERE org_id = %s
+              AND (%s::bigint IS NULL OR location_id = %s)
+            ORDER BY location_name, tank_name;
+            """,
+            (org_id, location_id, location_id),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ------------------------------------------------------------------------------
+# 8) Potencia nominal por bomba (para eficiencia en el front)
+# ------------------------------------------------------------------------------
+@router.get("/pumps/rated-kw")
+def kpi_pumps_rated_kw(
+    x_org_id: Optional[int] = Header(default=None, convert_underscores=False),
+    location_id: Optional[int] = Query(None),
+) -> List[Dict[str, Any]]:
+    """
+    Potencia nominal (rated_kw) por bomba y localidad.
+    """
+    org_id = _require_org_id(x_org_id)
+    with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT *
+            FROM public.v_pumps_rated_kw_loc
+            WHERE org_id = %s
+              AND (%s::bigint IS NULL OR location_id = %s)
+            ORDER BY location_name, pump_name;
+            """,
+            (org_id, location_id, location_id),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ------------------------------------------------------------------------------
+# 9) Locations (para combos en el front)
+# ------------------------------------------------------------------------------
 @router.get("/locations")
 def kpi_locations(
     x_org_id: Optional[int] = Header(default=None, convert_underscores=False),
 ) -> List[Dict[str, Any]]:
+    """
+    Lista de localidades visibles (no filtra por lecturas).
+    """
+    org_id = _require_org_id(x_org_id)
     with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
-        _set_org(cur, x_org_id)
-        cur.execute("SELECT id, code, name FROM public.locations ORDER BY name;")
-        return [dict(r) for r in cur.fetchall()]
-
-
-# ------------------------------------------------------------
-# 3) BY-LOCATION — tabla agregada del widget (con fallback)
-# ------------------------------------------------------------
-@router.get("/by-location")
-def kpi_by_location(
-    x_org_id: Optional[int] = Header(default=None, convert_underscores=False),
-) -> List[Dict[str, Any]]:
-    with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
-        _set_org(cur, x_org_id)
         cur.execute(
             """
-            SELECT
-              v.location_id,
-              v.location_code,
-              v.location_name,
-              COALESCE(v.assets_total, 0)            AS assets_total,
-              COALESCE(v.tanks_count, 0)             AS tanks_count,
-              COALESCE(v.pumps_count, 0)             AS pumps_count,
-              COALESCE(v.valves_count, 0)            AS valves_count,
-              COALESCE(v.manifolds_count, 0)         AS manifolds_count,
-              COALESCE(v.alarms_active, 0)           AS alarms_active,
-              COALESCE(v.alarms_critical_active, 0)  AS alarms_critical_active,
-              COALESCE(v.pumps_on_now, 0)            AS pumps_on_now,
-              COALESCE(v.kwh_30d, 0)::float8         AS kwh_30d
-            FROM public.v_by_location_kpi v
-            ORDER BY v.location_name;
-            """
+            SELECT id, code, name
+            FROM public.locations
+            WHERE org_id = %s
+            ORDER BY name;
+            """,
+            (org_id,),
         )
         return [dict(r) for r in cur.fetchall()]
