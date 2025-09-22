@@ -2,6 +2,11 @@ from fastapi import APIRouter, HTTPException
 from typing import List
 from pydantic import BaseModel
 from app.core.db import get_conn  # Importamos get_conn para usar el pool de conexiones
+import logging
+
+# Configurar logging
+logger = logging.getLogger("infraestatus")
+logger.setLevel(logging.DEBUG)
 
 # Modelo de respuesta
 class TankStatusResponse(BaseModel):
@@ -41,10 +46,12 @@ async def get_tank_status() -> List[TankStatusResponse]:
     WHERE
         t.org_id = 1;
     """
-    # Usamos get_conn para obtener la conexión desde el pool
+    logger.info("Iniciando la conexión con la base de datos...")
     try:
         async with get_conn() as conn:
+            logger.info("Conexión a la base de datos establecida.")
             rows = await conn.fetch(query)
+            logger.info(f"Consulta ejecutada correctamente, se obtuvieron {len(rows)} registros.")
             return [
                 TankStatusResponse(
                     id=row["id"],
@@ -59,6 +66,7 @@ async def get_tank_status() -> List[TankStatusResponse]:
                 for row in rows
             ]
     except Exception as e:
+        logger.error(f"Error al obtener los datos de los tanques: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error al obtener los datos de los tanques: {str(e)}")
 
 # Crear el router
@@ -67,7 +75,11 @@ router = APIRouter()
 # Endpoint para obtener los estados de los tanques
 @router.get("/tank_statuses", response_model=List[TankStatusResponse])
 async def tank_statuses():
+    logger.info("Iniciando solicitud para obtener los estados de los tanques.")
     try:
-        return await get_tank_status()
+        result = await get_tank_status()
+        logger.info("Datos de los tanques obtenidos con éxito.")
+        return result
     except Exception as e:
+        logger.error(f"Error en la obtención de los estados de los tanques: {str(e)}")
         raise HTTPException(status_code=500, detail="Error al obtener los datos de los tanques")
