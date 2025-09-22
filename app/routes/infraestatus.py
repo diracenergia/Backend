@@ -1,11 +1,12 @@
-from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 from typing import List
-from app.core.db import get_conn  # Asegúrate de usar la conexión sincrónica
+from fastapi import APIRouter, HTTPException
+import psycopg
 
-# Crea una instancia de APIRouter
-router = APIRouter()
+# Configura tu URL de conexión a la base de datos
+DATABASE_URL = "postgresql://postgres:password@localhost/dbname"  # Cambia esto a tu URL de conexión real
 
-# Modelo de respuesta para el estado de los tanques
+# Modelo de respuesta
 class TankStatusResponse(BaseModel):
     id: int
     name: str
@@ -16,52 +17,61 @@ class TankStatusResponse(BaseModel):
     high_high_pct: float
     status: str
 
+# Consulta para obtener el estado de los tanques
+def get_tank_status() -> List[TankStatusResponse]:
+    query = """
+    SELECT 
+        t.id,
+        t.name,
+        tl.level_percent,
+        tc.low_pct,
+        tc.low_low_pct,
+        tc.high_pct,
+        tc.high_high_pct,
+        CASE
+            WHEN tl.level_percent <= tc.low_low_pct THEN 'critical'
+            WHEN tl.level_percent <= tc.low_pct THEN 'warning'
+            WHEN tl.level_percent >= tc.high_high_pct THEN 'critical'
+            WHEN tl.level_percent >= tc.high_pct THEN 'warning'
+            ELSE 'ok'
+        END AS status
+    FROM 
+        public.tanks t
+    JOIN 
+        public.tank_levels tl ON tl.tank_id = t.id
+    JOIN 
+        public.tank_config tc ON tc.tank_id = t.id
+    WHERE
+        t.org_id = 1;
+    """
+    # Establecemos la conexión con la base de datos
+    with psycopg.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute(query)
+            rows = cur.fetchall()
+
+    # Procesamos los resultados y los retornamos
+    return [
+        TankStatusResponse(
+            id=row[0],
+            name=row[1],
+            level_percent=row[2],
+            low_pct=row[3],
+            low_low_pct=row[4],
+            high_pct=row[5],
+            high_high_pct=row[6],
+            status=row[7]
+        )
+        for row in rows
+    ]
+
+# Crear el router
+router = APIRouter()
+
 # Endpoint para obtener los estados de los tanques
 @router.get("/tank_statuses", response_model=List[TankStatusResponse])
-def tank_statuses():
+async def tank_statuses():
     try:
-        with get_conn() as conn:  # Usamos la conexión sincrónica
-            query = """
-            SELECT 
-                t.id,
-                t.name,
-                tl.level_percent,
-                tc.low_pct,
-                tc.low_low_pct,
-                tc.high_pct,
-                tc.high_high_pct,
-                CASE
-                    WHEN tl.level_percent <= tc.low_low_pct THEN 'critical'
-                    WHEN tl.level_percent <= tc.low_pct THEN 'warning'
-                    WHEN tl.level_percent >= tc.high_high_pct THEN 'critical'
-                    WHEN tl.level_percent >= tc.high_pct THEN 'warning'
-                    ELSE 'ok'
-                END AS status
-            FROM 
-                public.tanks t
-            JOIN 
-                public.tank_levels tl ON tl.tank_id = t.id
-            JOIN 
-                public.tank_config tc ON tc.tank_id = t.id
-            WHERE
-                t.org_id = 1;
-            """
-            conn.execute(query)
-            rows = conn.fetchall()
-
-        # Procesamos los resultados y los retornamos
-        return [
-            TankStatusResponse(
-                id=row[0],
-                name=row[1],
-                level_percent=row[2],
-                low_pct=row[3],
-                low_low_pct=row[4],
-                high_pct=row[5],
-                high_high_pct=row[6],
-                status=row[7]
-            )
-            for row in rows
-        ]
+        return get_tank_status()
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Error al obtener los datos de los tanques")
+        raise HTTPException(status_code=500, detail=f"Error al obtener los datos de los tanques: {str(e)}")
