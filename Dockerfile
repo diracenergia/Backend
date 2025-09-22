@@ -1,5 +1,4 @@
-﻿# Dockerfile
-FROM python:3.11-slim
+﻿FROM python:3.11-bullseye
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -11,7 +10,7 @@ WORKDIR /code
 
 # Paquetes de sistema (curl para healthcheck; libpq-dev para psycopg)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential libpq-dev curl \
+    build-essential libpq-dev curl python3-dev gcc libffi-dev \
  && rm -rf /var/lib/apt/lists/*
 
 # Dependencias de Python
