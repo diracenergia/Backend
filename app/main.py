@@ -61,7 +61,6 @@ from app.ws import router as ws_router
 
 # Visor en vivo (WS /viz/ws y GET /viz/state)
 from app.routes.live_view import viz_router
-from app.routes.infraestatus import router as infraestatus_router
 
 
 # ===== Config centralizada (pydantic Settings) con fallback a .env =====
@@ -257,7 +256,7 @@ app.include_router(ws_router)
 app.include_router(kpi_router)
 
 # INFRA
-app.include_router(infraestatus_router, prefix="/infraestatus", tags=["infraestatus"])
+
 
 # Visor en vivo (estado + websocket)
 app.include_router(viz_router)
