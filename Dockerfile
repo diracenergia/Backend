@@ -7,9 +7,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /code
 
-# Paquetes de sistema (curl para healthcheck; libpq-dev para psycopg, build-essential para la compilación)
+# Paquetes de sistema necesarios para la compilación de asyncpg
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential libpq-dev curl python3-dev \
+    build-essential libpq-dev curl python3-dev libffi-dev gcc \
  && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
