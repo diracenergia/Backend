@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException
-from app.core.db import database  # Importamos la conexión global de db.py
+from app.core.db import get_conn  # Usamos get_conn para obtener la conexión
 from typing import List
 from pydantic import BaseModel
 
@@ -42,8 +42,9 @@ async def get_tank_status() -> List[TankStatusResponse]:
         t.org_id = 1;
     """
     try:
-        # Usamos la conexión global para ejecutar la consulta
-        rows = await database.fetch_all(query)
+        # Usamos get_conn para obtener la conexión
+        async with get_conn() as conn:
+            rows = await conn.fetch(query)
 
         return [
             TankStatusResponse(
