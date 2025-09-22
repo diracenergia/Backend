@@ -1,79 +1,70 @@
-# app/routes/conn.py
-import os
+# app/routes/conn_simple.py
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+import os
+from fastapi import APIRouter, HTTPException, Header
+from psycopg.rows import dict_row
+from typing import Optional, Dict, Any, List
 
-from fastapi import APIRouter, Depends, HTTPException
-from app.core.security import device_id_dep
-from app.repos import tanks as repo
+from app.core.db import get_conn
 
-# Importamos helpers del WS para consultar presencia en memoria
-from app.ws import presence_snapshot  # asegúrate de exponer esta función en ws.py
+router = APIRouter(prefix="/conn", tags=["conn"])
 
-router = APIRouter(prefix="/tanks", tags=["tanks"])
+WARN_SEC = int(os.getenv("WARN_SEC", "120"))   # 2 min
+CRIT_SEC = int(os.getenv("CRIT_SEC", "300"))   # 5 min
 
-WS_WARN_SEC = int(os.getenv("WS_WARN_SEC", "30"))
-WS_CRIT_SEC = int(os.getenv("WS_CRIT_SEC", "120"))
+def _tone(age: Optional[int]) -> str:
+    if age is None:
+        return "bad"
+    return "ok" if age < WARN_SEC else ("warn" if age < CRIT_SEC else "bad")
 
-def _parse_iso(dt: Any) -> Optional[datetime]:
-    if dt is None:
-        return None
-    if isinstance(dt, datetime):
-        # asumimos UTC si viene naive
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+@router.get("/simple")
+def conn_simple(x_org_id: Optional[int] = Header(default=None, convert_underscores=False)) -> Dict[str, Any]:
+    """
+    Devuelve presencia basada en la frescura de lecturas (sin WS):
+      - node_id: 'pump_<id>' | 'tank_<id>'
+      - online: True/False
+      - tone: 'ok'|'warn'|'bad'
+      - age_sec, last_seen, source='reading'
+    Si se pasa X-Org-Id, intenta filtrar por organización (opcional).
+    """
     try:
-        # soporta "Z"
-        s = str(dt).replace("Z", "+00:00")
-        return datetime.fromisoformat(s)
-    except Exception:
-        return None
+        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+            if x_org_id:
+                # Filtra solo activos de la org (vía assets)
+                cur.execute("""
+                  with ap as (
+                    select p.asset_type, p.asset_id, p.last_ts
+                    from public.v_asset_presence_simple p
+                    join public.assets a
+                      on a.kind = p.asset_type and a.native_id = p.asset_id
+                    where a.org_id = %s
+                  )
+                  select * from ap;
+                """, (x_org_id,))
+            else:
+                cur.execute("select asset_type, asset_id, last_ts from public.v_asset_presence_simple;")
+            rows = cur.fetchall()
 
-@router.get("/{tank_id}/conn")
-def tank_conn(tank_id: int, _=Depends(device_id_dep)):
-    """
-    Estado de conexión de un tanque:
-      - Usa presence del WS (si existe) para 'online' y 'last_seen'
-      - Fallback: staleness de la última lectura en DB
-      - Tone por thresholds WS_WARN_SEC / WS_CRIT_SEC
-    """
-    latest = repo.latest_tank_row(tank_id)
-    if not latest:
-        raise HTTPException(404, "No hay lecturas para este tanque")
-
-    dev: Optional[str] = latest.get("device_id")
-    last_seen_dt: Optional[datetime] = None
-    online = False
-
-    # 1) Presence en memoria (si hay device_id y está cacheado como online)
-    if dev:
-        p: Optional[Dict[str, Any]] = presence_snapshot(dev)  # {'online': bool, 'last_seen': iso}
-        if p:
-            online = bool(p.get("online"))
-            last_seen_dt = _parse_iso(p.get("last_seen"))
-
-    # 2) Fallback: si no tenemos last_seen del WS, usamos ts de la última lectura
-    if not last_seen_dt:
-        last_seen_dt = _parse_iso(latest.get("ts"))
-
-    # 3) Calcular edad (segundos) respecto del ahora (UTC)
-    if not last_seen_dt:
-        age_sec = 10**9  # sin datos: muy viejo
-    else:
         now = datetime.now(timezone.utc)
-        if last_seen_dt.tzinfo is None:
-            last_seen_dt = last_seen_dt.replace(tzinfo=timezone.utc)
-        age_sec = max(0, int((now - last_seen_dt).total_seconds()))
-
-    # 4) Tono por staleness
-    tone = "ok" if age_sec < WS_WARN_SEC else "warn" if age_sec < WS_CRIT_SEC else "bad"
-
-    # 5) Si WS no lo marcó online, usamos staleness como heurística
-    if not online:
-        online = age_sec < WS_CRIT_SEC
-
-    return {
-        "device_id": dev,
-        "online": bool(online),
-        "age_sec": age_sec if age_sec < 10**8 else None,
-        "tone": tone,  # "ok" | "warn" | "bad"
-    }
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            last_ts = r["last_ts"]
+            age = None
+            if last_ts:
+                if last_ts.tzinfo is None:
+                    last_ts = last_ts.replace(tzinfo=timezone.utc)
+                age = max(0, int((now - last_ts).total_seconds()))
+            node_id = f'{r["asset_type"]}_{r["asset_id"]}'
+            out.append({
+                "node_id": node_id,
+                "asset_type": r["asset_type"],
+                "asset_id": r["asset_id"],
+                "last_seen": last_ts.isoformat() if last_ts else None,
+                "age_sec": age,
+                "online": age is not None and age < CRIT_SEC,
+                "tone": _tone(age),
+                "source": "reading"
+            })
+        return {"presence": out}
+    except Exception as e:
+        raise HTTPException(500, f"conn_simple failed: {e}")
