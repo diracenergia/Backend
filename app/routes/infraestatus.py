@@ -1,7 +1,12 @@
 from fastapi import APIRouter, HTTPException
-from app.core.db import get_conn  # Usamos el método de conexión del archivo db.py
+import psycopg
 from typing import List
 from pydantic import BaseModel
+import logging  # Agregado el import para el logger
+
+# Configurar el logger
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 # Modelo de respuesta
 class TankStatusResponse(BaseModel):
@@ -41,34 +46,26 @@ def get_tank_status() -> List[TankStatusResponse]:
     WHERE
         t.org_id = 1;
     """
-    try:
-        # Log de conexión
-        logger.info("Connecting to the database...")
-        
-        # Obtener la conexión desde get_conn() y ejecutar la consulta
-        with get_conn() as conn:
-            with conn.cursor() as cur:  # Usamos un cursor para ejecutar la consulta
-                logger.info("Database connection established.")
-                cur.execute(query)  # Ejecutamos la consulta
-                rows = cur.fetchall()  # Obtenemos los resultados de la consulta
-        
-        # Mapear los resultados de la base de datos al modelo TankStatusResponse
-        return [
-            TankStatusResponse(
-                id=row[0],
-                name=row[1],
-                level_percent=row[2],
-                low_pct=row[3],
-                low_low_pct=row[4],
-                high_pct=row[5],
-                high_high_pct=row[6],
-                status=row[7]
-            )
-            for row in rows
-        ]
-    except Exception as e:
-        logger.error(f"Error executing query: {str(e)}")  # Log del error
-        raise HTTPException(status_code=500, detail=f"Database query failed: {str(e)}")
+    # Establecemos la conexión con la base de datos
+    with psycopg.connect("postgresql://postgres:password@localhost/dbname") as conn:
+        with conn.cursor() as cur:
+            cur.execute(query)
+            rows = cur.fetchall()
+
+    # Procesamos los resultados y los retornamos
+    return [
+        TankStatusResponse(
+            id=row[0],
+            name=row[1],
+            level_percent=row[2],
+            low_pct=row[3],
+            low_low_pct=row[4],
+            high_pct=row[5],
+            high_high_pct=row[6],
+            status=row[7]
+        )
+        for row in rows
+    ]
 
 # Crear el router
 router = APIRouter()
