@@ -6,6 +6,7 @@ import logging
 
 # Configurar logging para depuración
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG)
 
 # Modelo de respuesta
 class TankStatusResponse(BaseModel):
@@ -46,12 +47,14 @@ async def get_tank_status() -> List[TankStatusResponse]:
         t.org_id = 1;
     """
     try:
+        logger.info("Connecting to the database...")
+
         # Usamos get_conn para obtener la conexión
         async with get_conn() as conn:
             logger.info("Database connection established.")
             rows = await conn.fetch(query)
             logger.info(f"Query executed successfully, fetched {len(rows)} rows.")
-
+        
         return [
             TankStatusResponse(
                 id=row["id"],
@@ -76,6 +79,8 @@ router = APIRouter()
 @router.get("/tank_statuses", response_model=List[TankStatusResponse])
 async def tank_statuses():
     try:
+        logger.info("Fetching tank statuses...")
         return await get_tank_status()
     except Exception as e:
+        logger.error(f"Error in tank status retrieval: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error al obtener los datos de los tanques: {str(e)}")
