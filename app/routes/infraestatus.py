@@ -48,22 +48,25 @@ def get_tank_status() -> List[TankStatusResponse]:
     """
     try:
         logger.info("Connecting to the database...")
-        # Cambiamos get_conn() para una versión síncrona
-        with get_conn() as conn:  # Cambié async with por un with normal para una conexión sincrónica
-            logger.info("Database connection established.")
-            rows = conn.fetch(query)
-            logger.info(f"Query executed successfully, fetched {len(rows)} rows.")
+        # Cambiamos get_conn() para usar un cursor
+        with get_conn() as conn:  # Obtener la conexión
+            with conn.cursor() as cur:  # Creamos el cursor
+                logger.info("Database connection established.")
+                cur.execute(query)  # Ejecutamos la consulta
+                rows = cur.fetchall()  # Obtenemos los resultados
+                
+                logger.info(f"Query executed successfully, fetched {len(rows)} rows.")
         
         return [
             TankStatusResponse(
-                id=row["id"],
-                name=row["name"],
-                level_percent=row["level_percent"],
-                low_pct=row["low_pct"],
-                low_low_pct=row["low_low_pct"],
-                high_pct=row["high_pct"],
-                high_high_pct=row["high_high_pct"],
-                status=row["status"]
+                id=row[0],
+                name=row[1],
+                level_percent=row[2],
+                low_pct=row[3],
+                low_low_pct=row[4],
+                high_pct=row[5],
+                high_high_pct=row[6],
+                status=row[7]
             )
             for row in rows
         ]
