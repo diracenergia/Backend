@@ -1,12 +1,26 @@
-# En lugar de usar "async with", vamos a usar la conexión sincrónica
+from fastapi import APIRouter, HTTPException
+from typing import List
 from app.core.db import get_conn  # Asegúrate de usar la conexión sincrónica
 
+# Crea una instancia de APIRouter
+router = APIRouter()
+
+# Modelo de respuesta para el estado de los tanques
+class TankStatusResponse(BaseModel):
+    id: int
+    name: str
+    level_percent: float
+    low_pct: float
+    low_low_pct: float
+    high_pct: float
+    high_high_pct: float
+    status: str
+
+# Endpoint para obtener los estados de los tanques
 @router.get("/tank_statuses", response_model=List[TankStatusResponse])
 def tank_statuses():
     try:
-        # Usamos get_conn sin await (sincrónico)
-        with get_conn() as conn:
-            # Realizamos la consulta de forma sincrónica
+        with get_conn() as conn:  # Usamos la conexión sincrónica
             query = """
             SELECT 
                 t.id,
