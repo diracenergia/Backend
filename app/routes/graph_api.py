@@ -1,4 +1,3 @@
-# app/routes/graph_api.py
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -69,13 +68,36 @@ def graph_all(request: Request):
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
             _set_org(cur, org_id)
 
+            # Obtener los datos de los nodos
             cur.execute("SELECT * FROM v_asset_nodes ORDER BY type, name;")
             raw_nodes = cur.fetchall()
 
+            # Obtener las relaciones entre los nodos
             cur.execute("SELECT * FROM v_topology_edges WHERE is_active ORDER BY id;")
             raw_edges = cur.fetchall()
 
-        # Mapa de posiciones guardadas en DB
+            # Obtener la configuración de los tanques (umbrales)
+            cur.execute("""
+                SELECT tank_id, low_pct, high_pct, low_low_pct, high_high_pct
+                FROM public.tank_config;
+            """)
+            tank_config = {row["tank_id"]: row for row in cur.fetchall()}
+
+            # Obtener los niveles más recientes de los tanques
+            cur.execute("""
+                SELECT tank_id, level_percent
+                FROM v_tank_latest;
+            """)
+            tank_levels = {row["tank_id"]: row["level_percent"] for row in cur.fetchall()}
+
+            # Obtener los estados más recientes de las bombas
+            cur.execute("""
+                SELECT pump_id, is_on
+                FROM v_pump_latest;
+            """)
+            pump_statuses = {row["pump_id"]: row["is_on"] for row in cur.fetchall()}
+
+        # Obtener el mapa de posiciones de los nodos
         layout_map = _get_layout_map(org_id)
 
         nodes = []
@@ -88,13 +110,20 @@ def graph_all(request: Request):
 
             # payload específico por tipo (opcional para el front)
             if r["type"] == "tank":
-                node["level"]    = r.get("level_ratio")
-                node["capacity"] = r.get("capacity_liters")
+                tank_id = r["asset_id"]
+                config = tank_config.get(tank_id)
+                if config:
+                    node["low_pct"] = config["low_pct"]
+                    node["high_pct"] = config["high_pct"]
+                    node["low_low_pct"] = config["low_low_pct"]
+                    node["high_high_pct"] = config["high_high_pct"]
+                    node["level"] = tank_levels.get(tank_id, None)  # Último nivel conocido del tanque
+
             elif r["type"] == "pump":
-                node["status"] = r.get("pump_status")
-                node["kW"]     = r.get("rated_kw")
+                node["status"] = pump_statuses.get(r["asset_id"], False)  # False significa apagada, True significa encendida
+                node["kW"] = r.get("rated_kw")
             elif r["type"] == "valve":
-                node["state"]  = r.get("valve_state")
+                node["state"] = r.get("valve_state")
 
             # Inyectar posiciones si están guardadas
             if nid in layout_map:
@@ -103,10 +132,11 @@ def graph_all(request: Request):
 
             nodes.append(node)
 
+        # Procesar las relaciones entre nodos (edges)
         edges = []
         for e in raw_edges:
             src = f'{e["from_type"]}:{e.get("from_code")}' if e.get("from_code") else f'{e["from_type"]}_{e["from_id"]}'
-            dst = f'{e["to_type"]}:{e.get("to_code")}'     if e.get("to_code")     else f'{e["to_type"]}_{e["to_id"]}'
+            dst = f'{e["to_type"]}:{e.get("to_code")}' if e.get("to_code") else f'{e["to_type"]}_{e["to_id"]}'
             edges.append(f"{src}>{dst}")
 
         return {"nodes": nodes, "edges": edges}
@@ -145,7 +175,7 @@ def graph_edges(request: Request):
             _set_org(cur, request.headers.get("X-Org-Id"))
             cur.execute("""
                 SELECT id, from_type, from_id, from_name, from_code,
-                       to_type,   to_id,   to_name,   to_code,
+                       to_type, to_id, to_name, to_code,
                        pipe_diameter_mm, length_m, is_active
                 FROM v_topology_edges
                 ORDER BY id;
