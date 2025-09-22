@@ -7,9 +7,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /code
 
-# Paquetes de sistema necesarios para la compilación de asyncpg
+# Instalar dependencias del sistema necesarias para compilar asyncpg
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential libpq-dev curl python3-dev libffi-dev gcc \
+    build-essential libpq-dev curl python3-dev gcc libffi-dev \
  && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
