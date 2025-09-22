@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException
-from app.core.db import database  # Importar la conexión global
+from app.core.db import database  # Importamos la conexión global de db.py
 from typing import List
 from pydantic import BaseModel
 
