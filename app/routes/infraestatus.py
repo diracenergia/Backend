@@ -1,7 +1,8 @@
 from pydantic import BaseModel
 from typing import List
 from fastapi import APIRouter, HTTPException
-import psycopg
+import asyncpg  # Usamos asyncpg en lugar de psycopg
+from typing import List
 
 # Configura tu URL de conexión a la base de datos
 DATABASE_URL = "postgresql://postgres:password@localhost/dbname"  # Cambia esto a tu URL de conexión real
@@ -18,7 +19,7 @@ class TankStatusResponse(BaseModel):
     status: str
 
 # Consulta para obtener el estado de los tanques
-def get_tank_status() -> List[TankStatusResponse]:
+async def get_tank_status() -> List[TankStatusResponse]:
     query = """
     SELECT 
         t.id,
@@ -44,23 +45,24 @@ def get_tank_status() -> List[TankStatusResponse]:
     WHERE
         t.org_id = 1;
     """
-    # Establecemos la conexión con la base de datos
-    with psycopg.connect(DATABASE_URL) as conn:
-        with conn.cursor() as cur:
-            cur.execute(query)
-            rows = cur.fetchall()
+    # Establecemos la conexión asíncrona con la base de datos
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        rows = await conn.fetch(query)  # Usamos `fetch` para obtener resultados de manera asíncrona
+    finally:
+        await conn.close()  # Aseguramos que la conexión se cierre
 
     # Procesamos los resultados y los retornamos
     return [
         TankStatusResponse(
-            id=row[0],
-            name=row[1],
-            level_percent=row[2],
-            low_pct=row[3],
-            low_low_pct=row[4],
-            high_pct=row[5],
-            high_high_pct=row[6],
-            status=row[7]
+            id=row['id'],
+            name=row['name'],
+            level_percent=row['level_percent'],
+            low_pct=row['low_pct'],
+            low_low_pct=row['low_low_pct'],
+            high_pct=row['high_pct'],
+            high_high_pct=row['high_high_pct'],
+            status=row['status']
         )
         for row in rows
     ]
@@ -72,6 +74,6 @@ router = APIRouter()
 @router.get("/tank_statuses", response_model=List[TankStatusResponse])
 async def tank_statuses():
     try:
-        return get_tank_status()
+        return await get_tank_status()  # Llamamos la función asíncrona
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al obtener los datos de los tanques: {str(e)}")
