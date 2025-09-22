@@ -1,12 +1,7 @@
 from fastapi import APIRouter, HTTPException
-from app.core.db import get_conn  # Usamos get_conn para obtener la conexión
+from app.core.db import get_conn  # Usamos el método de conexión del archivo db.py
 from typing import List
 from pydantic import BaseModel
-import logging
-
-# Configurar logging para depuración
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.DEBUG)
 
 # Modelo de respuesta
 class TankStatusResponse(BaseModel):
@@ -47,16 +42,17 @@ def get_tank_status() -> List[TankStatusResponse]:
         t.org_id = 1;
     """
     try:
+        # Log de conexión
         logger.info("Connecting to the database...")
-        # Cambiamos get_conn() para usar un cursor
-        with get_conn() as conn:  # Obtener la conexión
-            with conn.cursor() as cur:  # Creamos el cursor
+        
+        # Obtener la conexión desde get_conn() y ejecutar la consulta
+        with get_conn() as conn:
+            with conn.cursor() as cur:  # Usamos un cursor para ejecutar la consulta
                 logger.info("Database connection established.")
                 cur.execute(query)  # Ejecutamos la consulta
-                rows = cur.fetchall()  # Obtenemos los resultados
-                
-                logger.info(f"Query executed successfully, fetched {len(rows)} rows.")
+                rows = cur.fetchall()  # Obtenemos los resultados de la consulta
         
+        # Mapear los resultados de la base de datos al modelo TankStatusResponse
         return [
             TankStatusResponse(
                 id=row[0],
@@ -71,7 +67,7 @@ def get_tank_status() -> List[TankStatusResponse]:
             for row in rows
         ]
     except Exception as e:
-        logger.error(f"Error executing query: {str(e)}")
+        logger.error(f"Error executing query: {str(e)}")  # Log del error
         raise HTTPException(status_code=500, detail=f"Database query failed: {str(e)}")
 
 # Crear el router
@@ -85,4 +81,4 @@ async def tank_statuses():
         return get_tank_status()
     except Exception as e:
         logger.error(f"Error in tank status retrieval: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error al obtener los datos de los tanques: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error al obtener los datos de los tanques")
