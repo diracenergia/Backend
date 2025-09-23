@@ -123,21 +123,31 @@ def kpi_totals_by_location(
     location_id: Optional[int] = Query(None),
 ) -> List[Dict[str, Any]]:
     """
-    Totales de bombas y tanques por localidad.
+    Totales de activos por localidad (tanques, bombas, válvulas, manifolds).
+    Fuente: v_location_summary_30d + filtro por org_id desde locations.
     """
     org_id = _require_org_id(x_org_id)
     with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
-            SELECT *
-            FROM public.v_totals_by_location
-            WHERE org_id = %s
-              AND (%s::bigint IS NULL OR location_id = %s)
-            ORDER BY location_name;
+            SELECT
+              v.location_id,
+              v.location_code,
+              v.location_name,
+              COALESCE(v.tanks_count, 0)      AS tanks_count,
+              COALESCE(v.pumps_count, 0)      AS pumps_count,
+              COALESCE(v.valves_count, 0)     AS valves_count,
+              COALESCE(v.manifolds_count, 0)  AS manifolds_count
+            FROM public.v_location_summary_30d v
+            JOIN public.locations l ON l.id = v.location_id
+            WHERE l.org_id = %s
+              AND (%s::bigint IS NULL OR v.location_id = %s)
+            ORDER BY v.location_name;
             """,
             (org_id, location_id, location_id),
         )
         return [dict(r) for r in cur.fetchall()]
+
 
 
 # ------------------------------------------------------------------------------
