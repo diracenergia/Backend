@@ -3,6 +3,7 @@ from collections import defaultdict
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
 from psycopg.rows import dict_row
 
 from app.core.db import get_conn
@@ -13,6 +14,75 @@ from app.schemas.infra import (
 
 router = APIRouter(prefix="/infra", tags=["infra-locations"])
 
+
+# ------------------------------------------------------------
+# Modelo de salida para el mapa plano asset → location
+# ------------------------------------------------------------
+class AssetLoc(BaseModel):
+    asset_type: AssetType            # Literal['tank','pump','valve','manifold']
+    asset_id: int
+    location: Optional[Location] = None
+
+
+# ------------------------------------------------------------
+# GET /infra/asset-locations
+# Mapa plano asset → location (incluye huérfanos con location=null)
+# Filtros opcionales: ?type=tank&type=pump  y/o ?location_id=5
+# ------------------------------------------------------------
+@router.get("/asset-locations", response_model=List[AssetLoc])
+def list_asset_locations(
+    type: Optional[List[AssetType]] = Query(
+        default=None,
+        description="Filtro por tipo (repetir ?type=tank&type=pump)"
+    ),
+    location_id: Optional[int] = Query(
+        default=None,
+        description="Filtra por location_id. Si no se pasa, devuelve todos (incluye null)."
+    )
+):
+    base_sql = """
+    SELECT
+      n.type       AS asset_type,
+      n.asset_id,
+      al.location_id,
+      l.code       AS location_code,
+      l.name       AS location_name
+    FROM public.v_asset_nodes n
+    LEFT JOIN public.asset_locations al
+      ON al.asset_type = n.type AND al.asset_id = n.asset_id
+    LEFT JOIN public.locations l
+      ON l.id = al.location_id
+    WHERE 1=1
+    """
+    params: list = []
+
+    if type:
+        base_sql += " AND n.type = ANY(%s)"
+        params.append(type)
+
+    if location_id is not None:
+        base_sql += " AND al.location_id = %s"
+        params.append(location_id)
+
+    base_sql += " ORDER BY l.name NULLS LAST, n.type, n.asset_id;"
+
+    with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
+        cur.execute(base_sql, params or None)
+        rows = cur.fetchall()
+
+    out: list[AssetLoc] = []
+    for r in rows:
+        loc = None
+        if r["location_id"] is not None:
+            loc = Location(id=r["location_id"], code=r["location_code"], name=r["location_name"])
+        out.append(AssetLoc(asset_type=r["asset_type"], asset_id=r["asset_id"], location=loc))
+    return out
+
+
+# ------------------------------------------------------------
+# GET /infra/locations
+# Lista de locations. Si with_stats=true, incluye conteos y alarmas.
+# ------------------------------------------------------------
 @router.get("/locations", response_model=List[Location])
 def list_locations(with_stats: bool = Query(False)):
     """
@@ -68,13 +138,21 @@ def list_locations(with_stats: bool = Query(False)):
             # Para que el tipado no moleste al client, casteamos a LocationWithStats
             return [LocationWithStats(**r).dict() for r in rows]
 
+
+# ------------------------------------------------------------
+# GET /infra/locations/{loc_id}/assets
+# Devuelve [{type: 'tank', items: [...]}, ...] para pintar grupos.
+# ------------------------------------------------------------
 @router.get(
     "/locations/{loc_id}/assets",
     response_model=List[AssetGroup]
 )
 def location_assets(
     loc_id: int,
-    include: Optional[List[AssetType]] = Query(default=None, description="Filtra tipos: repetir ?include=tank&include=pump")
+    include: Optional[List[AssetType]] = Query(
+        default=None,
+        description="Filtra tipos: repetir ?include=tank&include=pump"
+    )
 ):
     """
     Devuelve [{type: 'tank', items: [...]}, ...] para que el front pinte grupos.
@@ -116,6 +194,11 @@ def location_assets(
         # Orden estable por tipo
         return [AssetGroup(type=k, items=v).dict() for k, v in sorted(groups.items())]
 
+
+# ------------------------------------------------------------
+# GET /infra/locations/{loc_id}/summary
+# Lee la vista v_location_summary_30d (LATERAL + last_seen histórico).
+# ------------------------------------------------------------
 @router.get(
     "/locations/{loc_id}/summary",
     response_model=LocationSummary
@@ -133,6 +216,11 @@ def location_summary(loc_id: int):
             raise HTTPException(404, "location not found")
         return row
 
+
+# ------------------------------------------------------------
+# GET /infra/locations/{loc_id}/tree
+# Paquete completo para el front: location + summary + assets agrupados.
+# ------------------------------------------------------------
 @router.get(
     "/locations/{loc_id}/tree",
     response_model=LocationTree
