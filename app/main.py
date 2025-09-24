@@ -1,14 +1,16 @@
 # app/main.py
 import os
 from pathlib import Path
+
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 
-# Routers core
+# --- Routers core (estos deberían existir en tu repo) ---
 from app.routes.graph_api import router as graph_router
+
 from app.routes.ingest import router as ingest_tank_router
 from app.routes.latest import router as latest_tank_router
 from app.routes.history import router as history_tank_router
@@ -24,19 +26,26 @@ from app.routes.commands_pumps import router as commands_pump_router
 from app.routes.alarms import router as alarms_router
 from app.routes.audit import router as audit_router
 
-# Diagnóstico (queda bajo /infra/debug si lo montamos con prefijo)
-from app.routes.diag_listener import router as diag_listener_router
+# --- Routers opcionales: los envolvemos en try/except por si no están ---
+try:
+    from app.routes.diag_listener import router as diag_listener_router
+except Exception:
+    diag_listener_router = None
 
-# Conexión (para /conn/simple, etc.)
-from app.routes.conn import router as conn_router
+try:
+    from app.routes.conn import router as conn_router   # /conn/simple, etc.
+except Exception:
+    conn_router = None
 
-# WebSocket
-from app.ws import router as ws_router
+try:
+    from app.ws import router as ws_router              # WebSocket
+except Exception:
+    ws_router = None
 
 
 # --- Config centralizada con fallback a .env ---
 try:
-    from app.core.config import settings  # opcional (pydantic settings)
+    from app.core.config import settings  # (opcional) Pydantic Settings
 except Exception:
     settings = None
     try:
@@ -98,10 +107,9 @@ app.add_middleware(
     allow_methods=ALLOW_METHODS,
     allow_headers=ALLOW_HEADERS,
 )
-
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
-# ===== UI estática =====
+# ===== UI estática (sirve /ui si existe carpeta web/) =====
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WEB_DIR = REPO_ROOT / "web"
 if WEB_DIR.exists():
@@ -109,7 +117,7 @@ if WEB_DIR.exists():
 else:
     print(f"⚠️ /ui deshabilitado: no existe {WEB_DIR}")
 
-# ===== Routers =====
+# ===== Incluir routers =====
 # Tanques
 app.include_router(ingest_tank_router)
 app.include_router(latest_tank_router)
@@ -122,7 +130,7 @@ app.include_router(ingest_pump_router)
 app.include_router(latest_pump_router)
 app.include_router(history_pump_router)
 app.include_router(configs_pump_router)
-app.include_router(commands_pumps_router := commands_pumps_router if 'commands_pumps_router' in globals() else commands_pump_router)
+app.include_router(commands_pump_router)
 
 # Alarmas / Auditoría
 app.include_router(alarms_router)
@@ -131,14 +139,17 @@ app.include_router(audit_router)
 # Infra / Graph API (una sola vez, con prefijo)
 app.include_router(graph_router, prefix="/infra")
 
-# Diagnóstico listener bajo /infra/debug
-app.include_router(diag_listener_router, prefix="/infra/debug", tags=["debug"])
+# Diagnóstico listener (si está): lo dejamos en /infra/debug
+if diag_listener_router:
+    app.include_router(diag_listener_router, prefix="/infra/debug", tags=["debug"])
 
-# Conexión (para /conn/simple usado por presence)
-app.include_router(conn_router)
+# Conexión (presence /conn/simple) si está
+if conn_router:
+    app.include_router(conn_router)
 
-# WebSocket
-app.include_router(ws_router)
+# WebSocket si está
+if ws_router:
+    app.include_router(ws_router)
 
 # ===== Endpoints utilitarios =====
 from app.core.db import get_conn
@@ -184,7 +195,7 @@ def cfg_echo():
         "version": APP_VERSION or None,
     }
 
-# --- DEBUG TELEGRAM inline (para evitar problemas de import) ---
+# --- DEBUG TELEGRAM inline (evita problemas de import/routers) ---
 from app.core.telegram import send_telegram as _send_tg
 
 @app.get("/infra/debug/__tg_env")
@@ -201,18 +212,19 @@ async def __ping_telegram_inline():
     res = await _send_tg("✅ Telegram OK (inline test)")
     return {"result": res}
 
-# --- Listar rutas (anti-dudas) ---
+# --- Listar rutas publicadas (para verificar deploy) ---
 @app.get("/__routes")
 def __routes():
-    out = []
-    for r in app.router.routes:
-        path = getattr(r, "path", None)
-        name = getattr(r, "name", None)
-        methods = list(getattr(r, "methods", []) or [])
-        out.append({"path": path, "name": name, "methods": methods})
-    return out
+    return [
+        {
+            "path": getattr(r, "path", None),
+            "name": getattr(r, "name", None),
+            "methods": list(getattr(r, "methods", []) or []),
+        }
+        for r in app.router.routes
+    ]
 
-# ===== Alarm Poller (sin LISTEN/NOTIFY) =====
+# ===== Alarm Poller (sin LISTEN/NOTIFY): si existe, lo levantamos =====
 try:
     from app.services.alarm_poller import start_alarm_poller, stop_alarm_poller
     _HAS_ALARM_POLLER = True
