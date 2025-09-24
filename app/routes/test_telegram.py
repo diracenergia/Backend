@@ -12,7 +12,7 @@ router = APIRouter()
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-# ✅ Publica NOTIFY -> lo consume alarm_listener -> envía Telegram
+# NOTIFY -> lo debe consumir el listener para que llegue a Telegram
 @router.get("/__test_alarm_notify")
 def test_alarm_notify(
     op: str = Query("RAISED", description="RAISED | CLEARED | ACK"),
@@ -26,7 +26,6 @@ def test_alarm_notify(
     alarm_id: Optional[int] = Query(None, description="Si no se pasa, se genera uno único"),
     ts: Optional[str] = Query(None, description="ISO-8601; si no se pasa se usa ahora UTC"),
 ):
-    # Genera un alarm_id único si no viene, para evitar dedupe del listener
     if alarm_id is None:
         alarm_id = int(time.time() * 1000)
 
@@ -48,11 +47,12 @@ def test_alarm_notify(
     print("[test_alarm] NOTIFY alarm_events:", json.dumps(payload, ensure_ascii=False))
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT pg_notify('alarm_events', %s)", (json.dumps(payload),))
+        conn.commit()  # ← explícito, por si el context manager no commitea
     return {"ok": True, "sent": payload}
 
-# ✅ Envío directo a Telegram (sin listener, útil para aislar problemas)
+# Envío directo (sin listener)
 @router.get("/__ping_telegram")
 async def ping_telegram():
-    text = "✅ Telegram OK desde Render (test directo)"
+    text = "✅ Telegram OK (test directo)"
     result = await send_telegram(text)
     return {"ok": True, "sent": text, "result": result}
