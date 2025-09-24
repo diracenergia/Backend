@@ -7,7 +7,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 
-# Routers “core”
+# Routers core
 from app.routes.graph_api import router as graph_router
 from app.routes.ingest import router as ingest_tank_router
 from app.routes.latest import router as latest_tank_router
@@ -23,8 +23,16 @@ from app.routes.commands_pumps import router as commands_pump_router
 
 from app.routes.alarms import router as alarms_router
 from app.routes.audit import router as audit_router
-from app.routes.diag_listener import router as diag_listener_router  # si querés, después lo movemos a /infra/debug
+
+# Diagnóstico (queda bajo /infra/debug si lo montamos con prefijo)
+from app.routes.diag_listener import router as diag_listener_router
+
+# Conexión (para /conn/simple, etc.)
+from app.routes.conn import router as conn_router
+
+# WebSocket
 from app.ws import router as ws_router
+
 
 # --- Config centralizada con fallback a .env ---
 try:
@@ -37,10 +45,13 @@ except Exception:
     except Exception:
         pass
 
+
 def _get_env(name: str, default: str = "") -> str:
+    """Lee primero de settings (si existe) y si no, del entorno."""
     if settings and hasattr(settings, name):
         return str(getattr(settings, name))
     return os.getenv(name, default)
+
 
 # ===== CORS =====
 _raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
@@ -64,7 +75,7 @@ TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
 APP_TITLE = _get_env("APP_TITLE", "ESP32 Tank/Pump API")
 APP_VERSION = _get_env("APP_VERSION", "") or _get_env("RENDER_GIT_COMMIT", "")[:8]
 
-# 🔧 crear app UNA sola vez
+# ===== Crear app (UNA sola vez) =====
 app = FastAPI(title=APP_TITLE, version=APP_VERSION or None)
 
 # Logs de arranque
@@ -111,7 +122,7 @@ app.include_router(ingest_pump_router)
 app.include_router(latest_pump_router)
 app.include_router(history_pump_router)
 app.include_router(configs_pump_router)
-app.include_router(commands_pump_router)
+app.include_router(commands_pumps_router := commands_pumps_router if 'commands_pumps_router' in globals() else commands_pump_router)
 
 # Alarmas / Auditoría
 app.include_router(alarms_router)
@@ -120,27 +131,11 @@ app.include_router(audit_router)
 # Infra / Graph API (una sola vez, con prefijo)
 app.include_router(graph_router, prefix="/infra")
 
-# Diag listener (si querés moverlo a /infra/debug, podés; lo dejo como estaba)
-app.include_router(diag_listener_router)
+# Diagnóstico listener bajo /infra/debug
+app.include_router(diag_listener_router, prefix="/infra/debug", tags=["debug"])
 
-# 🔧 Routers de test / diagnóstico (todos bajo /infra/debug)
-try:
-    from app.routes.test_telegram import router as test_telegram_router
-    app.include_router(test_telegram_router, prefix="/infra/debug", tags=["debug"])
-except Exception as e:
-    print(f"⚠️ test_telegram router no disponible: {e}")
-
-try:
-    from app.routes.test_alarm import router as test_alarm_router
-    app.include_router(test_alarm_router, prefix="/infra/debug", tags=["debug"])
-except Exception as e:
-    print(f"⚠️ test_alarm router no disponible: {e}")
-
-try:
-    from app.routes.debug_alarm import router as debug_alarm_router
-    app.include_router(debug_alarm_router, prefix="/infra/debug", tags=["debug"])
-except Exception as e:
-    print(f"⚠️ debug_alarm router no disponible: {e}")
+# Conexión (para /conn/simple usado por presence)
+app.include_router(conn_router)
 
 # WebSocket
 app.include_router(ws_router)
@@ -189,14 +184,33 @@ def cfg_echo():
         "version": APP_VERSION or None,
     }
 
-@app.get("/__tg_env")
-def tg_env():
-    token = _get_env("TELEGRAM_BOT_TOKEN", "")
+# --- DEBUG TELEGRAM inline (para evitar problemas de import) ---
+from app.core.telegram import send_telegram as _send_tg
+
+@app.get("/infra/debug/__tg_env")
+def __tg_env_inline():
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     return {
-        "ENABLED": _get_env("TELEGRAM_ENABLED", ""),
+        "ENABLED": os.getenv("TELEGRAM_ENABLED", ""),
         "BOT_head": (token[:8] + "...") if token else "",
-        "CHAT": _get_env("TELEGRAM_CHAT_ID", ""),
+        "CHAT": os.getenv("TELEGRAM_CHAT_ID", ""),
     }
+
+@app.get("/infra/debug/__ping_telegram")
+async def __ping_telegram_inline():
+    res = await _send_tg("✅ Telegram OK (inline test)")
+    return {"result": res}
+
+# --- Listar rutas (anti-dudas) ---
+@app.get("/__routes")
+def __routes():
+    out = []
+    for r in app.router.routes:
+        path = getattr(r, "path", None)
+        name = getattr(r, "name", None)
+        methods = list(getattr(r, "methods", []) or [])
+        out.append({"path": path, "name": name, "methods": methods})
+    return out
 
 # ===== Alarm Poller (sin LISTEN/NOTIFY) =====
 try:
@@ -226,31 +240,7 @@ def _shutdown_listeners():
         except Exception as e:
             print(f"⚠️ error al detener alarm-poller: {e}")
 
-@app.get("/__alarm_poller_status")
-def poller_status():
-    try:
-        from app.services import alarm_poller as ap
-    except Exception as e:
-        return {"alive": False, "error": f"import_error: {e}"}
-
-    alive = bool(getattr(ap, "_thread", None) and getattr(ap._thread, "is_alive", lambda: False)())
-    return {
-        "alive": alive,
-        "batch": getattr(ap, "BATCH", None),
-        "sleep_empty": getattr(ap, "SLEEP_EMPTY", None),
-        "sleep_busy": getattr(ap, "SLEEP_BUSY", None),
-    }
-
-@app.post("/__alarm_poller_stop")
-def poller_stop():
-    if _HAS_ALARM_POLLER and callable(stop_alarm_poller):
-        try:
-            stop_alarm_poller()
-            return {"stopped": True}
-        except Exception as e:
-            return {"stopped": False, "error": str(e)}
-    return {"stopped": False, "error": "poller no disponible"}
-
+# ===== Qué versión de alarms_eval está cargada =====
 @app.get("/__which_alarms_eval")
 def which_alarms_eval():
     import importlib
@@ -265,6 +255,7 @@ def which_alarms_eval():
     except Exception as e:
         return {"error": str(e)}
 
+# ===== Qué versión de alarm_events está cargada =====
 @app.get("/__which_alarm_events")
 def which_alarm_events():
     import importlib, inspect
@@ -288,6 +279,10 @@ def which_alarm_events():
 
 @app.post("/__diag_publish")
 def __diag_publish(payload: dict = Body(...)):
+    """
+    Empuja un evento a alarm_events._notify(payload).
+    Útil para probar el template de Telegram sin depender de otros módulos.
+    """
     try:
         from app.services import alarm_events
         alarm_events._notify(payload)
