@@ -2,7 +2,7 @@
 from collections import defaultdict
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Header
 from pydantic import BaseModel
 from psycopg.rows import dict_row
 
@@ -24,6 +24,14 @@ class AssetLoc(BaseModel):
     location: Optional[Location] = None
 
 
+def _set_org(cur, org_id: int | None):
+    """
+    Satisface el RLS de la DB: requiere app.org_id configurado por sesión.
+    Si no viene header, usa 1 por defecto.
+    """
+    cur.execute("select set_config('app.org_id', %s, true);", (str(org_id or 1),))
+
+
 # ------------------------------------------------------------
 # GET /infra/asset-locations
 # Mapa plano asset → location (incluye huérfanos con location=null)
@@ -38,7 +46,8 @@ def list_asset_locations(
     location_id: Optional[int] = Query(
         default=None,
         description="Filtra por location_id. Si no se pasa, devuelve todos (incluye null)."
-    )
+    ),
+    x_org_id: Optional[int] = Header(default=None, alias="x-org-id"),
 ):
     base_sql = """
     SELECT
@@ -67,7 +76,11 @@ def list_asset_locations(
     base_sql += " ORDER BY l.name NULLS LAST, n.type, n.asset_id;"
 
     with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
-        cur.execute(base_sql, params or None)
+        _set_org(cur, x_org_id)
+        if params:
+            cur.execute(base_sql, params)
+        else:
+            cur.execute(base_sql)
         rows = cur.fetchall()
 
     out: list[AssetLoc] = []
@@ -84,11 +97,16 @@ def list_asset_locations(
 # Lista de locations. Si with_stats=true, incluye conteos y alarmas.
 # ------------------------------------------------------------
 @router.get("/locations", response_model=List[Location])
-def list_locations(with_stats: bool = Query(False)):
+def list_locations(
+    with_stats: bool = Query(False),
+    x_org_id: Optional[int] = Header(default=None, alias="x-org-id"),
+):
     """
     Lista de locations. Si with_stats=true, devuelve conteos y alarmas.
     """
     with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
+        _set_org(cur, x_org_id)
+
         if not with_stats:
             cur.execute("""
                 SELECT id, code, name
@@ -135,7 +153,6 @@ def list_locations(with_stats: bool = Query(False)):
                 ORDER BY l.name;
             """)
             rows = cur.fetchall()
-            # Para que el tipado no moleste al client, casteamos a LocationWithStats
             return [LocationWithStats(**r).dict() for r in rows]
 
 
@@ -152,7 +169,8 @@ def location_assets(
     include: Optional[List[AssetType]] = Query(
         default=None,
         description="Filtra tipos: repetir ?include=tank&include=pump"
-    )
+    ),
+    x_org_id: Optional[int] = Header(default=None, alias="x-org-id"),
 ):
     """
     Devuelve [{type: 'tank', items: [...]}, ...] para que el front pinte grupos.
@@ -161,7 +179,9 @@ def location_assets(
     inc = set(include) & valid if include else None
 
     with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
-        # Verificamos que exista la location
+        _set_org(cur, x_org_id)
+
+        # Verificamos que exista la location (bajo RLS)
         cur.execute("SELECT 1 FROM public.locations WHERE id=%s;", (loc_id,))
         if cur.fetchone() is None:
             raise HTTPException(404, "location not found")
@@ -203,11 +223,12 @@ def location_assets(
     "/locations/{loc_id}/summary",
     response_model=LocationSummary
 )
-def location_summary(loc_id: int):
+def location_summary(loc_id: int, x_org_id: Optional[int] = Header(default=None, alias="x-org-id")):
     """
     Lee la vista v_location_summary_30d (LATERAL + last_seen histórico).
     """
     with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
+        _set_org(cur, x_org_id)
         cur.execute("""
           SELECT * FROM public.v_location_summary_30d WHERE location_id=%s;
         """, (loc_id,))
@@ -225,11 +246,13 @@ def location_summary(loc_id: int):
     "/locations/{loc_id}/tree",
     response_model=LocationTree
 )
-def location_tree(loc_id: int):
+def location_tree(loc_id: int, x_org_id: Optional[int] = Header(default=None, alias="x-org-id")):
     """
     Paquete completo para el front: location + summary + assets agrupados.
     """
     with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
+        _set_org(cur, x_org_id)
+
         # summary + datos de location
         cur.execute("SELECT * FROM public.v_location_summary_30d WHERE location_id=%s;", (loc_id,))
         summary = cur.fetchone()
