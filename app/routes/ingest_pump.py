@@ -16,7 +16,8 @@ from app.schemas.pumps import PumpPayload
 
 # Visor en vivo (best-effort)
 try:
-    from app.routes.live_view import apply_pump_ingest  # actualiza cache para /viz/ws y /viz/state
+    # actualiza cache para /viz/ws y /viz/state
+    from app.routes.live_view import apply_pump_ingest
 except Exception:
     def apply_pump_ingest(_: Dict[str, Any]) -> None:
         pass
@@ -29,6 +30,10 @@ router = APIRouter(prefix="/ingest", tags=["ingest"])
 # Helpers
 # ----------------------------
 def _extract_device_id(auth_obj: Any) -> Optional[int]:
+    """
+    Intenta extraer device_id desde el objeto de autenticación (dep).
+    Acepta dict o objeto con atributo .device_id
+    """
     raw = auth_obj.get("device_id") if isinstance(auth_obj, dict) else getattr(auth_obj, "device_id", None)
     if raw is None:
         return None
@@ -44,6 +49,9 @@ def _now_iso() -> str:
 
 
 def _table_columns(schema: str, table: str) -> set[str]:
+    """
+    Devuelve el set de nombres de columnas reales para (schema, table)
+    """
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
@@ -70,8 +78,9 @@ def _insert_pump_reading_inline(
 ) -> int:
     """
     Inserta en public.pump_readings SIN GUCs ni triggers.
-    - org_id se obtiene de public.pumps(id = payload.pump_id)
-    - Inserta solo las columnas que existan realmente
+    - Incluye org_id SOLO si existe en ambas tablas (pumps y pump_readings).
+    - Inserta únicamente las columnas que existan realmente en pump_readings.
+    - Si la tabla tiene 'extra' se usa; si no, y existe 'raw_json', se mapea extra -> raw_json.
     Devuelve el id de la lectura creada.
     """
     data = payload.model_dump(exclude_none=True)
@@ -84,17 +93,28 @@ def _insert_pump_reading_inline(
     pressure_bar = data.get("pressure_bar")
     voltage_v = data.get("voltage_v")
     current_a = data.get("current_a")
-    ts = data.get("ts")  # datetime | None
-    extra = data.get("extra")  # dict | None
+    speed_pct = data.get("speed_pct")  # opcional, si existe en el schema/tabla
+    ts = data.get("ts")                # datetime | None
+    extra = data.get("extra")          # dict | None
 
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cols = cached_cols or _table_columns("public", "pump_readings")
+        pump_cols = _table_columns("public", "pumps")
 
-        insert_cols: list[str] = ["pump_id", "org_id"]
-        select_exprs: list[str] = ["%s", "p.org_id"]
+        # SELECT basado en columnas reales
+        insert_cols: list[str] = ["pump_id"]
+        select_exprs: list[str] = ["%s"]
         params: list[Any] = [pump_id]
 
+        # org_id solo si existe en ambas tablas
+        if "org_id" in cols and "org_id" in pump_cols:
+            insert_cols.append("org_id")
+            select_exprs.append("p.org_id")
+
         def add_col(col: str, value: Any, cast: str | None = None):
+            """
+            Agrega la columna al INSERT solo si existe en 'cols'.
+            """
             if col in cols:
                 insert_cols.append(col)
                 select_exprs.append("%s" + (f"::{cast}" if cast else ""))
@@ -110,13 +130,18 @@ def _insert_pump_reading_inline(
         add_col("pressure_bar", pressure_bar)
         add_col("voltage_v", voltage_v)
         add_col("current_a", current_a)
+        add_col("speed_pct", speed_pct)  # si no existe en la tabla, se ignora
 
-        # Timestamp si la columna 'ts' existe
+        # Timestamp si existe
         add_col("ts", ts)
 
-        # JSONB extra si existe
+        # JSONB extra si existe; si no, usar raw_json si está disponible
         if "extra" in cols:
             insert_cols.append("extra")
+            select_exprs.append("%s::jsonb")
+            params.append(extra if extra is not None else None)
+        elif "raw_json" in cols:
+            insert_cols.append("raw_json")
             select_exprs.append("%s::jsonb")
             params.append(extra if extra is not None else None)
 
@@ -126,6 +151,9 @@ def _insert_pump_reading_inline(
         insert_cols_sql = ", ".join(insert_cols)
         select_sql = ", ".join(select_exprs)
 
+        # Siempre referenciamos public.pumps para:
+        #  - tomar p.org_id si aplica
+        #  - y validar existencia del pump_id (si no existe, no retorna fila)
         sql = f"""
             INSERT INTO public.pump_readings ({insert_cols_sql})
             SELECT {select_sql}
@@ -176,7 +204,7 @@ async def ingest_pump(
     Inserta una lectura de bomba y publica en el visor en vivo (si está disponible).
 
     - Body: PumpPayload (ver app.schemas.pumps)
-    - Header opcional: X-Device-Id: <int> (según tu device_id_dep)
+    - Headers opcionales: X-Device-Id, X-API-Key, X-Org-Id (según tus deps de seguridad)
     - Devuelve: {"ok": true, "reading_id": <int>, "source_ip": "..."}
     """
     device_id = _extract_device_id(auth)
