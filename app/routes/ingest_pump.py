@@ -14,7 +14,7 @@ from app.core.security import device_id_dep
 from app.core.db import get_conn
 from app.schemas.pumps import PumpPayload
 
-# Visor en vivo (si no existe, no rompe)
+# Visor en vivo (best-effort)
 try:
     from app.routes.live_view import apply_pump_ingest  # actualiza cache para /viz/ws y /viz/state
 except Exception:
@@ -26,13 +26,9 @@ router = APIRouter(prefix="/ingest", tags=["ingest"])
 
 
 # ----------------------------
-# Helpers locales
+# Helpers
 # ----------------------------
 def _extract_device_id(auth_obj: Any) -> Optional[int]:
-    """
-    Extrae device_id desde la dependencia de auth (dict/obj/string).
-    Retorna None si no existe o no es convertible.
-    """
     raw = auth_obj.get("device_id") if isinstance(auth_obj, dict) else getattr(auth_obj, "device_id", None)
     if raw is None:
         return None
@@ -143,7 +139,6 @@ def _insert_pump_reading_inline(
             cur.execute(sql, params)
             row = cur.fetchone()
         except PGError as exc:
-            # Devolver diagnóstico útil
             primary = getattr(getattr(exc, "diag", None), "message_primary", None)
             detail = getattr(getattr(exc, "diag", None), "message_detail", None)
             msg = primary or detail or str(exc)
@@ -162,7 +157,6 @@ def _insert_pump_reading_inline(
 
 
 async def _await_maybe(fn, *args, **kwargs):
-    """Permite usar funciones sync/async indistintamente."""
     res = fn(*args, **kwargs)
     if inspect.isawaitable(res):
         return await res
@@ -172,11 +166,11 @@ async def _await_maybe(fn, *args, **kwargs):
 # ----------------------------
 # Rutas
 # ----------------------------
-@router.post("/pump", status_code=status.HTTP_201_CREATED)
+@router.post("/pump", status_code=status.HTTP_201_CREATED, response_model=None)
 async def ingest_pump(
     payload: PumpPayload,
     auth: Any = Depends(device_id_dep),
-    request: Request | None = None,
+    request: Request = None,   # 👈 OJO: NO usar Union/Optional aquí
 ):
     """
     Inserta una lectura de bomba y publica en el visor en vivo (si está disponible).
@@ -199,7 +193,6 @@ async def ingest_pump(
         raise
     except Exception as exc:
         log.exception("DB insert failed", exc_info=exc)
-        # fallback genérico
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="db_error: no se pudo insertar la lectura de bomba",
@@ -215,7 +208,7 @@ async def ingest_pump(
             "is_on": data.get("is_on"),
             "flow_lpm": data.get("flow_lpm"),
             "pressure_bar": data.get("pressure_bar"),
-            "speed_pct": data.get("speed_pct"),  # si tu schema lo trae
+            "speed_pct": data.get("speed_pct"),
             "ts": data.get("ts"),
         }
         apply_pump_ingest(publish)
@@ -225,6 +218,6 @@ async def ingest_pump(
     return {"ok": True, "reading_id": reading_id, "source_ip": client_ip}
 
 
-@router.get("/pump/ping", status_code=status.HTTP_200_OK)
+@router.get("/pump/ping", status_code=status.HTTP_200_OK, response_model=None)
 def pump_ping():
     return {"ok": True, "service": "ingest_pump"}
