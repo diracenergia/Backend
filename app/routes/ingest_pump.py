@@ -9,6 +9,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from psycopg.rows import dict_row
 from psycopg import Error as PGError
+from psycopg.types.json import Json  # 👈 FIX: adaptador JSON para psycopg
 
 from app.core.security import device_id_dep
 from app.core.db import get_conn
@@ -139,11 +140,13 @@ def _insert_pump_reading_inline(
         if "extra" in cols:
             insert_cols.append("extra")
             select_exprs.append("%s::jsonb")
-            params.append(extra if extra is not None else None)
+            # 👇 FIX: envolver el dict con Json(extra)
+            params.append(Json(extra) if extra is not None else None)
         elif "raw_json" in cols:
             insert_cols.append("raw_json")
             select_exprs.append("%s::jsonb")
-            params.append(extra if extra is not None else None)
+            # 👇 FIX: envolver el dict con Json(extra)
+            params.append(Json(extra) if extra is not None else None)
 
         # device_id si existe
         add_col("device_id", device_id)
