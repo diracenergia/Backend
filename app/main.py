@@ -63,7 +63,7 @@ def _get_env(name: str, default: str = "") -> str:
 
 
 # ===== CORS =====
-_raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
+_raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5172,http://127.0.0.1:5173").strip()
 _origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
 
 if _raw == "*":
