@@ -1,46 +1,76 @@
-from pydantic import BaseModel, Field, conint
-from typing import Optional, Literal
-from datetime import datetime
+# app/repos/pumps.py
+from typing import Optional, Any
+from app.core.db import get_conn
+import json
 
-CmdLit = Literal["START", "STOP", "AUTO", "MAN", "SPEED"]
+def insert_pump_reading(
+    device_id: Optional[int],
+    payload: Any,
+    org_id: Optional[int] = None,
+) -> int:
+    with get_conn() as conn, conn.cursor() as cur:
+        # Seteamos la GUC por si algún trigger/DEFAULT la usa (no hace daño)
+        if org_id is not None:
+            cur.execute("SELECT set_config('app.org_id', %s, true)", (str(org_id),))
 
-class PumpPayload(BaseModel):
-    pump_id: int
-    is_on: Optional[bool] = None
-    flow_lpm: Optional[float] = None
-    pressure_bar: Optional[float] = None
-    voltage_v: Optional[float] = None
-    current_a: Optional[float] = None
-    control_mode: Literal["auto", "manual"] | None = None
-    manual_lockout: Optional[bool] = None
-    extra: Optional[dict] = None
-    ts: Optional[datetime] = None
+        # Si tenemos org_id válido => lo incluimos como columna explícita (sin ::bigint)
+        if org_id is not None:
+            cur.execute(
+                """
+                INSERT INTO public.pump_readings (
+                    pump_id, device_id, org_id, ts,
+                    is_on, flow_lpm, pressure_bar, voltage_v, current_a,
+                    control_mode, manual_lockout, raw_json
+                )
+                VALUES (%s, %s, %s, COALESCE(%s, now()),
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    payload.pump_id,
+                    device_id,
+                    org_id,  # 👈 va como parámetro normal, sin cast
+                    getattr(payload, "ts", None),
+                    getattr(payload, "is_on", None),
+                    getattr(payload, "flow_lpm", None),
+                    getattr(payload, "pressure_bar", None),
+                    getattr(payload, "voltage_v", None),
+                    getattr(payload, "current_a", None),
+                    getattr(payload, "control_mode", None),
+                    getattr(payload, "manual_lockout", None),
+                    json.dumps(getattr(payload, "extra", None)) if getattr(payload, "extra", None) else None,
+                ),
+            )
+        else:
+            # Sin org_id: dejamos que corra DEFAULT/trigger
+            cur.execute(
+                """
+                INSERT INTO public.pump_readings (
+                    pump_id, device_id, ts,
+                    is_on, flow_lpm, pressure_bar, voltage_v, current_a,
+                    control_mode, manual_lockout, raw_json
+                )
+                VALUES (%s, %s, COALESCE(%s, now()),
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    payload.pump_id,
+                    device_id,
+                    getattr(payload, "ts", None),
+                    getattr(payload, "is_on", None),
+                    getattr(payload, "flow_lpm", None),
+                    getattr(payload, "pressure_bar", None),
+                    getattr(payload, "voltage_v", None),
+                    getattr(payload, "current_a", None),
+                    getattr(payload, "control_mode", None),
+                    getattr(payload, "manual_lockout", None),
+                    json.dumps(getattr(payload, "extra", None)) if getattr(payload, "extra", None) else None,
+                ),
+            )
 
-class PumpConfigIn(BaseModel):
-    remote_enabled: bool | None = None
-    drive_type: Literal["direct", "soft", "vfd"] | None = None
-    vfd_min_speed_pct: conint(ge=0, le=100) | None = None
-    vfd_max_speed_pct: conint(ge=0, le=100) | None = None
-    vfd_default_speed_pct: conint(ge=0, le=100) | None = None
-
-class PumpCommandIn(BaseModel):
-    cmd: CmdLit
-    user: str = Field(..., description="Quién disparó el comando")
-    speed_pct: conint(ge=0, le=100) | None = None  # solo SPEED
-
-    class Config:
-        extra = "ignore"
-
-    @classmethod
-    def __get_validators__(cls):  # normaliza cmd como en tu código
-        yield cls._normalize_cmd
-
-    @staticmethod
-    def _normalize_cmd(values):
-        v = values.get("cmd")
-        if isinstance(v, str):
-            v = v.strip()
-            if v.upper().startswith("CMD_"):
-                v = v[4:]
-            values["cmd"] = v.upper()
-        return values
+        rid = cur.fetchone()[0]
+        conn.commit()
+        return rid
