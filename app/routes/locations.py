@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from psycopg.rows import dict_row
 
 from app.core.db import get_conn
-from app.auth.deps import conn_with_rls
+from app.core.tenancy import require_org
 from app.core.security import device_id_dep
 from app.schemas.infra import (
     Location, LocationWithStats, AssetGroup, AssetItem,
@@ -44,23 +44,26 @@ def list_asset_locations(
         description="Filtra por location_id. Si no se pasa, devuelve todos (incluye null)."
     ),
     _dev=Depends(device_id_dep),
-    conn=Depends(conn_with_rls),
 ):
+    org_id = require_org()
+
+    # Nota: incluimos huérfanos (al.location_id IS NULL).
+    # Para evitar leak entre orgs, cuando hay location, exigimos l.org_id = org_id.
     base_sql = """
-    SELECT
-      n.type       AS asset_type,
-      n.asset_id,
-      al.location_id,
-      l.code       AS location_code,
-      l.name       AS location_name
-    FROM public.v_asset_nodes n
-    LEFT JOIN public.asset_locations al
-      ON al.asset_type = n.type AND al.asset_id = n.asset_id
-    LEFT JOIN public.locations l
-      ON l.id = al.location_id
-    WHERE 1=1
+        SELECT
+          n.type       AS asset_type,
+          n.asset_id,
+          al.location_id,
+          l.code       AS location_code,
+          l.name       AS location_name
+        FROM public.v_asset_nodes n
+        LEFT JOIN public.asset_locations al
+          ON al.asset_type = n.type AND al.asset_id = n.asset_id
+        LEFT JOIN public.locations l
+          ON l.id = al.location_id
+        WHERE (l.id IS NULL OR l.org_id = %s)
     """
-    params: list = []
+    params: list = [org_id]
 
     if type:
         base_sql += " AND n.type = ANY(%s)"
@@ -72,12 +75,9 @@ def list_asset_locations(
 
     base_sql += " ORDER BY l.name NULLS LAST, n.type, n.asset_id;"
 
-    with conn.cursor(row_factory=dict_row) as cur:
-        if params:
-            cur.execute(base_sql, params)
-        else:
-            cur.execute(base_sql)
-        rows = cur.fetchall()
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(base_sql, params)
+        rows = cur.fetchall() or []
 
     out: list[AssetLoc] = []
     for r in rows:
@@ -96,22 +96,26 @@ def list_asset_locations(
 def list_locations(
     with_stats: bool = Query(False),
     _dev=Depends(device_id_dep),
-    conn=Depends(conn_with_rls),
 ):
     """
     Lista de locations. Si with_stats=true, devuelve conteos y alarmas.
     """
-    with conn.cursor(row_factory=dict_row) as cur:
+    org_id = require_org()
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         if not with_stats:
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT id, code, name
                 FROM public.locations
-                WHERE org_id = current_setting('app.org_id')::bigint
+                WHERE org_id = %s
                 ORDER BY name;
-            """)
-            return cur.fetchall()
+                """,
+                (org_id,),
+            )
+            return cur.fetchall() or []
         else:
-            cur.execute("""
+            cur.execute(
+                """
                 WITH counts AS (
                   SELECT
                     al.location_id,
@@ -122,7 +126,7 @@ def list_locations(
                     count(*) FILTER (WHERE al.asset_type='manifold') AS manifolds_count
                   FROM public.asset_locations al
                   JOIN public.locations l ON l.id = al.location_id
-                  WHERE l.org_id = current_setting('app.org_id')::bigint
+                  WHERE l.org_id = %s
                   GROUP BY al.location_id
                 ),
                 alarms AS (
@@ -134,7 +138,7 @@ def list_locations(
                   JOIN public.asset_locations al
                     ON al.asset_type=a.asset_type AND al.asset_id=a.asset_id
                   JOIN public.locations l ON l.id = al.location_id
-                  WHERE l.org_id = current_setting('app.org_id')::bigint
+                  WHERE l.org_id = %s
                   GROUP BY al.location_id
                 )
                 SELECT
@@ -149,10 +153,12 @@ def list_locations(
                 FROM public.locations l
                 LEFT JOIN counts c ON c.location_id = l.id
                 LEFT JOIN alarms am ON am.location_id = l.id
-                WHERE l.org_id = current_setting('app.org_id')::bigint
+                WHERE l.org_id = %s
                 ORDER BY l.name;
-            """)
-            rows = cur.fetchall()
+                """,
+                (org_id, org_id, org_id),
+            )
+            rows = cur.fetchall() or []
             return [LocationWithStats(**r).dict() for r in rows]
 
 
@@ -171,48 +177,58 @@ def location_assets(
         description="Filtra tipos: repetir ?include=tank&include=pump"
     ),
     _dev=Depends(device_id_dep),
-    conn=Depends(conn_with_rls),
 ):
     """
     Devuelve [{type: 'tank', items: [...]}, ...] para que el front pinte grupos.
     """
+    org_id = require_org()
     valid: set[str] = {'tank','pump','valve','manifold'}
     inc = set(include) & valid if include else None
 
-    with conn.cursor(row_factory=dict_row) as cur:
-        # Verificamos que exista la location en la org del token
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        # Verificamos que exista la location en la org actual
         cur.execute(
-            "SELECT 1 FROM public.locations WHERE id=%s AND org_id=current_setting('app.org_id')::bigint;",
-            (loc_id,),
+            "SELECT 1 FROM public.locations WHERE id=%s AND org_id=%s",
+            (loc_id, org_id),
         )
         if cur.fetchone() is None:
             raise HTTPException(404, "location not found")
 
         if inc:
-            cur.execute("""
-                SELECT al.asset_type, al.asset_id, COALESCE(n.name, CONCAT(al.asset_type,' ',al.asset_id)) AS name, n.code
+            cur.execute(
+                """
+                SELECT al.asset_type, al.asset_id,
+                       COALESCE(n.name, CONCAT(al.asset_type,' ',al.asset_id)) AS name,
+                       n.code
                 FROM public.asset_locations al
                 JOIN public.locations l ON l.id = al.location_id
                 LEFT JOIN public.v_asset_nodes n
                   ON n.type = al.asset_type AND n.asset_id = al.asset_id
                 WHERE al.location_id = %s
-                  AND l.org_id = current_setting('app.org_id')::bigint
+                  AND l.org_id = %s
                   AND al.asset_type = ANY(%s)
                 ORDER BY al.asset_type, name;
-            """, (loc_id, list(inc)))
+                """,
+                (loc_id, org_id, list(inc)),
+            )
         else:
-            cur.execute("""
-                SELECT al.asset_type, al.asset_id, COALESCE(n.name, CONCAT(al.asset_type,' ',al.asset_id)) AS name, n.code
+            cur.execute(
+                """
+                SELECT al.asset_type, al.asset_id,
+                       COALESCE(n.name, CONCAT(al.asset_type,' ',al.asset_id)) AS name,
+                       n.code
                 FROM public.asset_locations al
                 JOIN public.locations l ON l.id = al.location_id
                 LEFT JOIN public.v_asset_nodes n
                   ON n.type = al.asset_type AND n.asset_id = al.asset_id
                 WHERE al.location_id = %s
-                  AND l.org_id = current_setting('app.org_id')::bigint
+                  AND l.org_id = %s
                 ORDER BY al.asset_type, name;
-            """, (loc_id,))
+                """,
+                (loc_id, org_id),
+            )
 
-        rows = cur.fetchall()
+        rows = cur.fetchall() or []
         groups: dict[str, list[AssetItem]] = defaultdict(list)
         for r in rows:
             groups[r["asset_type"]].append(AssetItem(id=r["asset_id"], name=r["name"], code=r["code"]).dict())
@@ -232,23 +248,24 @@ def location_assets(
 def location_summary(
     loc_id: int,
     _dev=Depends(device_id_dep),
-    conn=Depends(conn_with_rls),
 ):
     """
     Lee la vista v_location_summary_30d (LATERAL + last_seen histórico).
     """
-    with conn.cursor(row_factory=dict_row) as cur:
-        # Chequeamos pertenencia de la location a la org del token
+    org_id = require_org()
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        # Chequeamos pertenencia de la location a la org actual
         cur.execute(
-            "SELECT 1 FROM public.locations WHERE id=%s AND org_id=current_setting('app.org_id')::bigint;",
-            (loc_id,),
+            "SELECT 1 FROM public.locations WHERE id=%s AND org_id=%s",
+            (loc_id, org_id),
         )
         if cur.fetchone() is None:
             raise HTTPException(404, "location not found")
 
-        cur.execute("""
-          SELECT * FROM public.v_location_summary_30d WHERE location_id=%s;
-        """, (loc_id,))
+        cur.execute(
+            "SELECT * FROM public.v_location_summary_30d WHERE location_id=%s;",
+            (loc_id,),
+        )
         row = cur.fetchone()
         if not row:
             # Si la vista no trae fila, igual es 404 para esa org
@@ -267,16 +284,16 @@ def location_summary(
 def location_tree(
     loc_id: int,
     _dev=Depends(device_id_dep),
-    conn=Depends(conn_with_rls),
 ):
     """
     Paquete completo para el front: location + summary + assets agrupados.
     """
-    with conn.cursor(row_factory=dict_row) as cur:
-        # Verificamos que la location sea de la org del token
+    org_id = require_org()
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        # Verificamos que la location sea de la org actual
         cur.execute(
-            "SELECT id FROM public.locations WHERE id=%s AND org_id=current_setting('app.org_id')::bigint;",
-            (loc_id,),
+            "SELECT id FROM public.locations WHERE id=%s AND org_id=%s",
+            (loc_id, org_id),
         )
         if cur.fetchone() is None:
             raise HTTPException(404, "location not found")
@@ -288,17 +305,22 @@ def location_tree(
             raise HTTPException(404, "location not found")
 
         # assets agrupados
-        cur.execute("""
-            SELECT al.asset_type, al.asset_id, COALESCE(n.name, CONCAT(al.asset_type,' ',al.asset_id)) AS name, n.code
+        cur.execute(
+            """
+            SELECT al.asset_type, al.asset_id,
+                   COALESCE(n.name, CONCAT(al.asset_type,' ',al.asset_id)) AS name,
+                   n.code
             FROM public.asset_locations al
             JOIN public.locations l ON l.id = al.location_id
             LEFT JOIN public.v_asset_nodes n
               ON n.type = al.asset_type AND n.asset_id = al.asset_id
             WHERE al.location_id = %s
-              AND l.org_id = current_setting('app.org_id')::bigint
+              AND l.org_id = %s
             ORDER BY al.asset_type, name;
-        """, (loc_id,))
-        rows = cur.fetchall()
+            """,
+            (loc_id, org_id),
+        )
+        rows = cur.fetchall() or []
 
         groups: dict[str, list[AssetItem]] = defaultdict(list)
         for r in rows:
