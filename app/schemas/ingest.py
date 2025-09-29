@@ -20,7 +20,7 @@ except Exception:
     except Exception:
         PsyJson = None
 
-from app.schemas.ingest import TankIngestIn, TankIngestOut
+
 from app.repos import tanks as repo
 from app.core.security import device_id_dep
 from app.repos.presence import bump_presence  # presencia online/offline
