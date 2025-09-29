@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, Query
 from psycopg.rows import dict_row
 
-# ⚠️ Deja de usar get_conn aquí
+# Dejamos de usar get_conn aquí
 # from app.core.db import get_conn
 from app.auth.deps import conn_with_rls
 
@@ -20,7 +20,7 @@ def kpi_time_buckets_hourly_24h(conn = Depends(conn_with_rls)) -> List[Dict[str,
     Devuelve los buckets horarios locales de las últimas 24 horas (incluida la hora actual).
     Útil para alinear los gráficos de bombas y tanques.
     """
-    with conn, conn.cursor(row_factory=dict_row) as cur:
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
             SELECT local_hour
@@ -41,7 +41,7 @@ def kpi_pumps_activity_hourly_24h(
     """
     Conteo de bombas con lectura por hora y por localidad, últimas 24h.
     """
-    with conn, conn.cursor(row_factory=dict_row) as cur:
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
             SELECT *
@@ -65,7 +65,7 @@ def kpi_tanks_level_avg_hourly_24h_by_location(
     """
     Nivel promedio de tanques agregado por localidad, por hora, últimas 24h.
     """
-    with conn, conn.cursor(row_factory=dict_row) as cur:
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
             SELECT *
@@ -86,7 +86,7 @@ def kpi_tanks_level_avg_hourly_24h_by_tank(
     """
     Nivel promedio de tanques por tanque (detalle), por hora, últimas 24h.
     """
-    with conn, conn.cursor(row_factory=dict_row) as cur:
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
             SELECT *
@@ -111,7 +111,7 @@ def kpi_totals_by_location(
     Totales de activos por localidad (tanques, bombas, válvulas, manifolds).
     Fuente: v_location_summary_30d + filtro por org_id desde locations.
     """
-    with conn, conn.cursor(row_factory=dict_row) as cur:
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
             SELECT
@@ -143,7 +143,7 @@ def kpi_uptime_pumps_30d_by_location(
     """
     Uptime promedio 30 días por localidad (promedio de bombas).
     """
-    with conn, conn.cursor(row_factory=dict_row) as cur:
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
             SELECT *
@@ -164,7 +164,7 @@ def kpi_uptime_pumps_30d_by_pump(
     """
     Uptime 30 días por bomba (detalle).
     """
-    with conn, conn.cursor(row_factory=dict_row) as cur:
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
             SELECT *
@@ -188,7 +188,7 @@ def kpi_alarms_active_by_severity(
     """
     Alarmas activas agrupadas por severidad y localidad.
     """
-    with conn, conn.cursor(row_factory=dict_row) as cur:
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
             SELECT *
@@ -212,7 +212,7 @@ def kpi_latest_ts_by_location(
     """
     Última lectura de bombas y tanques por localidad.
     """
-    with conn, conn.cursor(row_factory=dict_row) as cur:
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
             SELECT *
@@ -236,7 +236,7 @@ def kpi_tanks_coverage_30d(
     """
     Por tanque: horas con lectura en 30 días y % de cobertura respecto de 720 horas.
     """
-    with conn, conn.cursor(row_factory=dict_row) as cur:
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
             SELECT *
@@ -260,7 +260,7 @@ def kpi_pumps_rated_kw(
     """
     Potencia nominal (rated_kw) por bomba y localidad.
     """
-    with conn, conn.cursor(row_factory=dict_row) as cur:
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
             SELECT *
@@ -281,7 +281,7 @@ def kpi_locations(conn = Depends(conn_with_rls)) -> List[Dict[str, Any]]:
     """
     Lista de localidades visibles (no filtra por lecturas).
     """
-    with conn, conn.cursor(row_factory=dict_row) as cur:
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
             SELECT id, code, name
