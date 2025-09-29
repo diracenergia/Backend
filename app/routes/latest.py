@@ -3,12 +3,10 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Path, Query, HTTPException
 from typing import Optional, Dict, Any
 from decimal import Decimal
-
 from psycopg.rows import dict_row
 
 from app.core.security import device_id_dep
-from app.core.db import get_conn
-from app.core.tenancy import require_org
+from app.auth.deps import conn_with_rls
 
 router = APIRouter(prefix="/tanks", tags=["latest"])
 
@@ -33,24 +31,22 @@ def latest_tank(
     tank_id: int = Path(..., ge=1),
     include_capacity: bool = Query(True, description="Incluir capacity_m3 en la respuesta"),
     _=Depends(device_id_dep),
+    conn=Depends(conn_with_rls),
 ):
     """
-    Última lectura de un tanque **scopeada por organización**.
+    Última lectura de un tanque, scopeado por organización.
+    - 200 con has_data=false si no hay lecturas (usa v_tank_latest_full si existe).
     """
-    org_id = require_org()
-    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-        # validar pertenencia por org y traer capacity_m3
+    with conn.cursor(row_factory=dict_row) as cur:
+        # 1) Validar pertenencia por org_id directo (tanks tiene org_id)
         cur.execute(
             """
-            SELECT t.id, t.capacity_m3
-            FROM public.tanks t
-            JOIN public.asset_locations al
-              ON al.asset_type='tank' AND al.asset_id=t.id
-            JOIN public.locations l
-              ON l.id = al.location_id
-            WHERE t.id = %s AND l.org_id = %s
+            SELECT id, capacity_m3
+            FROM public.tanks
+            WHERE id = %s
+              AND org_id = current_setting('app.org_id')::bigint
             """,
-            (tank_id, org_id),
+            (tank_id,),
         )
         trow = cur.fetchone()
         if not trow:
@@ -58,20 +54,25 @@ def latest_tank(
 
         capacity_m3: Optional[float] = _to_float(trow.get("capacity_m3")) if include_capacity else None
 
-        # intentar vista; si no existe, fallback a tabla
-        row: Optional[Dict[str, Any]] = None
+        # 2) Intentar desde la vista "full"; fallback a tabla
+        row = None
         try:
             cur.execute(
                 """
-                SELECT id, tank_id, ts, level_percent, volume_l, temperature_c, device_id, raw_json
-                FROM public.v_tank_latest
+                SELECT tank_id, tank_name, ts, level_percent, volume_l, temperature_c, raw_json, has_data
+                FROM public.v_tank_latest_full
                 WHERE tank_id = %s
+                LIMIT 1
                 """,
                 (tank_id,),
             )
             r = cur.fetchone()
-            row = dict(r) if r else None
+            if r:
+                row = dict(r)
         except Exception:
+            pass
+
+        if not row:
             cur.execute(
                 """
                 SELECT id, tank_id, ts, level_percent, volume_l, temperature_c, device_id, raw_json
@@ -83,12 +84,14 @@ def latest_tank(
                 (tank_id,),
             )
             r = cur.fetchone()
-            row = dict(r) if r else None
+            if r:
+                row = dict(r)
 
+    # 3) Sin lecturas
     if not row:
         out: Dict[str, Any] = {
-            "id": None,
             "tank_id": tank_id,
+            "tank_name": None,
             "ts": None,
             "level_percent": None,
             "volume_l": None,
@@ -102,6 +105,7 @@ def latest_tank(
             out["capacity_m3"] = capacity_m3
         return out
 
+    # 4) Con lecturas: normalizar y estimar volumen si hace falta
     level_percent = _to_float(row.get("level_percent"))
     volume_l_measured = _to_float(row.get("volume_l"))
     temperature_c = _to_float(row.get("temperature_c"))
@@ -115,8 +119,8 @@ def latest_tank(
             volume_source = "estimated"
 
     out: Dict[str, Any] = {
-        "id": row.get("id"),
-        "tank_id": row.get("tank_id"),
+        "tank_id": row.get("tank_id") or tank_id,
+        "tank_name": row.get("tank_name"),
         "ts": row.get("ts"),
         "level_percent": level_percent,
         "volume_l": volume_l,
