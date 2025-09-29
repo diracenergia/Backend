@@ -6,49 +6,42 @@ import logging
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Body, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.exceptions import ClientDisconnect
+import anyio
 
 # Routers varios
 from app.routes.control import control_router
 from app.routes.kpi import router as kpi_router
 
-# Infra
 from app.routes.graph_api import router as graph_router
 from app.routes.locations import router as locations_router
 
-# Tanks
 from app.routes.ingest import router as ingest_tank_router
 from app.routes.latest import router as latest_tank_router
 from app.routes.history import router as history_tank_router
 from app.routes.configs import router as configs_tank_router
 from app.routes.commands_tanks import router as commands_tank_router
 
-# Pumps
 from app.routes.ingest_pump import router as ingest_pump_router
 from app.routes.latest_pump import router as latest_pump_router
 from app.routes.history_pump import router as history_pump_router
 from app.routes.configs_pump import router as configs_pump_router
 from app.routes.commands_pumps import router as commands_pump_router
 
-# Alarmas / Auditoría
 from app.routes.alarms import router as alarms_router
 from app.routes.audit import router as audit_router
-
-# Diag listener
 from app.routes.diag_listener import router as diag_listener_router
-
-# WebSocket + viz
 from app.ws import router as ws_router
 from app.routes.live_view import viz_router
 
-# Auth
 from app.auth.router import router as auth_router
-from app.core.tenancy import tenant_ctx_dep  # dependencia del tenant
+from app.auth.deps import conn_with_rls  # noqa: F401 (puede no usarse directamente)
 
 # ===== LOGGING GLOBAL =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -60,7 +53,7 @@ logging.basicConfig(
 logger = logging.getLogger("rdls")
 logger.info(f"[boot] LOG_LEVEL={LOG_LEVEL}")
 
-# ===== Config (.env / Settings) =====
+# ===== Config centralizada =====
 try:
     from app.core.config import settings  # opcional
 except Exception:
@@ -76,12 +69,11 @@ def _get_env(name: str, default: str = "") -> str:
         return str(getattr(settings, name))
     return os.getenv(name, default)
 
-# ===== App metadata =====
 APP_TITLE = _get_env("APP_TITLE", "ESP32 Tank/Pump API")
 APP_VERSION = _get_env("APP_VERSION", "") or _get_env("RENDER_GIT_COMMIT", "")[:8]
 app = FastAPI(title=APP_TITLE, version=APP_VERSION or None)
 
-# ===== Logging de requests =====
+# ===== Middleware de LOG =====
 class LoggingMiddleware(BaseHTTPMiddleware):
     def __init__(self, app):
         super().__init__(app)
@@ -97,6 +89,7 @@ class LoggingMiddleware(BaseHTTPMiddleware):
             "authorization-present": bool(hdr.get("authorization")),
             "content-type": hdr.get("content-type"),
         }
+
         body_text = None
         if (request.url.path, request.method) in {("/ingest/tank","POST"), ("/ingest/pump","POST")}:
             try:
@@ -111,34 +104,33 @@ class LoggingMiddleware(BaseHTTPMiddleware):
             dt = (time.time() - t0) * 1000
             self._log.info(f"[RES] {request.method} {request.url.path} status={response.status_code} {dt:.1f}ms")
             return response
+
+        except (ClientDisconnect, anyio.EndOfStream):
+            # Cliente abortó la conexión (abort() en fetch, navegación, etc.)
+            self._log.info(f"[DISCONNECT] {request.method} {request.url.path} (client closed connection)")
+            return Response(status_code=499)
+
         except Exception:
             self._log.exception(f"[ERR] {request.method} {request.url.path} crashed")
             raise
 
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(LoggingMiddleware)
 
-# ===== Compresión =====
-app.add_middleware(GZipMiddleware, minimum_size=1024)
+# ===== Tenancy (RLS) =====
+from app.core.tenancy import tenant_ctx_dep
 
-# ===== Trusted hosts (opcional) =====
-_trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
-TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
-if TRUSTED_HOSTS:
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
-    print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
-
-# ===== Tenant (RLS) - class-based =====
 _PUBLIC_PATHS = {
     "/", "/health", "/health/db", "/favicon.ico",
     "/__config", "/openapi.json", "/docs", "/redoc",
     "/__alarm_poller_status", "/__which_alarms_eval", "/__which_alarm_events",
 }
-# Incluimos /auth como público para permitir /auth/login
+# Agregamos "/auth" para login público
 _PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws", "/ingest", "/infra", "/auth")
 
 class TenantContextMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # Deja que CORS maneje preflight (estará por fuera)
+        # Preflight CORS: dejar pasar
         if request.method == "OPTIONS":
             return await call_next(request)
 
@@ -155,14 +147,20 @@ class TenantContextMiddleware(BaseHTTPMiddleware):
                 x_role=request.headers.get("x-role"),
             )
         except HTTPException as e:
-            # Respuesta inmediata; CORS (afuera) agregará los headers
             return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
 
         return await call_next(request)
 
 app.add_middleware(TenantContextMiddleware)
 
-# ===== CORS (DEBE SER EL MÁS EXTERNO: agregarlo ÚLTIMO) =====
+# ===== Trusted hosts (opcional) =====
+_trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
+TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
+if TRUSTED_HOSTS:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
+    print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
+
+# ===== CORS (el más externo: agregarlo AL FINAL) =====
 _raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
 _origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
 if _raw == "*":
@@ -171,6 +169,7 @@ if _raw == "*":
 else:
     ALLOW_ALL_ORIGINS = False
     ALLOWED_ORIGINS = [o.strip() for o in _raw.split(",") if o.strip()]
+
 ALLOW_CREDENTIALS = False
 ALLOW_METHODS = ["*"]
 ALLOW_HEADERS = ["*"]
@@ -189,7 +188,7 @@ app.add_middleware(
     allow_headers=ALLOW_HEADERS,
 )
 
-# ===== Montaje de UI estática (/ui) =====
+# ===== UI estática =====
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WEB_DIR = REPO_ROOT / "web"
 if WEB_DIR.exists():
@@ -197,51 +196,40 @@ if WEB_DIR.exists():
 else:
     print(f"⚠️ /ui deshabilitado: no existe {WEB_DIR}")
 
-# ===== Incluir Routers =====
+# ===== Routers =====
 app.include_router(diag_listener_router)
 
-# Tanques
 app.include_router(ingest_tank_router)
 app.include_router(latest_tank_router)
 app.include_router(history_tank_router)
 app.include_router(configs_tank_router)
 app.include_router(commands_tank_router)
 
-# Bombas
 app.include_router(ingest_pump_router)
 app.include_router(latest_pump_router)
 app.include_router(history_pump_router)
 app.include_router(configs_pump_router)
 app.include_router(commands_pump_router)
 
-# CRUD Tanques (opcional)
 try:
     from app.routes.tanks import router as tanks_router
     app.include_router(tanks_router)
 except Exception as e:
     print(f"⚠️ tanks router no disponible: {e}")
 
-# Alarmas / Auditoría
 app.include_router(alarms_router)
 app.include_router(audit_router)
 
-# Infra
 app.include_router(graph_router, prefix="/infra", tags=["infra-graph"])
-app.include_router(locations_router)  # ya tiene prefix="/infra"
+app.include_router(locations_router)
 
-# WebSocket
 app.include_router(ws_router)
-
-# KPI
 app.include_router(kpi_router)
+app.include_router(auth_router, prefix="")  # /auth/...
 
-# Auth (router ya define /auth/..)
-app.include_router(auth_router, prefix="")
-
-# Viz (estado + websocket)
 app.include_router(viz_router)
 
-# ===== Endpoints utilitarios =====
+# ===== Utilitarios =====
 from app.core.db import get_conn
 
 @app.get("/")
@@ -294,15 +282,14 @@ def tg_env():
         "CHAT": _get_env("TELEGRAM_CHAT_ID", ""),
     }
 
-# Conexión (diagnóstico)
+# ===== Conexión (diagnóstico) =====
 try:
     from app.routes.conn import router as conn_router
     app.include_router(conn_router)
 except Exception as e:
     print(f"⚠️ conn router no disponible: {e}")
 
-# Alarm Poller (controlado por flag)
-ENABLE_ALARM_POLLER = _get_env("ALARM_POLLER_ENABLED", "true").lower() != "false"
+# ===== Alarm Poller opcional =====
 try:
     from app.services.alarm_poller import start_alarm_poller, stop_alarm_poller
     _HAS_ALARM_POLLER = True
@@ -314,7 +301,7 @@ except Exception as e:
 
 @app.on_event("startup")
 def _startup_listeners():
-    if ENABLE_ALARM_POLLER and _HAS_ALARM_POLLER and callable(start_alarm_poller):
+    if _HAS_ALARM_POLLER and callable(start_alarm_poller):
         try:
             start_alarm_poller()
             print("[alarm-poller] started")
@@ -337,10 +324,12 @@ def poller_status():
     except Exception as e:
         return {"alive": False, "error": f"import_error: {e}"}
     alive = bool(getattr(ap, "_thread", None) and getattr(ap._thread, "is_alive", lambda: False)())
-    batch = getattr(ap, "BATCH", None)
-    sleep_empty = getattr(ap, "SLEEP_EMPTY", None)
-    sleep_busy = getattr(ap, "SLEEP_BUSY", None)
-    return {"alive": alive, "batch": batch, "sleep_empty": sleep_empty, "sleep_busy": sleep_busy}
+    return {
+        "alive": alive,
+        "batch": getattr(ap, "BATCH", None),
+        "sleep_empty": getattr(ap, "SLEEP_EMPTY", None),
+        "sleep_busy": getattr(ap, "SLEEP_BUSY", None),
+    }
 
 @app.post("/__alarm_poller_stop")
 def poller_stop():
