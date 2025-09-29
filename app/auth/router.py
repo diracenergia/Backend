@@ -1,73 +1,78 @@
-from fastapi import APIRouter, HTTPException, Depends
+from __future__ import annotations
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any
+
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 import jwt  # PyJWT
-import os, time
-import psycopg
+import bcrypt
+from psycopg.rows import dict_row
 
-SECRET = os.getenv("AUTH_SECRET", "devsecret")  # poné algo fuerte en prod
-ALGO   = "HS256"
-TTL    = 60 * 60 * 8  # 8h
+from app.core.db import get_conn
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+AUTH_SECRET = os.getenv("AUTH_SECRET", "devsecret")
+AUTH_ALGO   = os.getenv("AUTH_ALGO", "HS256")
+AUTH_TTL    = int(os.getenv("AUTH_TTL_MINUTES", "720"))
 
 class LoginIn(BaseModel):
     username: str
     password: str
-    org_id: int | None = None  # si no viene, usamos la primera del usuario
+    org_id: Optional[int] = None
 
-@router.post("/login")
+class LoginOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    exp: int
+
+@router.post("/login", response_model=LoginOut)
 def login(body: LoginIn):
-    # abrí conexión como lo hacés en tu proyecto (psycopg3 sync por sencillez)
-    with psycopg.connect(os.getenv("DATABASE_URL")) as conn:
-        with conn.cursor() as cur:
-            # 1) validar credenciales con pgcrypto (crypt)
-            cur.execute("""
-                select u.id, u.name, u.is_active
-                  from public.users u
-                 where u.username = %s
-                   and u.password_hash = crypt(%s, u.password_hash)
-            """, (body.username, body.password))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(status_code=401, detail="Usuario o contraseña inválidos")
-            user_id, name, is_active = row
-            if not is_active:
-                raise HTTPException(status_code=403, detail="Usuario deshabilitado")
+    if not body.username or not body.password:
+        raise HTTPException(400, "username/password requeridos")
 
-            # 2) organizaciones y rol
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("select id as user_id, password_hash, is_active from public.users where username = %s", (body.username,))
+        row = cur.fetchone()
+        if not row or not row["is_active"]:
+            raise HTTPException(401, "credenciales inválidas")
+
+        hashed: str = row["password_hash"] or ""
+        try:
+            ok = bcrypt.checkpw(body.password.encode("utf-8"), hashed.encode("utf-8"))
+        except Exception:
+            ok = False
+        if not ok:
+            raise HTTPException(401, "credenciales inválidas")
+
+        user_id = int(row["user_id"])
+
+        # resolver org
+        if body.org_id is None:
             cur.execute("""
-                select org_id, role
-                  from public.user_organizations
-                 where user_id = %s
-                 order by org_id
+              select org_id, role
+              from public.user_organizations
+              where user_id = %s
+              order by org_id
+              limit 1
             """, (user_id,))
-            orgs = cur.fetchall()
-            if not orgs:
-                raise HTTPException(status_code=403, detail="Usuario sin organizaciones")
-            if body.org_id:
-                # validar que pertenezca
-                roles = {o: r for (o, r) in orgs}
-                if body.org_id not in roles:
-                    raise HTTPException(status_code=403, detail="No pertenece a esa organización")
-                org_id, role = body.org_id, roles[body.org_id]
-            else:
-                org_id, role = orgs[0]
+        else:
+            cur.execute("""
+              select org_id, role
+              from public.user_organizations
+              where user_id = %s and org_id = %s
+              limit 1
+            """, (user_id, body.org_id))
+        org = cur.fetchone()
+        if not org:
+            raise HTTPException(403, "usuario sin organización válida")
+        org_id = int(org["org_id"]); role = org.get("role")
 
-            # 3) token
-            now = int(time.time())
-            payload = {
-                "sub": str(user_id),
-                "name": name,
-                "org_id": org_id,
-                "role": role,
-                "iat": now, "exp": now + TTL,
-            }
-            token = jwt.encode(payload, SECRET, algorithm=ALGO)
+    now = datetime.now(timezone.utc); exp = now + timedelta(minutes=AUTH_TTL)
+    token = jwt.encode({
+        "sub": user_id, "org_id": org_id, "role": role,
+        "iat": int(now.timestamp()), "exp": int(exp.timestamp()),
+    }, AUTH_SECRET, algorithm=AUTH_ALGO)
 
-            return {
-                "access_token": token,
-                "token_type": "bearer",
-                "user": {"id": user_id, "name": name, "username": body.username},
-                "org": {"id": org_id, "role": role},
-                "orgs": [{"org_id": o, "role": r} for (o, r) in orgs],
-            }
+    return LoginOut(access_token=token, exp=int(exp.timestamp()))
