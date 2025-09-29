@@ -1,10 +1,14 @@
-from typing import List, Optional
+# app/routes/graph_api.py
+from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request
+from typing import List, Optional, Dict, Tuple
+
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from psycopg.rows import dict_row
 
 from app.core.db import get_conn
+from app.core.security import device_id_dep
 
 router = APIRouter()
 
@@ -12,36 +16,21 @@ router = APIRouter()
 # Helpers
 # ---------------------------------------------------------------------
 
-def _set_org(cur, org_id: Optional[str]):
+def _get_layout_map() -> Dict[str, Tuple[float, float]]:
     """
-    Intenta setear la GUC 'app.org_id' (si tus vistas la usan). No rompe si falla.
+    Lee posiciones guardadas en DB para la org actual (según app.org_id)
+    y devuelve {node_uid: (x, y)}.
     """
-    if not org_id:
-        return
-    try:
-        cur.execute("SELECT set_config('app.org_id', %s, true)", (str(org_id),))
-    except Exception:
-        # No tiramos abajo el request si falla el set_config
-        pass
-
-def _get_layout_map(org_id: Optional[str]) -> dict:
-    """
-    Lee posiciones guardadas en DB para la org dada y devuelve {node_uid: (x, y)}.
-    """
-    if not org_id:
-        return {}
-    layout_map: dict[str, tuple[float, float]] = {}
+    layout_map: Dict[str, Tuple[float, float]] = {}
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
             SELECT node_uid, x, y
             FROM public.asset_layouts
-            WHERE org_id = %s
-            """,
-            (org_id,),
+            WHERE org_id = current_setting('app.org_id')::bigint
+            """
         )
         for r in cur.fetchall():
-            # numeric -> float
             layout_map[r["node_uid"]] = (float(r["x"]), float(r["y"]))
     return layout_map
 
@@ -51,7 +40,7 @@ def _get_layout_map(org_id: Optional[str]) -> dict:
 # ---------------------------------------------------------------------
 
 @router.get("/graph")
-def graph_all(request: Request):
+def graph_all(_=Depends(device_id_dep)):
     """
     Devuelve:
       {
@@ -60,83 +49,94 @@ def graph_all(request: Request):
         ],
         "edges": ["SRC>DST", ...]
       }
-    Además, inyecta (x,y) desde public.asset_layouts si existen para esa org.
+    Inyecta (x,y) desde public.asset_layouts si existen para la org del token.
     """
     try:
-        org_id = request.headers.get("X-Org-Id")
-
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-            _set_org(cur, org_id)
-
-            # Obtener los datos de los nodos
+            # Nodos
             cur.execute("SELECT * FROM v_asset_nodes ORDER BY type, name;")
             raw_nodes = cur.fetchall()
 
-            # Obtener las relaciones entre los nodos
+            # Edges (asumimos vista ya RLS/filtrada por org)
             cur.execute("SELECT * FROM v_topology_edges WHERE is_active ORDER BY id;")
             raw_edges = cur.fetchall()
 
-            # Obtener la configuración de los tanques (umbrales)
-            cur.execute("""
-                SELECT tank_id, low_pct, high_pct, low_low_pct, high_high_pct
-                FROM public.tank_config;
-            """)
+            # Config de tanques filtrada por org actual
+            cur.execute(
+                """
+                SELECT tc.tank_id, tc.low_pct, tc.high_pct, tc.low_low_pct, tc.high_high_pct
+                FROM public.tank_config tc
+                JOIN public.tanks t    ON t.id = tc.tank_id
+                JOIN public.locations l ON l.id = t.location_id
+                WHERE l.org_id = current_setting('app.org_id')::bigint
+                """
+            )
             tank_config = {row["tank_id"]: row for row in cur.fetchall()}
 
-            # Obtener los niveles más recientes de los tanques
-            cur.execute("""
-                SELECT tank_id, level_percent
-                FROM v_tank_latest;
-            """)
+            # Últimos niveles de tanques (filtrados por org)
+            cur.execute(
+                """
+                SELECT v.tank_id, v.level_percent
+                FROM v_tank_latest v
+                JOIN public.tanks t    ON t.id = v.tank_id
+                JOIN public.locations l ON l.id = t.location_id
+                WHERE l.org_id = current_setting('app.org_id')::bigint
+                """
+            )
             tank_levels = {row["tank_id"]: row["level_percent"] for row in cur.fetchall()}
 
-            # Obtener los estados más recientes de las bombas
-            cur.execute("""
-                SELECT pump_id, is_on
-                FROM v_pump_latest;
-            """)
+            # Último estado de bombas (filtrado por org)
+            cur.execute(
+                """
+                SELECT v.pump_id, v.is_on
+                FROM v_pump_latest v
+                JOIN public.pumps p    ON p.id = v.pump_id
+                JOIN public.locations l ON l.id = p.location_id
+                WHERE l.org_id = current_setting('app.org_id')::bigint
+                """
+            )
             pump_statuses = {row["pump_id"]: row["is_on"] for row in cur.fetchall()}
 
-        # Obtener el mapa de posiciones de los nodos
-        layout_map = _get_layout_map(org_id)
+        # Layouts guardados
+        layout_map = _get_layout_map()
 
         nodes = []
         for r in raw_nodes:
             # ID único EXACTO (coincide con edges y con asset_layouts.node_uid)
-            # preferimos code si existe, sino fallback a type_id
             code = r.get("code")
             nid = f'{r["type"]}:{code}' if code else f'{r["type"]}_{r["asset_id"]}'
             node = {"id": nid, "type": r["type"], "name": r["name"]}
 
-            # payload específico por tipo (opcional para el front)
+            # payload por tipo
             if r["type"] == "tank":
                 tank_id = r["asset_id"]
-                config = tank_config.get(tank_id)
-                if config:
-                    node["low_pct"] = config["low_pct"]
-                    node["high_pct"] = config["high_pct"]
-                    node["low_low_pct"] = config["low_low_pct"]
-                    node["high_high_pct"] = config["high_high_pct"]
-                    node["level"] = tank_levels.get(tank_id, None)  # Último nivel conocido del tanque
+                cfg = tank_config.get(tank_id)
+                if cfg:
+                    node["low_pct"] = cfg["low_pct"]
+                    node["high_pct"] = cfg["high_pct"]
+                    node["low_low_pct"] = cfg["low_low_pct"]
+                    node["high_high_pct"] = cfg["high_high_pct"]
+                node["level"] = tank_levels.get(tank_id, None)
 
             elif r["type"] == "pump":
-                node["status"] = pump_statuses.get(r["asset_id"], False)  # False significa apagada, True significa encendida
+                node["status"] = pump_statuses.get(r["asset_id"], False)  # False=apagada
                 node["kW"] = r.get("rated_kw")
+
             elif r["type"] == "valve":
                 node["state"] = r.get("valve_state")
 
-            # Inyectar posiciones si están guardadas
+            # Posiciones (si están guardadas)
             if nid in layout_map:
                 x, y = layout_map[nid]
                 node["x"], node["y"] = x, y
 
             nodes.append(node)
 
-        # Procesar las relaciones entre nodos (edges)
+        # Edges
         edges = []
         for e in raw_edges:
             src = f'{e["from_type"]}:{e.get("from_code")}' if e.get("from_code") else f'{e["from_type"]}_{e["from_id"]}'
-            dst = f'{e["to_type"]}:{e.get("to_code")}' if e.get("to_code") else f'{e["to_type"]}_{e["to_id"]}'
+            dst = f'{e["to_type"]}:{e.get("to_code")}'     if e.get("to_code")   else f'{e["to_type"]}_{e["to_id"]}'
             edges.append(f"{src}>{dst}")
 
         return {"nodes": nodes, "edges": edges}
@@ -149,11 +149,11 @@ def graph_all(request: Request):
 # ---------------------------------------------------------------------
 
 @router.get("/graph/nodes")
-def graph_nodes(request: Request):
+def graph_nodes(_=Depends(device_id_dep)):
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-            _set_org(cur, request.headers.get("X-Org-Id"))
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT
                   type,
                   asset_id AS id,
@@ -163,23 +163,26 @@ def graph_nodes(request: Request):
                   location_id, location_code, location_name
                 FROM v_asset_nodes
                 ORDER BY type, name;
-            """)
+                """
+            )
             return cur.fetchall()
     except Exception as e:
         raise HTTPException(500, f"graph_nodes failed: {e}")
 
+
 @router.get("/graph/edges")
-def graph_edges(request: Request):
+def graph_edges(_=Depends(device_id_dep)):
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-            _set_org(cur, request.headers.get("X-Org-Id"))
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT id, from_type, from_id, from_name, from_code,
                        to_type, to_id, to_name, to_code,
                        pipe_diameter_mm, length_m, is_active
                 FROM v_topology_edges
                 ORDER BY id;
-            """)
+                """
+            )
             return cur.fetchall()
     except Exception as e:
         raise HTTPException(500, f"graph_edges failed: {e}")
@@ -195,16 +198,13 @@ class NodePos(BaseModel):
     y: float
     updated_by: Optional[str] = None  # opcional (ej. email o "ui-embed")
 
+
 @router.post("/layout")
-def save_layout(items: List[NodePos], request: Request):
+def save_layout(items: List[NodePos], _=Depends(device_id_dep)):
     """
-    Guarda posiciones (UPSERT) en public.asset_layouts para la org indicada por X-Org-Id.
+    Guarda posiciones (UPSERT) en public.asset_layouts para la org del token.
     Body: [{ "id": "<node_uid>", "x": <num>, "y": <num>, "updated_by": "..." }, ...]
     """
-    org_id = request.headers.get("X-Org-Id")
-    if not org_id:
-        raise HTTPException(400, "X-Org-Id requerido")
-
     if not items:
         return {"ok": True, "saved": 0}
 
@@ -214,38 +214,34 @@ def save_layout(items: List[NodePos], request: Request):
                 cur.execute(
                     """
                     INSERT INTO public.asset_layouts (org_id, node_uid, x, y, updated_by)
-                    VALUES (%s, %s, %s, %s, %s)
+                    VALUES (current_setting('app.org_id')::bigint, %s, %s, %s, %s)
                     ON CONFLICT (org_id, node_uid)
                     DO UPDATE SET x = EXCLUDED.x,
                                   y = EXCLUDED.y,
                                   updated_by = EXCLUDED.updated_by,
                                   updated_at = now()
                     """,
-                    (org_id, it.id, it.x, it.y, it.updated_by or "ui-embed"),
+                    (it.id, it.x, it.y, it.updated_by or "ui-embed"),
                 )
         return {"ok": True, "saved": len(items)}
     except Exception as e:
         raise HTTPException(500, f"save_layout failed: {e}")
 
-@router.get("/layout")
-def get_layout(request: Request):
-    """
-    Devuelve todas las posiciones guardadas para la org (útil para debug).
-    """
-    org_id = request.headers.get("X-Org-Id")
-    if not org_id:
-        raise HTTPException(400, "X-Org-Id requerido")
 
+@router.get("/layout")
+def get_layout(_=Depends(device_id_dep)):
+    """
+    Devuelve todas las posiciones guardadas para la org del token (útil para debug).
+    """
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
                 SELECT node_uid AS id, x, y, updated_by, updated_at
                 FROM public.asset_layouts
-                WHERE org_id = %s
+                WHERE org_id = current_setting('app.org_id')::bigint
                 ORDER BY updated_at DESC
-                """,
-                (org_id,),
+                """
             )
             return cur.fetchall()
     except Exception as e:
