@@ -9,7 +9,7 @@ from psycopg.rows import dict_row
 
 from app.core.db import get_conn
 from app.core.security import device_id_dep
-from app.core.tenancy import require_org  # 👈 asegura el GUC app.org_id por request
+from app.core.tenancy import require_org  # 👈 asegura GUC app.org_id por request
 
 router = APIRouter()
 
@@ -36,12 +36,25 @@ def _get_layout_map() -> Dict[str, Tuple[float, float]]:
     return layout_map
 
 
+def _safe_int(v: Any) -> Optional[int]:
+    try:
+        if v is None:
+            return None
+        # Evitar castear strings vacíos u otros
+        s = str(v).strip()
+        if s == "":
+            return None
+        return int(float(s)) if "." in s else int(s)
+    except Exception:
+        return None
+
+
 def _load_nodes_filtered(cur) -> List[Dict[str, Any]]:
     """
     Carga nodos desde v_asset_nodes priorizando filtro por org_id.
-    Fallback: si la vista no expone org_id, carga todo.
+    Si la vista no expone org_id, carga todo y dejamos que las uniones/joins
+    y el post-filtrado hagan el resto.
     """
-    # Intento 1: la vista tiene org_id
     try:
         cur.execute(
             """
@@ -52,12 +65,9 @@ def _load_nodes_filtered(cur) -> List[Dict[str, Any]]:
             """
         )
         rows = cur.fetchall()
-        if rows:
-            return rows
-        # Si no hay filas, igual devolvemos vacío (org sin datos)
-        return []
+        return rows or []
     except Exception:
-        # Intento 2: vista sin org_id -> cargo todo (se filtrará más abajo)
+        # Vista sin org_id o sin permiso: caemos a SELECT plano
         cur.execute("SELECT * FROM v_asset_nodes ORDER BY type, name;")
         return cur.fetchall() or []
 
@@ -65,12 +75,15 @@ def _load_nodes_filtered(cur) -> List[Dict[str, Any]]:
 def _node_uid(row: Dict[str, Any]) -> str:
     """UID consistente para nodos y layouts: usa code si existe; si no, asset_id."""
     code = row.get("code")
-    return f'{row["type"]}:{code}' if code else f'{row["type"]}_{row["asset_id"]}'
+    t = row.get("type") or "node"
+    aid = row.get("asset_id")
+    return f"{t}:{code}" if (code not in (None, "")) else f"{t}_{aid}"
 
 
-def _endpoint_key(t: str, asset_id: Any, code: Optional[str]) -> str:
+def _endpoint_key(t: Optional[str], asset_id: Any, code: Optional[str]) -> str:
     """Clave para lookup rápido de extremos de aristas."""
-    return f"{t}:{code}" if code else f"{t}_{asset_id}"
+    t = t or "node"
+    return f"{t}:{code}" if (code not in (None, "")) else f"{t}_{asset_id}"
 
 
 def _filter_edges_by_nodes(raw_edges: List[Dict[str, Any]], node_keys: Set[str]) -> List[Dict[str, Any]]:
@@ -79,20 +92,12 @@ def _filter_edges_by_nodes(raw_edges: List[Dict[str, Any]], node_keys: Set[str])
     Esto blinda contra vistas de edges sin filtro por org.
     """
     kept: List[Dict[str, Any]] = []
-    for e in raw_edges:
-        src_key = _endpoint_key(e["from_type"], e["from_id"], e.get("from_code"))
-        dst_key = _endpoint_key(e["to_type"], e["to_id"], e.get("to_code"))
-        if src_key in node_keys and dst_key in node_keys and e.get("is_active", True):
+    for e in raw_edges or []:
+        src_key = _endpoint_key(e.get("from_type"), e.get("from_id"), e.get("from_code"))
+        dst_key = _endpoint_key(e.get("to_type"),   e.get("to_id"),   e.get("to_code"))
+        if src_key in node_keys and dst_key in node_keys and (e.get("is_active", True) is True):
             kept.append(e)
     return kept
-
-
-def _fetch_by_ids(cur, sql: str, ids: List[int]) -> List[Dict[str, Any]]:
-    """Helper para consultas '... WHERE <col> = ANY(%s)' seguras."""
-    if not ids:
-        return []
-    cur.execute(sql, (list(ids),))
-    return cur.fetchall() or []
 
 
 # ---------------------------------------------------------------------
@@ -126,69 +131,83 @@ def graph_all(
             pump_ids: Set[int] = set()
 
             for r in raw_nodes:
-                node_keys.add(_node_uid(r))
-                if r["type"] == "tank":
-                    try:
-                        tank_ids.add(int(r["asset_id"]))
-                    except Exception:
-                        pass
-                elif r["type"] == "pump":
-                    try:
-                        pump_ids.add(int(r["asset_id"]))
-                    except Exception:
-                        pass
+                nid = _node_uid(r)
+                node_keys.add(nid)
 
-            # Edges crudos (pueden venir sin filtro de org) -> filtramos por nodos presentes
+                t = (r.get("type") or "").lower()
+                aid = _safe_int(r.get("asset_id"))
+                if t == "tank" and aid is not None:
+                    tank_ids.add(aid)
+                elif t == "pump" and aid is not None:
+                    pump_ids.add(aid)
+
+            # Edges: versión con JOIN a v_asset_nodes (como tenías originalmente),
+            # que además fuerza org via los nodos (aunque la vista no filtre sola).
             cur.execute(
                 """
                 SELECT e.*
                 FROM v_topology_edges e
+                JOIN v_asset_nodes nf
+                  ON nf.type = e.from_type AND nf.asset_id = e.from_id
+                JOIN v_asset_nodes nt
+                  ON nt.type = e.to_type   AND nt.asset_id = e.to_id
                 WHERE e.is_active
                 ORDER BY e.id;
                 """
             )
             all_edges = cur.fetchall() or []
+            # Por si v_topology_edges no filtra correctamente, reforzamos:
             raw_edges = _filter_edges_by_nodes(all_edges, node_keys)
 
-            # Payloads de tanques/bombas: limitamos por IDs de nodos
+            # Payloads de tanques/bombas: usar JOIN contra v_asset_nodes (filtra por org)
             tank_config: Dict[int, Dict[str, Any]] = {}
             tank_levels: Dict[int, Any] = {}
             pump_statuses: Dict[int, Any] = {}
 
             if tank_ids:
-                rows = _fetch_by_ids(
-                    cur,
+                cur.execute(
                     """
                     SELECT tc.tank_id, tc.low_pct, tc.high_pct, tc.low_low_pct, tc.high_high_pct
                     FROM public.tank_config tc
-                    WHERE tc.tank_id = ANY(%s)
-                    """,
-                    list(tank_ids),
+                    JOIN v_asset_nodes n
+                      ON n.type = 'tank' AND n.asset_id = tc.tank_id
+                    """
                 )
-                tank_config = {int(r["tank_id"]): r for r in rows}
+                rows = cur.fetchall() or []
+                # Quedarnos solo con los que están en nuestros nodos (por si la vista no filtró org)
+                for r in rows:
+                    tid = _safe_int(r.get("tank_id"))
+                    if tid is not None and tid in tank_ids:
+                        tank_config[tid] = r
 
-                rows = _fetch_by_ids(
-                    cur,
+                cur.execute(
                     """
                     SELECT v.tank_id, v.level_percent
                     FROM v_tank_latest v
-                    WHERE v.tank_id = ANY(%s)
-                    """,
-                    list(tank_ids),
+                    JOIN v_asset_nodes n
+                      ON n.type = 'tank' AND n.asset_id = v.tank_id
+                    """
                 )
-                tank_levels = {int(r["tank_id"]): r["level_percent"] for r in rows}
+                rows = cur.fetchall() or []
+                for r in rows:
+                    tid = _safe_int(r.get("tank_id"))
+                    if tid is not None and tid in tank_ids:
+                        tank_levels[tid] = r.get("level_percent")
 
             if pump_ids:
-                rows = _fetch_by_ids(
-                    cur,
+                cur.execute(
                     """
                     SELECT v.pump_id, v.is_on
                     FROM v_pump_latest v
-                    WHERE v.pump_id = ANY(%s)
-                    """,
-                    list(pump_ids),
+                    JOIN v_asset_nodes n
+                      ON n.type = 'pump' AND n.asset_id = v.pump_id
+                    """
                 )
-                pump_statuses = {int(r["pump_id"]): r["is_on"] for r in rows}
+                rows = cur.fetchall() or []
+                for r in rows:
+                    pid = _safe_int(r.get("pump_id"))
+                    if pid is not None and pid in pump_ids:
+                        pump_statuses[pid] = r.get("is_on")
 
         # Layouts guardados (por org)
         layout_map = _get_layout_map()
@@ -196,28 +215,31 @@ def graph_all(
         # Construcción de nodos de salida
         nodes: List[Dict[str, Any]] = []
         for r in raw_nodes:
+            t = (r.get("type") or "").lower()
             nid = _node_uid(r)
-            node: Dict[str, Any] = {"id": nid, "type": r["type"], "name": r["name"]}
+            node: Dict[str, Any] = {"id": nid, "type": r.get("type"), "name": r.get("name")}
 
             # payload por tipo
-            if r["type"] == "tank":
-                tank_id = int(r["asset_id"])
-                cfg = tank_config.get(tank_id)
-                if cfg:
-                    node["low_pct"] = cfg.get("low_pct")
-                    node["high_pct"] = cfg.get("high_pct")
-                    node["low_low_pct"] = cfg.get("low_low_pct")
-                    node["high_high_pct"] = cfg.get("high_high_pct")
-                node["level"] = tank_levels.get(tank_id, None)
+            if t == "tank":
+                tank_id = _safe_int(r.get("asset_id"))
+                if tank_id is not None:
+                    cfg = tank_config.get(tank_id)
+                    if cfg:
+                        node["low_pct"] = cfg.get("low_pct")
+                        node["high_pct"] = cfg.get("high_pct")
+                        node["low_low_pct"] = cfg.get("low_low_pct")
+                        node["high_high_pct"] = cfg.get("high_high_pct")
+                    node["level"] = tank_levels.get(tank_id, None)
 
-            elif r["type"] == "pump":
-                pid = int(r["asset_id"])
-                node["status"] = bool(pump_statuses.get(pid, False))  # False=apagada
+            elif t == "pump":
+                pid = _safe_int(r.get("asset_id"))
+                if pid is not None:
+                    node["status"] = bool(pump_statuses.get(pid, False))  # False=apagada
                 rk = r.get("rated_kw")
                 if rk is not None:
                     node["kW"] = rk
 
-            elif r["type"] == "valve":
+            elif t == "valve":
                 vs = r.get("valve_state")
                 if vs is not None:
                     node["state"] = vs
@@ -237,8 +259,8 @@ def graph_all(
         # Edges → formateo compacto "SRC>DST"
         edges: List[str] = []
         for e in raw_edges:
-            src = f'{e["from_type"]}:{e.get("from_code")}' if e.get("from_code") else f'{e["from_type"]}_{e["from_id"]}'
-            dst = f'{e["to_type"]}:{e.get("to_code")}'     if e.get("to_code")   else f'{e["to_type"]}_{e["to_id"]}'
+            src = f'{e.get("from_type")}:{e.get("from_code")}' if e.get("from_code") not in (None, "") else f'{e.get("from_type")}_{e.get("from_id")}'
+            dst = f'{e.get("to_type")}:{e.get("to_code")}'     if e.get("to_code")   not in (None, "") else f'{e.get("to_type")}_{e.get("to_id")}'
             edges.append(f"{src}>{dst}")
 
         return {"nodes": nodes, "edges": edges}
@@ -246,6 +268,7 @@ def graph_all(
     except HTTPException:
         raise
     except Exception as e:
+        # No exponemos stack, pero sí un mensaje claro (te ayuda en PS con Invoke-WebRequest)
         raise HTTPException(500, f"graph_all failed: {e}")
 
 
@@ -265,7 +288,6 @@ def graph_nodes(
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
             rows = _load_nodes_filtered(cur)
-            # Mantengo la forma original cuando es posible:
             out = []
             for r in rows:
                 out.append({
@@ -310,6 +332,10 @@ def graph_edges(
                        e.to_type,   e.to_id,   e.to_name,   e.to_code,
                        e.pipe_diameter_mm, e.length_m, e.is_active
                 FROM v_topology_edges e
+                JOIN v_asset_nodes nf
+                  ON nf.type = e.from_type AND nf.asset_id = e.from_id
+                JOIN v_asset_nodes nt
+                  ON nt.type = e.to_type   AND nt.asset_id = e.to_id
                 WHERE e.is_active
                 ORDER BY e.id;
                 """
