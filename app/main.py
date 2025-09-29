@@ -128,6 +128,7 @@ if TRUSTED_HOSTS:
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # ===== Middleware de LOG de request/response (después de CORS) =====
+# ===== Middleware de LOG =====
 class LoggingMiddleware(BaseHTTPMiddleware):
     def __init__(self, app):
         super().__init__(app)
@@ -136,8 +137,6 @@ class LoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         t0 = time.time()
         hdr = request.headers
-
-        # headers “seguros” (sin exponer secretos)
         safe_headers = {
             "x-org-id": hdr.get("x-org-id"),
             "x-device-id": hdr.get("x-device-id"),
@@ -145,21 +144,15 @@ class LoggingMiddleware(BaseHTTPMiddleware):
             "authorization-present": bool(hdr.get("authorization")),
             "content-type": hdr.get("content-type"),
         }
-
-        # Sólo muestreamos body de ingest para no saturar
         body_text = None
-        if (request.url.path, request.method) in {
-            ("/ingest/tank", "POST"),
-            ("/ingest/pump", "POST"),
-        }:
+        if (request.url.path, request.method) in {("/ingest/tank","POST"), ("/ingest/pump","POST")}:
             try:
                 body_bytes = await request.body()
-                body_text = body_bytes.decode("utf-8")[:2000]  # truncado
+                body_text = body_bytes.decode("utf-8")[:2000]
             except Exception as e:
                 body_text = f"<no-body: {e}>"
 
         self._log.info(f"[REQ] {request.method} {request.url.path} {safe_headers} body={body_text}")
-
         try:
             response = await call_next(request)
             dt = (time.time() - t0) * 1000
@@ -170,6 +163,86 @@ class LoggingMiddleware(BaseHTTPMiddleware):
             raise
 
 app.add_middleware(LoggingMiddleware)
+
+# ===== Contexto multi-tenant (RLS) =====
+from app.core.tenancy import tenant_ctx_dep
+
+_PUBLIC_PATHS = {
+    "/", "/health", "/health/db", "/favicon.ico",
+    "/__config", "/openapi.json", "/docs", "/redoc",
+    "/__alarm_poller_status", "/__which_alarms_eval", "/__which_alarm_events",
+}
+_PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws", "/ingest", "/infra")
+
+class TenantContextMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Dejá que el CORS maneje el preflight (está más afuera en el stack)
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        path = request.url.path
+        if path in _PUBLIC_PATHS or any(path.startswith(p) for p in _PUBLIC_PREFIXES):
+            return await call_next(request)
+
+        try:
+            await tenant_ctx_dep(
+                request,
+                authorization=request.headers.get("authorization"),
+                x_org_id=request.headers.get("x-org-id"),
+                x_user_id=request.headers.get("x-user-id"),
+                x_role=request.headers.get("x-role"),
+            )
+        except HTTPException as e:
+            # Importante: devolvemos la respuesta aquí pero CORS está por fuera
+            # y le agregará los headers de CORS.
+            return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
+
+        return await call_next(request)
+
+# ⚠️ IMPORTANTE: agregalo ANTES del CORS, para que el CORS se agregue por fuera
+app.add_middleware(TenantContextMiddleware)
+
+# ===== CORS (debe ser el MÁS EXTERNO) =====
+_raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
+_origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
+if _raw == "*":
+    ALLOW_ALL_ORIGINS = True
+    ALLOWED_ORIGINS = ["*"]
+else:
+    ALLOW_ALL_ORIGINS = False
+    ALLOWED_ORIGINS = [o.strip() for o in _raw.split(",") if o.strip()]
+
+ALLOW_CREDENTIALS = False
+ALLOW_METHODS = ["*"]
+ALLOW_HEADERS = ["*"]
+
+print("[CORS] allow_all          =", ALLOW_ALL_ORIGINS)
+print("[CORS] allow_origins      =", ALLOWED_ORIGINS)
+print("[CORS] allow_origin_regex =", _origin_regex or "(none)")
+print("[CORS] allow_credentials  =", ALLOW_CREDENTIALS)
+
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=_origin_regex or None,
+    allow_credentials=ALLOW_CREDENTIALS,
+    allow_methods=ALLOW_METHODS,
+    allow_headers=ALLOW_HEADERS,
+)
+
+# ===== TrustedHost / GZip (opcional, su orden no afecta CORS si quedan por dentro)
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+
+_trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
+TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
+if TRUSTED_HOSTS:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
+    print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
+
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
 
 # ===== Contexto multi-tenant (RLS) =====
 from app.core.tenancy import tenant_ctx_dep
