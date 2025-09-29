@@ -8,23 +8,23 @@ from typing import Any, Dict, List, Optional
 from psycopg.rows import dict_row
 
 from app.core.security import device_id_dep
-from app.auth.deps import conn_with_rls
+from app.core.db import get_conn
+from app.core.tenancy import require_org, get_user_id
 from app.schemas.configs import TankConfigIn, TankConfigOut
 
 router = APIRouter(prefix="/tanks", tags=["config"])
-
 
 # 1) LISTA TODAS LAS CONFIGS (scopeadas por org)
 @router.get("/config")
 def list_configs(
     _=Depends(device_id_dep),
-    conn=Depends(conn_with_rls),
-):
+) -> List[Dict[str, Any]]:
     """
     Devuelve todas las configs visibles para la organización actual.
     Incluye: tank_id, name, capacity_m3 y los umbrales (si existen).
     """
-    with conn.cursor(row_factory=dict_row) as cur:
+    org_id = require_org()
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
             SELECT
@@ -42,22 +42,22 @@ def list_configs(
               ON l.id = t.location_id
             LEFT JOIN public.tank_configs c
               ON c.tank_id = t.id
-            WHERE l.org_id = current_setting('app.org_id')::bigint
+            WHERE l.org_id = %s
             ORDER BY t.id
-            """
+            """,
+            (org_id,),
         )
         rows = cur.fetchall() or []
     return rows
-
 
 # 2) LEE UNA CONFIG (valida org del tanque)
 @router.get("/{tank_id}/config", response_model=TankConfigOut)
 def get_config(
     tank_id: int = Path(..., ge=1),
     _=Depends(device_id_dep),
-    conn=Depends(conn_with_rls),
 ):
-    with conn.cursor(row_factory=dict_row) as cur:
+    org_id = require_org()
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         # Validar pertenencia del tanque a la org
         cur.execute(
             """
@@ -65,9 +65,9 @@ def get_config(
             FROM public.tanks t
             JOIN public.locations l ON l.id = t.location_id
             WHERE t.id = %s
-              AND l.org_id = current_setting('app.org_id')::bigint
+              AND l.org_id = %s
             """,
-            (tank_id,),
+            (tank_id, org_id),
         )
         trow = cur.fetchone()
         if not trow:
@@ -97,16 +97,18 @@ def get_config(
         }
     return cfg
 
-
 # 3) UPSERT (valida org del tanque + ON CONFLICT)
 @router.put("/{tank_id}/config", response_model=TankConfigOut)
 def upsert_config(
     tank_id: int = Path(..., ge=1),
     payload: TankConfigIn = Body(...),
     _=Depends(device_id_dep),
-    conn=Depends(conn_with_rls),
 ):
-    with conn.cursor(row_factory=dict_row) as cur:
+    org_id = require_org()
+    # si tenés usuario autenticado, usalo; si no, respetá el del payload si viene
+    updated_by = get_user_id() or getattr(payload, "updated_by", None)
+
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         # Validar que el tanque sea de la org actual
         cur.execute(
             """
@@ -114,9 +116,9 @@ def upsert_config(
             FROM public.tanks t
             JOIN public.locations l ON l.id = t.location_id
             WHERE t.id = %s
-              AND l.org_id = current_setting('app.org_id')::bigint
+              AND l.org_id = %s
             """,
-            (tank_id,),
+            (tank_id, org_id),
         )
         if not cur.fetchone():
             raise HTTPException(status_code=404, detail="tank not found")
@@ -143,7 +145,7 @@ def upsert_config(
                 payload.low_low_pct,
                 payload.high_pct,
                 payload.high_high_pct,
-                getattr(payload, "updated_by", None),
+                updated_by,
             ),
         )
         row = cur.fetchone()
