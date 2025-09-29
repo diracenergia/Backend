@@ -1,10 +1,9 @@
-# app/routes/latest.py
 from __future__ import annotations
 
+from fastapi import APIRouter, Depends, Path, Query, HTTPException
 from typing import Optional, Dict, Any
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, Path, Query, HTTPException
 from psycopg.rows import dict_row
 
 from app.core.security import device_id_dep
@@ -12,7 +11,6 @@ from app.core.db import get_conn
 from app.core.tenancy import require_org
 
 router = APIRouter(prefix="/tanks", tags=["latest"])
-
 
 def _to_float(v: Optional[Any]) -> Optional[float]:
     if v is None:
@@ -24,14 +22,11 @@ def _to_float(v: Optional[Any]) -> Optional[float]:
     except Exception:
         return None
 
-
 def _estimate_volume_l(capacity_m3: Optional[float], level_percent: Optional[float]) -> Optional[float]:
     if capacity_m3 is None or level_percent is None:
         return None
-    # clamp 0..100
     pct = max(0.0, min(100.0, float(level_percent)))
     return round(capacity_m3 * 1000.0 * (pct / 100.0), 3)
-
 
 @router.get("/{tank_id}/latest")
 def latest_tank(
@@ -41,32 +36,29 @@ def latest_tank(
 ):
     """
     Última lectura de un tanque **scopeada por organización**.
-    - Valida que el `tank_id` pertenezca a la `org` actual (derivada del JWT/headers).
-    - Si no hay lecturas, devuelve `has_data = False` (HTTP 200).
-    - Si `include_capacity = true`, incluye `capacity_m3` y se usa para estimar volumen.
     """
     org_id = require_org()
-
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-        # 1) Validar que el tanque pertenezca a la org actual y leer capacity_m3
+        # validar pertenencia por org y traer capacity_m3
         cur.execute(
             """
             SELECT t.id, t.capacity_m3
             FROM public.tanks t
-            JOIN public.locations l ON l.id = t.location_id
-            WHERE t.id = %s
-              AND l.org_id = %s
+            JOIN public.asset_locations al
+              ON al.asset_type='tank' AND al.asset_id=t.id
+            JOIN public.locations l
+              ON l.id = al.location_id
+            WHERE t.id = %s AND l.org_id = %s
             """,
             (tank_id, org_id),
         )
-        tank_row = cur.fetchone()
-        if not tank_row:
-            # No existe o no pertenece a la org actual
+        trow = cur.fetchone()
+        if not trow:
             raise HTTPException(status_code=404, detail="tank not found")
 
-        capacity_m3: Optional[float] = _to_float(tank_row.get("capacity_m3")) if include_capacity else None
+        capacity_m3: Optional[float] = _to_float(trow.get("capacity_m3")) if include_capacity else None
 
-        # 2) Intentar traer la última lectura (primero vista, si existe; si no, fallback a tabla)
+        # intentar vista; si no existe, fallback a tabla
         row: Optional[Dict[str, Any]] = None
         try:
             cur.execute(
@@ -74,17 +66,12 @@ def latest_tank(
                 SELECT id, tank_id, ts, level_percent, volume_l, temperature_c, device_id, raw_json
                 FROM public.v_tank_latest
                 WHERE tank_id = %s
-                LIMIT 1
                 """,
                 (tank_id,),
             )
             r = cur.fetchone()
             row = dict(r) if r else None
         except Exception:
-            row = None
-
-        if row is None:
-            # Fallback si la vista no existe o no tiene datos
             cur.execute(
                 """
                 SELECT id, tank_id, ts, level_percent, volume_l, temperature_c, device_id, raw_json
@@ -98,7 +85,6 @@ def latest_tank(
             r = cur.fetchone()
             row = dict(r) if r else None
 
-    # 3) Sin lecturas -> payload vacío pero válido
     if not row:
         out: Dict[str, Any] = {
             "id": None,
@@ -116,7 +102,6 @@ def latest_tank(
             out["capacity_m3"] = capacity_m3
         return out
 
-    # 4) Con lecturas: normalizar y estimar volumen si no vino medido
     level_percent = _to_float(row.get("level_percent"))
     volume_l_measured = _to_float(row.get("volume_l"))
     temperature_c = _to_float(row.get("temperature_c"))
