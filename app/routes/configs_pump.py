@@ -1,125 +1,91 @@
 # app/routes/configs_pump.py
-from typing import List, Dict, Any, Optional
-from fastapi import APIRouter, Request
+from __future__ import annotations
 
-# Compat: en tu repo existe get_conn en app.core.db
-try:
-    from app.core.db import get_conn  # psycopg connection helper (context manager)
-except Exception as e:  # pragma: no cover
-    raise RuntimeError("No se pudo importar app.core.db.get_conn") from e
+from fastapi import APIRouter, Depends, Path, Body, HTTPException
+from psycopg.rows import dict_row
 
-# Compat: si tenés require_auth, lo usamos; si no, seguimos igual (modo legacy)
-try:
-    from fastapi import Depends
-    from app.auth import require_auth  # debe setear request.state.org_id si hay JWT
-    _AUTH_DEP = Depends(require_auth)
-except Exception:
-    _AUTH_DEP = None  # sin dependencia, seguiremos leyendo X-Org-Id
+from app.schemas.pumps import PumpConfigIn
+from app.repos import pumps as repo
+from app.core.security import device_id_dep
+from app.core.db import get_conn
 
-router = APIRouter(prefix="/pumps", tags=["pumps"])
+router = APIRouter(prefix="/pumps", tags=["config"])
 
 
-def _get_org_id(request: Request) -> int:
+@router.get("")
+def list_pumps(_=Depends(device_id_dep)):
     """
-    Prioridad:
-    1) request.state.org_id (seteado por auth/JWT)
-    2) Header X-Org-Id (modo legacy sin login)
+    Lista bombas visibles para la org actual (vía RLS).
     """
-    org_id: Optional[int] = getattr(request.state, "org_id", None)
-    if not org_id:
-        hdr = request.headers.get("x-org-id") or request.headers.get("X-Org-Id")
-        try:
-            org_id = int(hdr) if hdr is not None else 0
-        except Exception:
-            org_id = 0
-    return int(org_id or 0)
+    return repo.list_pumps()
 
 
 @router.get("/config")
-def list_pumps_config(request: Request, _user=(_AUTH_DEP if _AUTH_DEP is not None else None)) -> List[Dict[str, Any]]:
+def list_pumps_with_config(_=Depends(device_id_dep)):
     """
-    Devuelve bombas visibles para la organización del request.
-    - Filtra por pertenencia a locations de esa org (asset_locations -> locations.org_id).
-    - Toma config desde tabla SINGULAR public.pump_config (coincide con tu pump.py).
-    - Evita duplicados con DISTINCT ON (p.id).
+    Lista bombas con su configuración (vista/consulta del repo).
     """
-    org_id = _get_org_id(request)
-    if not org_id:
-        # Sin org no devolvemos nada (evita 500 y CORS bloqueado en el front)
-        return []
+    return repo.list_pumps_with_config()
 
-    with get_conn() as conn, conn.cursor() as cur:
+
+@router.get("/{pump_id}/config")
+def get_pump_config(pump_id: int = Path(..., ge=1), _=Depends(device_id_dep)):
+    """
+    Devuelve la config de una bomba. Si no existe, el repo puede
+    devolver valores nulos/por defecto.
+    """
+    # Si querés validar pertenencia a la org antes de consultar:
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
-            SELECT DISTINCT ON (p.id)
-                p.id                                           AS pump_id,
-                COALESCE(NULLIF(p.name, ''), 'Bomba ' || p.id) AS pump_name,
-                p.model,
-                p.max_flow_lpm,
-
-                cfg.drive_type,
-                cfg.remote_enabled,
-                cfg.vfd_min_speed_pct,
-                cfg.vfd_max_speed_pct,
-                cfg.vfd_default_speed_pct,
-
-                l.id    AS location_id,
-                l.code  AS location_code,
-                l.name  AS location_name
+            SELECT p.id
             FROM public.pumps p
-            -- Config (tu schema usa 'pump_config' en singular)
-            LEFT JOIN public.pump_config cfg
-                   ON cfg.pump_id = p.id
-            -- Ubicación
-            LEFT JOIN public.asset_locations al
-                   ON al.asset_type = 'pump'
-                  AND al.asset_id   = p.id
-            LEFT JOIN public.locations l
-                   ON l.id = al.location_id
-            WHERE EXISTS (
-                SELECT 1
-                FROM public.asset_locations al2
-                JOIN public.locations l2 ON l2.id = al2.location_id
-                WHERE al2.asset_type = 'pump'
-                  AND al2.asset_id   = p.id
-                  AND l2.org_id      = %(org_id)s
-            )
-            -- DISTINCT ON requiere que la primera expresión de ORDER BY coincida
-            ORDER BY p.id, l.name NULLS FIRST, pump_name NULLS LAST
+            JOIN public.locations l ON l.id = p.location_id
+            WHERE p.id = %s
+              AND l.org_id = current_setting('app.org_id')::bigint
             """,
-            {"org_id": org_id},
+            (pump_id,),
         )
-        rows = cur.fetchall()
+        if not cur.fetchone():
+            raise HTTPException(404, "pump not found")
 
-    result: List[Dict[str, Any]] = []
-    for (
-        pump_id,
-        pump_name,
-        model,
-        max_flow_lpm,
-        drive_type,
-        remote_enabled,
-        vfd_min_speed_pct,
-        vfd_max_speed_pct,
-        vfd_default_speed_pct,
-        location_id,
-        location_code,
-        location_name,
-    ) in rows:
-        result.append(
-            {
-                "pump_id": pump_id,
-                "pump_name": pump_name,
-                "model": model,
-                "max_flow_lpm": max_flow_lpm,
-                "drive_type": drive_type,
-                "remote_enabled": remote_enabled,
-                "vfd_min_speed_pct": vfd_min_speed_pct,
-                "vfd_max_speed_pct": vfd_max_speed_pct,
-                "vfd_default_speed_pct": vfd_default_speed_pct,
-                "location_id": location_id,
-                "location_code": location_code,
-                "location_name": location_name,
-            }
+    # Delegamos al repo (que ya usa RLS vía get_conn)
+    return repo.get_pump_config(pump_id)
+
+
+@router.put("/{pump_id}/config")
+def upsert_pump_config_put(
+    pump_id: int = Path(..., ge=1),
+    body: PumpConfigIn = Body(...),
+    _=Depends(device_id_dep),
+):
+    """
+    Upsert de configuración (método preferido por el front).
+    Valida que la bomba pertenezca a la org actual.
+    """
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT p.id
+            FROM public.pumps p
+            JOIN public.locations l ON l.id = p.location_id
+            WHERE p.id = %s
+              AND l.org_id = current_setting('app.org_id')::bigint
+            """,
+            (pump_id,),
         )
-    return result
+        if not cur.fetchone():
+            raise HTTPException(404, "pump not found")
+
+    cfg = repo.upsert_pump_config(pump_id, body)
+    return {"ok": True, "config": cfg}
+
+
+# Fallback por compatibilidad (el front intenta PUT y, si recibe 405, hace POST)
+@router.post("/{pump_id}/config")
+def upsert_pump_config_post(
+    pump_id: int = Path(..., ge=1),
+    body: PumpConfigIn = Body(...),
+    _=Depends(device_id_dep),
+):
+    return upsert_pump_config_put(pump_id, body)  # reutilizamos la misma lógica
