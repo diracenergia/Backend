@@ -1,24 +1,21 @@
-# app/routes/configs.py
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Path, Body, HTTPException
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from fastapi import APIRouter, Depends, Path, Body, HTTPException
 from psycopg.rows import dict_row
 
 from app.core.security import device_id_dep
 from app.core.db import get_conn
-from app.core.tenancy import require_org, get_user_id
+from app.core.tenancy import require_org
 from app.schemas.configs import TankConfigIn, TankConfigOut
 
 router = APIRouter(prefix="/tanks", tags=["config"])
 
 # 1) LISTA TODAS LAS CONFIGS (scopeadas por org)
 @router.get("/config")
-def list_configs(
-    _=Depends(device_id_dep),
-) -> List[Dict[str, Any]]:
+def list_configs(_=Depends(device_id_dep)):
     """
     Devuelve todas las configs visibles para la organización actual.
     Incluye: tank_id, name, capacity_m3 y los umbrales (si existen).
@@ -105,9 +102,6 @@ def upsert_config(
     _=Depends(device_id_dep),
 ):
     org_id = require_org()
-    # si tenés usuario autenticado, usalo; si no, respetá el del payload si viene
-    updated_by = get_user_id() or getattr(payload, "updated_by", None)
-
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         # Validar que el tanque sea de la org actual
         cur.execute(
@@ -145,9 +139,8 @@ def upsert_config(
                 payload.low_low_pct,
                 payload.high_pct,
                 payload.high_high_pct,
-                updated_by,
+                getattr(payload, "updated_by", None),
             ),
         )
         row = cur.fetchone()
-
     return row
