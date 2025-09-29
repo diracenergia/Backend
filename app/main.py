@@ -2,45 +2,33 @@
 import os
 import sys
 import time
-import json
 import logging
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Body, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
+# Routers varios
 from app.routes.control import control_router
-
-# ===== LOGGING GLOBAL =====
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-logger = logging.getLogger("rdls")
-logger.info(f"[boot] LOG_LEVEL={LOG_LEVEL}")
-
-# ===== Routers propios =====
 from app.routes.kpi import router as kpi_router
 
 # Infra
-from app.routes.graph_api import router as graph_router       # <- lo montamos con prefix="/infra"
-from app.routes.locations import router as locations_router   # ya trae prefix="/infra"
+from app.routes.graph_api import router as graph_router
+from app.routes.locations import router as locations_router
 
-# Tanks (ingesta / latest / history / configs / commands)
+# Tanks
 from app.routes.ingest import router as ingest_tank_router
 from app.routes.latest import router as latest_tank_router
 from app.routes.history import router as history_tank_router
 from app.routes.configs import router as configs_tank_router
 from app.routes.commands_tanks import router as commands_tank_router
 
-# Pumps (ingesta / latest / history / configs / commands)
+# Pumps
 from app.routes.ingest_pump import router as ingest_pump_router
 from app.routes.latest_pump import router as latest_pump_router
 from app.routes.history_pump import router as history_pump_router
@@ -54,17 +42,25 @@ from app.routes.audit import router as audit_router
 # Diag listener
 from app.routes.diag_listener import router as diag_listener_router
 
-# WebSocket
+# WebSocket + viz
 from app.ws import router as ws_router
-
-# Visor en vivo (WS /viz/ws y GET /viz/state)
 from app.routes.live_view import viz_router
 
-# AUTH
+# Auth
 from app.auth.router import router as auth_router
-from app.auth.deps import conn_with_rls  # (import opcional, por si usás yield conn)
+from app.core.tenancy import tenant_ctx_dep  # dependencia del tenant
 
-# ===== Config centralizada (pydantic Settings) con fallback a .env =====
+# ===== LOGGING GLOBAL =====
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("rdls")
+logger.info(f"[boot] LOG_LEVEL={LOG_LEVEL}")
+
+# ===== Config (.env / Settings) =====
 try:
     from app.core.config import settings  # opcional
 except Exception:
@@ -75,60 +71,17 @@ except Exception:
     except Exception:
         pass
 
-
 def _get_env(name: str, default: str = "") -> str:
-    """Lee primero de settings (si existe) y si no, del entorno."""
     if settings and hasattr(settings, name):
         return str(getattr(settings, name))
     return os.getenv(name, default)
-
 
 # ===== App metadata =====
 APP_TITLE = _get_env("APP_TITLE", "ESP32 Tank/Pump API")
 APP_VERSION = _get_env("APP_VERSION", "") or _get_env("RENDER_GIT_COMMIT", "")[:8]
 app = FastAPI(title=APP_TITLE, version=APP_VERSION or None)
 
-# ===== CORS (debe ir PRIMERO en la cadena) =====
-_raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
-_origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
-
-if _raw == "*":
-    ALLOW_ALL_ORIGINS = True
-    ALLOWED_ORIGINS = ["*"]
-else:
-    ALLOW_ALL_ORIGINS = False
-    ALLOWED_ORIGINS = [o.strip() for o in _raw.split(",") if o.strip()]
-
-ALLOW_CREDENTIALS = False
-ALLOW_METHODS = ["*"]
-ALLOW_HEADERS = ["*"]
-
-print("[CORS] allow_all          =", ALLOW_ALL_ORIGINS)
-print("[CORS] allow_origins      =", ALLOWED_ORIGINS)
-print("[CORS] allow_origin_regex =", _origin_regex or "(none)")
-print("[CORS] allow_credentials  =", ALLOW_CREDENTIALS)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=_origin_regex or None,
-    allow_credentials=ALLOW_CREDENTIALS,
-    allow_methods=ALLOW_METHODS,
-    allow_headers=ALLOW_HEADERS,
-)
-
-# ===== Trusted hosts (opcional) =====
-_trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
-TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
-if TRUSTED_HOSTS:
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
-    print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
-
-# ===== Compresión =====
-app.add_middleware(GZipMiddleware, minimum_size=1024)
-
-# ===== Middleware de LOG de request/response (después de CORS) =====
-# ===== Middleware de LOG =====
+# ===== Logging de requests =====
 class LoggingMiddleware(BaseHTTPMiddleware):
     def __init__(self, app):
         super().__init__(app)
@@ -164,19 +117,28 @@ class LoggingMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(LoggingMiddleware)
 
-# ===== Contexto multi-tenant (RLS) =====
-from app.core.tenancy import tenant_ctx_dep
+# ===== Compresión =====
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
+# ===== Trusted hosts (opcional) =====
+_trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
+TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
+if TRUSTED_HOSTS:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
+    print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
+
+# ===== Tenant (RLS) - class-based =====
 _PUBLIC_PATHS = {
     "/", "/health", "/health/db", "/favicon.ico",
     "/__config", "/openapi.json", "/docs", "/redoc",
     "/__alarm_poller_status", "/__which_alarms_eval", "/__which_alarm_events",
 }
-_PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws", "/ingest", "/infra")
+# Incluimos /auth como público para permitir /auth/login
+_PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws", "/ingest", "/infra", "/auth")
 
 class TenantContextMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # Dejá que el CORS maneje el preflight (está más afuera en el stack)
+        # Deja que CORS maneje preflight (estará por fuera)
         if request.method == "OPTIONS":
             return await call_next(request)
 
@@ -193,16 +155,14 @@ class TenantContextMiddleware(BaseHTTPMiddleware):
                 x_role=request.headers.get("x-role"),
             )
         except HTTPException as e:
-            # Importante: devolvemos la respuesta aquí pero CORS está por fuera
-            # y le agregará los headers de CORS.
+            # Respuesta inmediata; CORS (afuera) agregará los headers
             return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
 
         return await call_next(request)
 
-# ⚠️ IMPORTANTE: agregalo ANTES del CORS, para que el CORS se agregue por fuera
 app.add_middleware(TenantContextMiddleware)
 
-# ===== CORS (debe ser el MÁS EXTERNO) =====
+# ===== CORS (DEBE SER EL MÁS EXTERNO: agregarlo ÚLTIMO) =====
 _raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
 _origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
 if _raw == "*":
@@ -211,7 +171,6 @@ if _raw == "*":
 else:
     ALLOW_ALL_ORIGINS = False
     ALLOWED_ORIGINS = [o.strip() for o in _raw.split(",") if o.strip()]
-
 ALLOW_CREDENTIALS = False
 ALLOW_METHODS = ["*"]
 ALLOW_HEADERS = ["*"]
@@ -221,7 +180,6 @@ print("[CORS] allow_origins      =", ALLOWED_ORIGINS)
 print("[CORS] allow_origin_regex =", _origin_regex or "(none)")
 print("[CORS] allow_credentials  =", ALLOW_CREDENTIALS)
 
-from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -230,57 +188,6 @@ app.add_middleware(
     allow_methods=ALLOW_METHODS,
     allow_headers=ALLOW_HEADERS,
 )
-
-# ===== TrustedHost / GZip (opcional, su orden no afecta CORS si quedan por dentro)
-from starlette.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
-
-_trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
-TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
-if TRUSTED_HOSTS:
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
-    print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
-
-app.add_middleware(GZipMiddleware, minimum_size=1024)
-
-
-# ===== Contexto multi-tenant (RLS) =====
-from app.core.tenancy import tenant_ctx_dep
-
-app.include_router(control_router)
-
-_PUBLIC_PATHS = {
-    "/", "/health", "/health/db", "/favicon.ico",
-    "/__config", "/openapi.json", "/docs", "/redoc",
-    "/__alarm_poller_status", "/__which_alarms_eval", "/__which_alarm_events",
-}
-# Agregamos "/auth" para que /auth/login sea público (sin tenant)
-_PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws", "/ingest", "/infra", "/auth")
-
-@app.middleware("http")
-async def _tenant_context_middleware(request: Request, call_next):
-    # Preflight CORS: dejar pasar (CORSMiddleware lo maneja)
-    if request.method == "OPTIONS":
-        return await call_next(request)
-
-    path = request.url.path
-    if path in _PUBLIC_PATHS or any(path.startswith(p) for p in _PUBLIC_PREFIXES):
-        return await call_next(request)
-
-    try:
-        # Pasamos headers tal cual
-        await tenant_ctx_dep(
-            request,
-            authorization=request.headers.get("authorization"),
-            x_org_id=request.headers.get("x-org-id"),
-            x_user_id=request.headers.get("x-user-id"),
-            x_role=request.headers.get("x-role"),
-        )
-    except HTTPException as e:
-        logger.warning(f"[tenant] reject {path} -> {e.status_code} {e.detail}")
-        return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
-
-    return await call_next(request)
 
 # ===== Montaje de UI estática (/ui) =====
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -291,7 +198,6 @@ else:
     print(f"⚠️ /ui deshabilitado: no existe {WEB_DIR}")
 
 # ===== Incluir Routers =====
-# Diag listener
 app.include_router(diag_listener_router)
 
 # Tanques
@@ -319,8 +225,8 @@ except Exception as e:
 app.include_router(alarms_router)
 app.include_router(audit_router)
 
-# Infra / Graph API
-app.include_router(graph_router, prefix="/infra", tags=["infra-graph"])  # <- clave para /infra/graph
+# Infra
+app.include_router(graph_router, prefix="/infra", tags=["infra-graph"])
 app.include_router(locations_router)  # ya tiene prefix="/infra"
 
 # WebSocket
@@ -329,10 +235,10 @@ app.include_router(ws_router)
 # KPI
 app.include_router(kpi_router)
 
-# Rutas de auth (login)
-app.include_router(auth_router, prefix="")  # el router ya define /auth/...
+# Auth (router ya define /auth/..)
+app.include_router(auth_router, prefix="")
 
-# Visor en vivo (estado + websocket)
+# Viz (estado + websocket)
 app.include_router(viz_router)
 
 # ===== Endpoints utilitarios =====
@@ -350,7 +256,6 @@ def root():
 
 @app.get("/favicon.ico")
 def favicon_noop():
-    # Evita 404s ruidosos del navegador si no hay favicon
     return {}
 
 @app.get("/health")
@@ -389,14 +294,15 @@ def tg_env():
         "CHAT": _get_env("TELEGRAM_CHAT_ID", ""),
     }
 
-# ===== Conexión (diagnóstico) =====
+# Conexión (diagnóstico)
 try:
     from app.routes.conn import router as conn_router
     app.include_router(conn_router)
 except Exception as e:
     print(f"⚠️ conn router no disponible: {e}")
 
-# ===== Alarm Poller (sin LISTEN/NOTIFY) =====
+# Alarm Poller (controlado por flag)
+ENABLE_ALARM_POLLER = _get_env("ALARM_POLLER_ENABLED", "true").lower() != "false"
 try:
     from app.services.alarm_poller import start_alarm_poller, stop_alarm_poller
     _HAS_ALARM_POLLER = True
@@ -408,7 +314,7 @@ except Exception as e:
 
 @app.on_event("startup")
 def _startup_listeners():
-    if _HAS_ALARM_POLLER and callable(start_alarm_poller):
+    if ENABLE_ALARM_POLLER and _HAS_ALARM_POLLER and callable(start_alarm_poller):
         try:
             start_alarm_poller()
             print("[alarm-poller] started")
@@ -424,25 +330,17 @@ def _shutdown_listeners():
         except Exception as e:
             print(f"⚠️ error al detener alarm-poller: {e}")
 
-# ===== Endpoints de diagnóstico del poller =====
 @app.get("/__alarm_poller_status")
 def poller_status():
     try:
         from app.services import alarm_poller as ap
     except Exception as e:
         return {"alive": False, "error": f"import_error: {e}"}
-
     alive = bool(getattr(ap, "_thread", None) and getattr(ap._thread, "is_alive", lambda: False)())
     batch = getattr(ap, "BATCH", None)
     sleep_empty = getattr(ap, "SLEEP_EMPTY", None)
     sleep_busy = getattr(ap, "SLEEP_BUSY", None)
-
-    return {
-        "alive": alive,
-        "batch": batch,
-        "sleep_empty": sleep_empty,
-        "sleep_busy": sleep_busy,
-    }
+    return {"alive": alive, "batch": batch, "sleep_empty": sleep_empty, "sleep_busy": sleep_busy}
 
 @app.post("/__alarm_poller_stop")
 def poller_stop():
@@ -454,7 +352,6 @@ def poller_stop():
             return {"stopped": False, "error": str(e)}
     return {"stopped": False, "error": "poller no disponible"}
 
-# ===== Qué versión de alarms_eval está cargada =====
 @app.get("/__which_alarms_eval")
 def which_alarms_eval():
     import importlib
@@ -469,7 +366,6 @@ def which_alarms_eval():
     except Exception as e:
         return {"error": str(e)}
 
-# ===== Qué versión de alarm_events está cargada =====
 @app.get("/__which_alarm_events")
 def which_alarm_events():
     import importlib, inspect
@@ -493,10 +389,6 @@ def which_alarm_events():
 
 @app.post("/__diag_publish")
 def __diag_publish(payload: dict = Body(...)):
-    """
-    Empuja un evento a alarm_events._notify(payload).
-    Útil para probar el template de Telegram sin depender de otros módulos.
-    """
     try:
         from app.services import alarm_events
         alarm_events._notify(payload)
