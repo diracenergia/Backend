@@ -1,14 +1,15 @@
 # app/routes/history.py
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Path, Query, HTTPException
 from typing import Optional, Dict, Any, List, Literal
 from decimal import Decimal
 
+from fastapi import APIRouter, Depends, Path, Query, HTTPException
 from psycopg.rows import dict_row
 
 from app.core.security import device_id_dep
-from app.auth.deps import conn_with_rls
+from app.core.db import get_conn
+from app.core.tenancy import require_org
 
 router = APIRouter(prefix="/tanks", tags=["history"])
 
@@ -50,19 +51,19 @@ def history_tank(
     flat: bool = Query(True, description="Si true, devuelve solo el array de lecturas (compat con front)"),
 
     _=Depends(device_id_dep),
-    conn = Depends(conn_with_rls),
 ):
     """
     Historial de lecturas del tanque `tank_id` **scopeado por organización**.
-    - Valida que el tanque pertenezca a `current_setting('app.org_id')`.
+    - Valida que el tanque pertenezca a la org actual.
     - Filtra por `since/until` (o `date_from/date_to`).
     - Respeta `order`, `limit` y `offset`.
     """
+    org_id = require_org()
     df = since or date_from
     dt = until or date_to
     ord_sql = "ASC" if str(order).lower() == "asc" else "DESC"
 
-    with conn.cursor(row_factory=dict_row) as cur:
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         # 1) Validar acceso del tanque por org y (opcionalmente) obtener capacity_m3
         cur.execute(
             """
@@ -70,9 +71,9 @@ def history_tank(
             FROM public.tanks t
             JOIN public.locations l ON l.id = t.location_id
             WHERE t.id = %s
-              AND l.org_id = current_setting('app.org_id')::bigint
+              AND l.org_id = %s
             """,
-            (tank_id,),
+            (tank_id, org_id),
         )
         trow = cur.fetchone()
         if not trow:
@@ -81,7 +82,6 @@ def history_tank(
         capacity_m3: Optional[float] = _to_float(trow.get("capacity_m3")) if include_capacity else None
 
         # 2) Leer historial desde tank_readings con filtros opcionales
-        #    (si usás particiones o una vista dedicada, podés cambiar aquí)
         params: List[Any] = [tank_id]
         where = ["tank_id = %s"]
 

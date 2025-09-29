@@ -1,14 +1,15 @@
 # app/routes/latest.py
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Path, Query, HTTPException
 from typing import Optional, Dict, Any
 from decimal import Decimal
 
+from fastapi import APIRouter, Depends, Path, Query, HTTPException
 from psycopg.rows import dict_row
 
 from app.core.security import device_id_dep
-from app.auth.deps import conn_with_rls
+from app.core.db import get_conn
+from app.core.tenancy import require_org
 
 router = APIRouter(prefix="/tanks", tags=["latest"])
 
@@ -37,25 +38,26 @@ def latest_tank(
     tank_id: int = Path(..., ge=1),
     include_capacity: bool = Query(True, description="Incluir capacity_m3 en la respuesta"),
     _=Depends(device_id_dep),
-    conn = Depends(conn_with_rls),
 ):
     """
     Última lectura de un tanque **scopeada por organización**.
-    - Valida que el `tank_id` pertenezca a la `org` actual (derivada del JWT).
+    - Valida que el `tank_id` pertenezca a la `org` actual (derivada del JWT/headers).
     - Si no hay lecturas, devuelve `has_data = False` (HTTP 200).
     - Si `include_capacity = true`, incluye `capacity_m3` y se usa para estimar volumen.
     """
-    with conn.cursor(row_factory=dict_row) as cur:
-        # 1) Validar que el tanque pertenezca a la org actual y (de paso) leer capacity_m3
+    org_id = require_org()
+
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        # 1) Validar que el tanque pertenezca a la org actual y leer capacity_m3
         cur.execute(
             """
             SELECT t.id, t.capacity_m3
             FROM public.tanks t
             JOIN public.locations l ON l.id = t.location_id
             WHERE t.id = %s
-              AND l.org_id = current_setting('app.org_id')::bigint
+              AND l.org_id = %s
             """,
-            (tank_id,),
+            (tank_id, org_id),
         )
         tank_row = cur.fetchone()
         if not tank_row:
@@ -72,13 +74,17 @@ def latest_tank(
                 SELECT id, tank_id, ts, level_percent, volume_l, temperature_c, device_id, raw_json
                 FROM public.v_tank_latest
                 WHERE tank_id = %s
+                LIMIT 1
                 """,
                 (tank_id,),
             )
             r = cur.fetchone()
             row = dict(r) if r else None
         except Exception:
-            # Fallback si la vista no existe en este deploy
+            row = None
+
+        if row is None:
+            # Fallback si la vista no existe o no tiene datos
             cur.execute(
                 """
                 SELECT id, tank_id, ts, level_percent, volume_l, temperature_c, device_id, raw_json

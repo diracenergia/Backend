@@ -102,7 +102,7 @@ def _apply_rls_context(conn: "psycopg.Connection") -> None:
 
         # IMPORTANTE: set_config recibe strings
         if org_id is not None:
-            cur.execute("SELECT set_config('app.org_id', %s, true)", (str(int(org_id)),))
+            cur.execute("SELECT set_config('app.org_id', %s, false)", (str(int(org_id)),))
         if user_id is not None:
             cur.execute("SELECT set_config('app.user_id', %s, true)", (str(int(user_id)),))
         if role is not None:
