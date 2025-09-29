@@ -13,10 +13,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
+
 from app.routes.control import control_router
-
-
-
 
 # ===== LOGGING GLOBAL =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -62,9 +60,9 @@ from app.ws import router as ws_router
 # Visor en vivo (WS /viz/ws y GET /viz/state)
 from app.routes.live_view import viz_router
 
-#AUTH
+# AUTH
 from app.auth.router import router as auth_router
-from app.auth.deps import conn_with_rls
+from app.auth.deps import conn_with_rls  # (import opcional, por si usás yield conn)
 
 # ===== Config centralizada (pydantic Settings) con fallback a .env =====
 try:
@@ -90,7 +88,46 @@ APP_TITLE = _get_env("APP_TITLE", "ESP32 Tank/Pump API")
 APP_VERSION = _get_env("APP_VERSION", "") or _get_env("RENDER_GIT_COMMIT", "")[:8]
 app = FastAPI(title=APP_TITLE, version=APP_VERSION or None)
 
-# ===== Middleware de LOG de request/response (antes de tenancy para ver TODO) =====
+# ===== CORS (debe ir PRIMERO en la cadena) =====
+_raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
+_origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
+
+if _raw == "*":
+    ALLOW_ALL_ORIGINS = True
+    ALLOWED_ORIGINS = ["*"]
+else:
+    ALLOW_ALL_ORIGINS = False
+    ALLOWED_ORIGINS = [o.strip() for o in _raw.split(",") if o.strip()]
+
+ALLOW_CREDENTIALS = False
+ALLOW_METHODS = ["*"]
+ALLOW_HEADERS = ["*"]
+
+print("[CORS] allow_all          =", ALLOW_ALL_ORIGINS)
+print("[CORS] allow_origins      =", ALLOWED_ORIGINS)
+print("[CORS] allow_origin_regex =", _origin_regex or "(none)")
+print("[CORS] allow_credentials  =", ALLOW_CREDENTIALS)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=_origin_regex or None,
+    allow_credentials=ALLOW_CREDENTIALS,
+    allow_methods=ALLOW_METHODS,
+    allow_headers=ALLOW_HEADERS,
+)
+
+# ===== Trusted hosts (opcional) =====
+_trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
+TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
+if TRUSTED_HOSTS:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
+    print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
+
+# ===== Compresión =====
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+# ===== Middleware de LOG de request/response (después de CORS) =====
 class LoggingMiddleware(BaseHTTPMiddleware):
     def __init__(self, app):
         super().__init__(app)
@@ -134,48 +171,8 @@ class LoggingMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(LoggingMiddleware)
 
-# ===== CORS =====
-_raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
-_origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
-
-if _raw == "*":
-    ALLOW_ALL_ORIGINS = True
-    ALLOWED_ORIGINS = ["*"]
-else:
-    ALLOW_ALL_ORIGINS = False
-    ALLOWED_ORIGINS = [o.strip() for o in _raw.split(",") if o.strip()]
-
-ALLOW_CREDENTIALS = False
-ALLOW_METHODS = ["*"]
-ALLOW_HEADERS = ["*"]
-
-print("[CORS] allow_all          =", ALLOW_ALL_ORIGINS)
-print("[CORS] allow_origins      =", ALLOWED_ORIGINS)
-print("[CORS] allow_origin_regex =", _origin_regex or "(none)")
-print("[CORS] allow_credentials  =", ALLOW_CREDENTIALS)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=_origin_regex or None,
-    allow_credentials=ALLOW_CREDENTIALS,
-    allow_methods=ALLOW_METHODS,
-    allow_headers=ALLOW_HEADERS,
-)
-
-# ===== Trusted hosts (opcional) =====
-_trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
-TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
-if TRUSTED_HOSTS:
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
-    print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
-
-# ===== Compresión =====
-app.add_middleware(GZipMiddleware, minimum_size=1024)
-
 # ===== Contexto multi-tenant (RLS) =====
 from app.core.tenancy import tenant_ctx_dep
-
 
 app.include_router(control_router)
 
@@ -184,11 +181,12 @@ _PUBLIC_PATHS = {
     "/__config", "/openapi.json", "/docs", "/redoc",
     "/__alarm_poller_status", "/__which_alarms_eval", "/__which_alarm_events",
 }
-_PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws", "/ingest", "/infra")
+# Agregamos "/auth" para que /auth/login sea público (sin tenant)
+_PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws", "/ingest", "/infra", "/auth")
 
 @app.middleware("http")
 async def _tenant_context_middleware(request: Request, call_next):
-    # Preflight CORS: dejar pasar
+    # Preflight CORS: dejar pasar (CORSMiddleware lo maneja)
     if request.method == "OPTIONS":
         return await call_next(request)
 
@@ -259,12 +257,10 @@ app.include_router(ws_router)
 app.include_router(kpi_router)
 
 # Rutas de auth (login)
-app.include_router(auth_router, prefix="")  # o sin prefix si ya tiene /auth en el router
-
+app.include_router(auth_router, prefix="")  # el router ya define /auth/...
 
 # Visor en vivo (estado + websocket)
 app.include_router(viz_router)
-
 
 # ===== Endpoints utilitarios =====
 from app.core.db import get_conn
