@@ -1,12 +1,16 @@
 # app/routes/locations.py
+from __future__ import annotations
+
 from collections import defaultdict
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Header
+from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
 from psycopg.rows import dict_row
 
 from app.core.db import get_conn
+from app.auth.deps import conn_with_rls
+from app.core.security import device_id_dep
 from app.schemas.infra import (
     Location, LocationWithStats, AssetGroup, AssetItem,
     LocationSummary, LocationTree, AssetType
@@ -24,14 +28,6 @@ class AssetLoc(BaseModel):
     location: Optional[Location] = None
 
 
-def _set_org(cur, org_id: int | None):
-    """
-    Satisface el RLS de la DB: requiere app.org_id configurado por sesión.
-    Si no viene header, usa 1 por defecto.
-    """
-    cur.execute("select set_config('app.org_id', %s, true);", (str(org_id or 1),))
-
-
 # ------------------------------------------------------------
 # GET /infra/asset-locations
 # Mapa plano asset → location (incluye huérfanos con location=null)
@@ -47,7 +43,8 @@ def list_asset_locations(
         default=None,
         description="Filtra por location_id. Si no se pasa, devuelve todos (incluye null)."
     ),
-    x_org_id: Optional[int] = Header(default=None, alias="x-org-id"),
+    _dev=Depends(device_id_dep),
+    conn=Depends(conn_with_rls),
 ):
     base_sql = """
     SELECT
@@ -75,8 +72,7 @@ def list_asset_locations(
 
     base_sql += " ORDER BY l.name NULLS LAST, n.type, n.asset_id;"
 
-    with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
-        _set_org(cur, x_org_id)
+    with conn.cursor(row_factory=dict_row) as cur:
         if params:
             cur.execute(base_sql, params)
         else:
@@ -99,23 +95,22 @@ def list_asset_locations(
 @router.get("/locations", response_model=List[Location])
 def list_locations(
     with_stats: bool = Query(False),
-    x_org_id: Optional[int] = Header(default=None, alias="x-org-id"),
+    _dev=Depends(device_id_dep),
+    conn=Depends(conn_with_rls),
 ):
     """
     Lista de locations. Si with_stats=true, devuelve conteos y alarmas.
     """
-    with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
-        _set_org(cur, x_org_id)
-
+    with conn.cursor(row_factory=dict_row) as cur:
         if not with_stats:
             cur.execute("""
                 SELECT id, code, name
                 FROM public.locations
+                WHERE org_id = current_setting('app.org_id')::bigint
                 ORDER BY name;
             """)
             return cur.fetchall()
         else:
-            # devolvemos LocationWithStats pero FastAPI lo serializa igual
             cur.execute("""
                 WITH counts AS (
                   SELECT
@@ -126,6 +121,8 @@ def list_locations(
                     count(*) FILTER (WHERE al.asset_type='valve')    AS valves_count,
                     count(*) FILTER (WHERE al.asset_type='manifold') AS manifolds_count
                   FROM public.asset_locations al
+                  JOIN public.locations l ON l.id = al.location_id
+                  WHERE l.org_id = current_setting('app.org_id')::bigint
                   GROUP BY al.location_id
                 ),
                 alarms AS (
@@ -136,20 +133,23 @@ def list_locations(
                   FROM public.alarms a
                   JOIN public.asset_locations al
                     ON al.asset_type=a.asset_type AND al.asset_id=a.asset_id
+                  JOIN public.locations l ON l.id = al.location_id
+                  WHERE l.org_id = current_setting('app.org_id')::bigint
                   GROUP BY al.location_id
                 )
                 SELECT
                   l.id, l.code, l.name,
-                  COALESCE(c.assets_total,0)        AS assets_total,
-                  COALESCE(c.tanks_count,0)         AS tanks_count,
-                  COALESCE(c.pumps_count,0)         AS pumps_count,
-                  COALESCE(c.valves_count,0)        AS valves_count,
-                  COALESCE(c.manifolds_count,0)     AS manifolds_count,
-                  COALESCE(am.alarms_active,0)      AS alarms_active,
+                  COALESCE(c.assets_total,0)            AS assets_total,
+                  COALESCE(c.tanks_count,0)             AS tanks_count,
+                  COALESCE(c.pumps_count,0)             AS pumps_count,
+                  COALESCE(c.valves_count,0)            AS valves_count,
+                  COALESCE(c.manifolds_count,0)         AS manifolds_count,
+                  COALESCE(am.alarms_active,0)          AS alarms_active,
                   COALESCE(am.alarms_critical_active,0) AS alarms_critical_active
                 FROM public.locations l
                 LEFT JOIN counts c ON c.location_id = l.id
                 LEFT JOIN alarms am ON am.location_id = l.id
+                WHERE l.org_id = current_setting('app.org_id')::bigint
                 ORDER BY l.name;
             """)
             rows = cur.fetchall()
@@ -170,7 +170,8 @@ def location_assets(
         default=None,
         description="Filtra tipos: repetir ?include=tank&include=pump"
     ),
-    x_org_id: Optional[int] = Header(default=None, alias="x-org-id"),
+    _dev=Depends(device_id_dep),
+    conn=Depends(conn_with_rls),
 ):
     """
     Devuelve [{type: 'tank', items: [...]}, ...] para que el front pinte grupos.
@@ -178,11 +179,12 @@ def location_assets(
     valid: set[str] = {'tank','pump','valve','manifold'}
     inc = set(include) & valid if include else None
 
-    with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
-        _set_org(cur, x_org_id)
-
-        # Verificamos que exista la location (bajo RLS)
-        cur.execute("SELECT 1 FROM public.locations WHERE id=%s;", (loc_id,))
+    with conn.cursor(row_factory=dict_row) as cur:
+        # Verificamos que exista la location en la org del token
+        cur.execute(
+            "SELECT 1 FROM public.locations WHERE id=%s AND org_id=current_setting('app.org_id')::bigint;",
+            (loc_id,),
+        )
         if cur.fetchone() is None:
             raise HTTPException(404, "location not found")
 
@@ -190,9 +192,11 @@ def location_assets(
             cur.execute("""
                 SELECT al.asset_type, al.asset_id, COALESCE(n.name, CONCAT(al.asset_type,' ',al.asset_id)) AS name, n.code
                 FROM public.asset_locations al
+                JOIN public.locations l ON l.id = al.location_id
                 LEFT JOIN public.v_asset_nodes n
                   ON n.type = al.asset_type AND n.asset_id = al.asset_id
                 WHERE al.location_id = %s
+                  AND l.org_id = current_setting('app.org_id')::bigint
                   AND al.asset_type = ANY(%s)
                 ORDER BY al.asset_type, name;
             """, (loc_id, list(inc)))
@@ -200,9 +204,11 @@ def location_assets(
             cur.execute("""
                 SELECT al.asset_type, al.asset_id, COALESCE(n.name, CONCAT(al.asset_type,' ',al.asset_id)) AS name, n.code
                 FROM public.asset_locations al
+                JOIN public.locations l ON l.id = al.location_id
                 LEFT JOIN public.v_asset_nodes n
                   ON n.type = al.asset_type AND n.asset_id = al.asset_id
                 WHERE al.location_id = %s
+                  AND l.org_id = current_setting('app.org_id')::bigint
                 ORDER BY al.asset_type, name;
             """, (loc_id,))
 
@@ -223,17 +229,29 @@ def location_assets(
     "/locations/{loc_id}/summary",
     response_model=LocationSummary
 )
-def location_summary(loc_id: int, x_org_id: Optional[int] = Header(default=None, alias="x-org-id")):
+def location_summary(
+    loc_id: int,
+    _dev=Depends(device_id_dep),
+    conn=Depends(conn_with_rls),
+):
     """
     Lee la vista v_location_summary_30d (LATERAL + last_seen histórico).
     """
-    with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
-        _set_org(cur, x_org_id)
+    with conn.cursor(row_factory=dict_row) as cur:
+        # Chequeamos pertenencia de la location a la org del token
+        cur.execute(
+            "SELECT 1 FROM public.locations WHERE id=%s AND org_id=current_setting('app.org_id')::bigint;",
+            (loc_id,),
+        )
+        if cur.fetchone() is None:
+            raise HTTPException(404, "location not found")
+
         cur.execute("""
           SELECT * FROM public.v_location_summary_30d WHERE location_id=%s;
         """, (loc_id,))
         row = cur.fetchone()
         if not row:
+            # Si la vista no trae fila, igual es 404 para esa org
             raise HTTPException(404, "location not found")
         return row
 
@@ -246,12 +264,22 @@ def location_summary(loc_id: int, x_org_id: Optional[int] = Header(default=None,
     "/locations/{loc_id}/tree",
     response_model=LocationTree
 )
-def location_tree(loc_id: int, x_org_id: Optional[int] = Header(default=None, alias="x-org-id")):
+def location_tree(
+    loc_id: int,
+    _dev=Depends(device_id_dep),
+    conn=Depends(conn_with_rls),
+):
     """
     Paquete completo para el front: location + summary + assets agrupados.
     """
-    with get_conn() as c, c.cursor(row_factory=dict_row) as cur:
-        _set_org(cur, x_org_id)
+    with conn.cursor(row_factory=dict_row) as cur:
+        # Verificamos que la location sea de la org del token
+        cur.execute(
+            "SELECT id FROM public.locations WHERE id=%s AND org_id=current_setting('app.org_id')::bigint;",
+            (loc_id,),
+        )
+        if cur.fetchone() is None:
+            raise HTTPException(404, "location not found")
 
         # summary + datos de location
         cur.execute("SELECT * FROM public.v_location_summary_30d WHERE location_id=%s;", (loc_id,))
@@ -263,9 +291,11 @@ def location_tree(loc_id: int, x_org_id: Optional[int] = Header(default=None, al
         cur.execute("""
             SELECT al.asset_type, al.asset_id, COALESCE(n.name, CONCAT(al.asset_type,' ',al.asset_id)) AS name, n.code
             FROM public.asset_locations al
+            JOIN public.locations l ON l.id = al.location_id
             LEFT JOIN public.v_asset_nodes n
               ON n.type = al.asset_type AND n.asset_id = al.asset_id
             WHERE al.location_id = %s
+              AND l.org_id = current_setting('app.org_id')::bigint
             ORDER BY al.asset_type, name;
         """, (loc_id,))
         rows = cur.fetchall()
