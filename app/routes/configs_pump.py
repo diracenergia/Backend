@@ -1,198 +1,82 @@
-from __future__ import annotations
+# app/routes/configs_pump.py
+from fastapi import APIRouter, Depends, Request
+from app.deps import get_db  # tu helper para obtener conexión
+from app.auth import require_auth  # middleware/dep que setea request.state.org_id
 
-from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Path
-from psycopg.rows import dict_row
+router = APIRouter(prefix="/pumps", tags=["pumps"])
 
-from app.auth.deps import conn_with_rls
-
-router = APIRouter(prefix="/pumps", tags=["pump-config"])
-
-# ------------------------------------------------------------------------------
-# LIST: /pumps/config
-# Devuelve SOLO bombas de la org actual (RLS) + su config + location
-# El scope se garantiza por locations.org_id (vía asset_locations)
-# ------------------------------------------------------------------------------
 @router.get("/config")
-def list_pumps_config(conn = Depends(conn_with_rls)) -> List[Dict[str, Any]]:
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(
-            """
+def list_pumps_config(request: Request, db = Depends(get_db), user=Depends(require_auth)):
+    org_id = int(getattr(request.state, "org_id", 0))  # viene del JWT (payload.org_id)
+    if not org_id:
+        # si querés soportar modo legacy sin login:
+        org_id = int(request.headers.get("x-org-id", "0") or 0)
+    if not org_id:
+        return []  # o lanzar 401/403
+
+    with db.cursor() as cur:
+        cur.execute("""
             SELECT
-              p.id                              AS pump_id,
-              COALESCE(n.name, p.name, CONCAT('Bomba ', p.id)) AS pump_name,
-              p.model,
-              p.max_flow_lpm,
-              p.drive_type,
-              cfg.remote_enabled,
-              cfg.vfd_min_speed_pct,
-              cfg.vfd_max_speed_pct,
-              cfg.vfd_default_speed_pct,
-              l.id                               AS location_id,
-              l.code                             AS location_code,
-              l.name                             AS location_name
+                p.id AS pump_id,
+                COALESCE(p.name, p.code) AS pump_name,
+                p.model,
+                p.max_flow_lpm,
+
+                cfg.remote_enabled,
+                cfg.drive_type,
+                cfg.vfd_min_speed_pct,
+                cfg.vfd_max_speed_pct,
+                cfg.vfd_default_speed_pct,
+
+                al.location_id,
+                l.code AS location_code,
+                l.name AS location_name
             FROM public.pumps p
-            -- nombre/código opcional desde el grafo (si existe)
-            LEFT JOIN public.v_asset_nodes n
-              ON n.type = 'pump' AND n.asset_id = p.id
-            -- mapeo asset → location
-            JOIN public.asset_locations al
-              ON al.asset_type = 'pump' AND al.asset_id = p.id
-            JOIN public.locations l
-              ON l.id = al.location_id
-            -- config (puede no existir)
+            -- config (opcional, por org)
             LEFT JOIN public.pump_configs cfg
-              ON cfg.pump_id = p.id
-            WHERE l.org_id = current_setting('app.org_id')::bigint
-            ORDER BY l.name, pump_name, p.id;
-            """
-        )
-        return [dict(r) for r in cur.fetchall()]
+                   ON cfg.pump_id = p.id
+                  AND cfg.org_id  = %(org_id)s
+            -- ubicación (si existe)
+            LEFT JOIN public.asset_locations al
+                   ON al.asset_type = 'pump'
+                  AND al.asset_id   = p.id
+            LEFT JOIN public.locations l
+                   ON l.id = al.location_id
 
-# ------------------------------------------------------------------------------
-# GET ONE: /pumps/{pump_id}/config
-# Valida pertenencia del asset a la org; si no, 404
-# ------------------------------------------------------------------------------
-@router.get("/{pump_id}/config")
-def get_pump_config(
-    pump_id: int = Path(..., ge=1),
-    conn = Depends(conn_with_rls),
-) -> Dict[str, Any]:
-    with conn.cursor(row_factory=dict_row) as cur:
-        # valida org
-        cur.execute(
-            """
-            SELECT 1
-            FROM public.pumps p
-            JOIN public.asset_locations al
-              ON al.asset_type='pump' AND al.asset_id=p.id
-            JOIN public.locations l
-              ON l.id = al.location_id
-            WHERE p.id = %s
-              AND l.org_id = current_setting('app.org_id')::bigint;
-            """,
-            (pump_id,),
-        )
-        if cur.fetchone() is None:
-            raise HTTPException(status_code=404, detail="pump not found")
+            WHERE
+              -- Si tu tabla pumps tiene org_id, esta línea basta:
+              (p.org_id = %(org_id)s)
+              OR
+              -- si NO lo tiene, filtramos por pertenencia a una location de la org:
+              EXISTS (
+                SELECT 1
+                FROM public.asset_locations al2
+                JOIN public.locations l2 ON l2.id = al2.location_id
+                WHERE al2.asset_type = 'pump'
+                  AND al2.asset_id   = p.id
+                  AND l2.org_id      = %(org_id)s
+              )
 
-        # trae payload unificado
-        cur.execute(
-            """
-            SELECT
-              p.id                              AS pump_id,
-              COALESCE(n.name, p.name, CONCAT('Bomba ', p.id)) AS pump_name,
-              p.model,
-              p.max_flow_lpm,
-              p.drive_type,
-              cfg.remote_enabled,
-              cfg.vfd_min_speed_pct,
-              cfg.vfd_max_speed_pct,
-              cfg.vfd_default_speed_pct,
-              l.id                               AS location_id,
-              l.code                             AS location_code,
-              l.name                             AS location_name
-            FROM public.pumps p
-            LEFT JOIN public.v_asset_nodes n
-              ON n.type = 'pump' AND n.asset_id = p.id
-            JOIN public.asset_locations al
-              ON al.asset_type='pump' AND al.asset_id=p.id
-            JOIN public.locations l
-              ON l.id = al.location_id
-            LEFT JOIN public.pump_configs cfg
-              ON cfg.pump_id = p.id
-            WHERE p.id = %s
-              AND l.org_id = current_setting('app.org_id')::bigint;
-            """,
-            (pump_id,),
-        )
-        row = cur.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="pump not found")
-        return dict(row)
+            ORDER BY l.name NULLS FIRST, p.name NULLS LAST, p.id
+        """, {"org_id": org_id})
 
-# ------------------------------------------------------------------------------
-# UPSERT: /pumps/{pump_id}/config (PUT/POST)
-# Si llega drive_type, lo guardamos en pumps; el resto en pump_configs
-# ------------------------------------------------------------------------------
-def _bool(v: Optional[Any]) -> Optional[bool]:
-    if v is None: return None
-    if isinstance(v, bool): return v
-    s = str(v).strip().lower()
-    if s in {"true","1","t","yes","y","on"}: return True
-    if s in {"false","0","f","no","n","off"}: return False
-    return None
+        rows = cur.fetchall()
 
-def _num(v: Optional[Any]) -> Optional[float]:
-    if v is None: return None
-    try: return float(v)
-    except: return None
-
-def _upsert_pump_config(conn, pump_id: int, body: Dict[str, Any]) -> Dict[str, Any]:
-    rem = _bool(body.get("remote_enabled"))
-    dtyp = body.get("drive_type")
-    vmin = _num(body.get("vfd_min_speed_pct"))
-    vmax = _num(body.get("vfd_max_speed_pct"))
-    vdef = _num(body.get("vfd_default_speed_pct"))
-
-    with conn.cursor(row_factory=dict_row) as cur:
-        # valida org (mismo check que GET)
-        cur.execute(
-            """
-            SELECT l.org_id
-            FROM public.pumps p
-            JOIN public.asset_locations al
-              ON al.asset_type='pump' AND al.asset_id=p.id
-            JOIN public.locations l
-              ON l.id = al.location_id
-            WHERE p.id = %s
-              AND l.org_id = current_setting('app.org_id')::bigint;
-            """,
-            (pump_id,),
-        )
-        if cur.fetchone() is None:
-            raise HTTPException(status_code=404, detail="pump not found")
-
-        # si vino drive_type, actualizamos la bomba
-        if dtyp is not None:
-            cur.execute(
-                "UPDATE public.pumps SET drive_type=%s WHERE id=%s;",
-                (dtyp, pump_id)
-            )
-
-        # upsert en pump_configs
-        cur.execute(
-            """
-            INSERT INTO public.pump_configs
-              (pump_id, remote_enabled, vfd_min_speed_pct, vfd_max_speed_pct, vfd_default_speed_pct)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (pump_id) DO UPDATE SET
-              remote_enabled       = EXCLUDED.remote_enabled,
-              vfd_min_speed_pct    = EXCLUDED.vfd_min_speed_pct,
-              vfd_max_speed_pct    = EXCLUDED.vfd_max_speed_pct,
-              vfd_default_speed_pct= EXCLUDED.vfd_default_speed_pct
-            RETURNING pump_id, remote_enabled, vfd_min_speed_pct, vfd_max_speed_pct, vfd_default_speed_pct;
-            """,
-            (pump_id, rem, vmin, vmax, vdef),
-        )
-        cfg = dict(cur.fetchone())
-
-        conn.commit()
-
-    return {"ok": True, "config": cfg}
-
-@router.put("/{pump_id}/config")
-def put_pump_config(
-    pump_id: int = Path(..., ge=1),
-    body: Dict[str, Any] = None,
-    conn = Depends(conn_with_rls),
-):
-    return _upsert_pump_config(conn, pump_id, body or {})
-
-@router.post("/{pump_id}/config")
-def post_pump_config(
-    pump_id: int = Path(..., ge=1),
-    body: Dict[str, Any] = None,
-    conn = Depends(conn_with_rls),
-):
-    return _upsert_pump_config(conn, pump_id, body or {})
+    # mapeo simple a JSON
+    result = []
+    for r in rows:
+        result.append({
+            "pump_id": r[0],
+            "pump_name": r[1],
+            "model": r[2],
+            "max_flow_lpm": r[3],
+            "remote_enabled": r[4],
+            "drive_type": r[5],
+            "vfd_min_speed_pct": r[6],
+            "vfd_max_speed_pct": r[7],
+            "vfd_default_speed_pct": r[8],
+            "location_id": r[9],
+            "location_code": r[10],
+            "location_name": r[11],
+        })
+    return result
