@@ -12,7 +12,17 @@ from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.exceptions import ClientDisconnect
+
+# === Import robusto para ClientDisconnect (Starlette moderno -> requests; viejo -> exceptions)
+try:
+    from starlette.requests import ClientDisconnect  # Starlette >= ~0.14 en adelante
+except Exception:
+    try:
+        from starlette.exceptions import ClientDisconnect  # fallback p/ versiones antiguas
+    except Exception:  # último fallback: definimos la clase para evitar NameError
+        class ClientDisconnect(Exception):
+            pass
+
 import anyio
 
 # Routers varios
@@ -41,7 +51,7 @@ from app.ws import router as ws_router
 from app.routes.live_view import viz_router
 
 from app.auth.router import router as auth_router
-from app.auth.deps import conn_with_rls  # noqa: F401 (puede no usarse directamente)
+from app.auth.deps import conn_with_rls  # noqa: F401
 
 # ===== LOGGING GLOBAL =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
