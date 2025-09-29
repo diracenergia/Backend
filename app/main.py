@@ -62,6 +62,9 @@ from app.ws import router as ws_router
 # Visor en vivo (WS /viz/ws y GET /viz/state)
 from app.routes.live_view import viz_router
 
+#AUTH
+from app.auth.router import router as auth_router
+from app.auth.deps import conn_with_rls
 
 # ===== Config centralizada (pydantic Settings) con fallback a .env =====
 try:
@@ -255,7 +258,8 @@ app.include_router(ws_router)
 # KPI
 app.include_router(kpi_router)
 
-# INFRA
+# Rutas de auth (login)
+app.include_router(auth_router, prefix="")  # o sin prefix si ya tiene /auth en el router
 
 
 # Visor en vivo (estado + websocket)
