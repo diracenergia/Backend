@@ -74,10 +74,12 @@ except Exception:
     except Exception:
         pass
 
+
 def _get_env(name: str, default: str = "") -> str:
     if settings and hasattr(settings, name):
         return str(getattr(settings, name))
     return os.getenv(name, default)
+
 
 APP_TITLE = _get_env("APP_TITLE", "ESP32 Tank/Pump API")
 APP_VERSION = _get_env("APP_VERSION", "") or _get_env("RENDER_GIT_COMMIT", "")[:8]
@@ -101,7 +103,7 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         }
 
         body_text = None
-        if (request.url.path, request.method) in {("/ingest/tank","POST"), ("/ingest/pump","POST")}:
+        if (request.url.path, request.method) in {("/ingest/tank", "POST"), ("/ingest/pump", "POST")}:
             try:
                 body_bytes = await request.body()
                 body_text = body_bytes.decode("utf-8")[:2000]
@@ -124,6 +126,7 @@ class LoggingMiddleware(BaseHTTPMiddleware):
             self._log.exception(f"[ERR] {request.method} {request.url.path} crashed")
             raise
 
+
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(LoggingMiddleware)
 
@@ -135,8 +138,9 @@ _PUBLIC_PATHS = {
     "/__config", "/openapi.json", "/docs", "/redoc",
     "/__alarm_poller_status", "/__which_alarms_eval", "/__which_alarm_events",
 }
-# Agregamos "/auth" para login público
-_PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws", "/ingest", "/infra", "/auth")
+# ⚠️ Importante: NO incluir "/infra" acá para que aplique el tenant_ctx_dep a esos endpoints
+_PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws", "/ingest", "/auth")
+
 
 class TenantContextMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -160,6 +164,7 @@ class TenantContextMiddleware(BaseHTTPMiddleware):
             return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
 
         return await call_next(request)
+
 
 app.add_middleware(TenantContextMiddleware)
 
@@ -230,6 +235,7 @@ except Exception as e:
 app.include_router(alarms_router)
 app.include_router(audit_router)
 
+# Infra graph bajo /infra (pasa por TenantContextMiddleware)
 app.include_router(graph_router, prefix="/infra", tags=["infra-graph"])
 app.include_router(locations_router)
 
@@ -242,6 +248,7 @@ app.include_router(viz_router)
 # ===== Utilitarios =====
 from app.core.db import get_conn
 
+
 @app.get("/")
 def root():
     return {
@@ -252,13 +259,16 @@ def root():
         "health": "/health",
     }
 
+
 @app.get("/favicon.ico")
 def favicon_noop():
     return {}
 
+
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 @app.get("/health/db")
 def health_db():
@@ -269,6 +279,7 @@ def health_db():
         return {"ok": True, "db": "up"}
     except Exception as e:
         raise HTTPException(500, f"DB error: {e}")
+
 
 @app.get("/__config")
 def cfg_echo():
@@ -283,6 +294,7 @@ def cfg_echo():
         "version": APP_VERSION or None,
     }
 
+
 @app.get("/__tg_env")
 def tg_env():
     token = _get_env("TELEGRAM_BOT_TOKEN", "")
@@ -291,6 +303,7 @@ def tg_env():
         "BOT_head": (token[:8] + "...") if token else "",
         "CHAT": _get_env("TELEGRAM_CHAT_ID", ""),
     }
+
 
 # ===== Conexión (diagnóstico) =====
 try:
@@ -309,6 +322,7 @@ except Exception as e:
     stop_alarm_poller = None
     _HAS_ALARM_POLLER = False
 
+
 @app.on_event("startup")
 def _startup_listeners():
     if _HAS_ALARM_POLLER and callable(start_alarm_poller):
@@ -318,6 +332,7 @@ def _startup_listeners():
         except Exception as e:
             print(f"⚠️ error al iniciar alarm-poller: {e}")
 
+
 @app.on_event("shutdown")
 def _shutdown_listeners():
     if _HAS_ALARM_POLLER and callable(stop_alarm_poller):
@@ -326,6 +341,7 @@ def _shutdown_listeners():
             print("[alarm-poller] stopped")
         except Exception as e:
             print(f"⚠️ error al detener alarm-poller: {e}")
+
 
 @app.get("/__alarm_poller_status")
 def poller_status():
@@ -341,6 +357,7 @@ def poller_status():
         "sleep_busy": getattr(ap, "SLEEP_BUSY", None),
     }
 
+
 @app.post("/__alarm_poller_stop")
 def poller_stop():
     if _HAS_ALARM_POLLER and callable(stop_alarm_poller):
@@ -350,6 +367,7 @@ def poller_stop():
         except Exception as e:
             return {"stopped": False, "error": str(e)}
     return {"stopped": False, "error": "poller no disponible"}
+
 
 @app.get("/__which_alarms_eval")
 def which_alarms_eval():
@@ -364,6 +382,7 @@ def which_alarms_eval():
         }
     except Exception as e:
         return {"error": str(e)}
+
 
 @app.get("/__which_alarm_events")
 def which_alarm_events():
@@ -381,10 +400,11 @@ def which_alarm_events():
             "file": getattr(mod, "__file__", None),
             "version": getattr(mod, "__VERSION__", None),
             "uses_pg_notify": uses_pg,
-            "notify_src_preview": preview
+            "notify_src_preview": preview,
         }
     except Exception as e:
         return {"error": str(e)}
+
 
 @app.post("/__diag_publish")
 def __diag_publish(payload: dict = Body(...)):
@@ -394,3 +414,21 @@ def __diag_publish(payload: dict = Body(...)):
         return {"ok": True, "published": payload}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"publish failed: {e}")
+
+
+# ===== Debug de tenancy para /infra =====
+@app.get("/infra/__org_echo")
+def _infra_org_echo():
+    """
+    Devuelve el org_id que quedó seteado en el GUC 'app.org_id' para esta request.
+    Útil para verificar que el TenantContextMiddleware está aplicando en /infra/*.
+    """
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT current_setting('app.org_id', true)")
+            raw = cur.fetchone()
+            val = (raw[0] if raw else None)
+            org_id = int(val) if val not in (None, "",) else None
+        return {"org_id": org_id}
+    except Exception as e:
+        raise HTTPException(500, f"org_echo failed: {e}")
