@@ -1,10 +1,9 @@
-# app/routes/history.py
 from __future__ import annotations
 
+from fastapi import APIRouter, Depends, Path, Query, HTTPException
 from typing import Optional, Dict, Any, List, Literal
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, Path, Query, HTTPException
 from psycopg.rows import dict_row
 
 from app.core.security import device_id_dep
@@ -12,7 +11,6 @@ from app.core.db import get_conn
 from app.core.tenancy import require_org
 
 router = APIRouter(prefix="/tanks", tags=["history"])
-
 
 def _to_float(v: Optional[Any]) -> Optional[float]:
     if v is None:
@@ -24,54 +22,43 @@ def _to_float(v: Optional[Any]) -> Optional[float]:
     except Exception:
         return None
 
-
 def _estimate_volume_l(capacity_m3: Optional[float], level_percent: Optional[float]) -> Optional[float]:
     if capacity_m3 is None or level_percent is None:
         return None
     pct = max(0.0, min(100.0, float(level_percent)))
     return round(capacity_m3 * 1000.0 * (pct / 100.0), 3)
 
-
 @router.get("/{tank_id}/history")
 def history_tank(
     tank_id: int = Path(..., ge=1),
-
-    # Aceptamos ambas variantes para compat:
     date_from: Optional[str] = Query(None, description="ISO 8601 o YYYY-MM-DD (alias de 'since')"),
     date_to:   Optional[str] = Query(None, description="ISO 8601 o YYYY-MM-DD (alias de 'until')"),
     since:     Optional[str] = Query(None, description="ISO 8601 o YYYY-MM-DD (preferido)"),
     until:     Optional[str] = Query(None, description="ISO 8601 o YYYY-MM-DD"),
-
     limit: int = Query(500, ge=1, le=5000),
     offset: int = Query(0, ge=0),
-
     order: Literal["asc", "desc"] = Query("asc", description="Orden temporal en la respuesta"),
     include_capacity: bool = Query(True, description="Incluir capacity_m3 en la respuesta"),
     estimate_missing_volume: bool = Query(True, description="Estimar volume_l cuando no hay medición"),
-    flat: bool = Query(True, description="Si true, devuelve solo el array de lecturas (compat con front)"),
-
+    flat: bool = Query(True, description="Si true, devuelve solo el array de lecturas"),
     _=Depends(device_id_dep),
 ):
-    """
-    Historial de lecturas del tanque `tank_id` **scopeado por organización**.
-    - Valida que el tanque pertenezca a la org actual.
-    - Filtra por `since/until` (o `date_from/date_to`).
-    - Respeta `order`, `limit` y `offset`.
-    """
     org_id = require_org()
     df = since or date_from
     dt = until or date_to
     ord_sql = "ASC" if str(order).lower() == "asc" else "DESC"
 
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-        # 1) Validar acceso del tanque por org y (opcionalmente) obtener capacity_m3
+        # validar acceso del tanque por org y (opcionalmente) obtener capacity_m3
         cur.execute(
             """
             SELECT t.id, t.capacity_m3
             FROM public.tanks t
-            JOIN public.locations l ON l.id = t.location_id
-            WHERE t.id = %s
-              AND l.org_id = %s
+            JOIN public.asset_locations al
+              ON al.asset_type='tank' AND al.asset_id=t.id
+            JOIN public.locations l
+              ON l.id = al.location_id
+            WHERE t.id = %s AND l.org_id = %s
             """,
             (tank_id, org_id),
         )
@@ -81,17 +68,15 @@ def history_tank(
 
         capacity_m3: Optional[float] = _to_float(trow.get("capacity_m3")) if include_capacity else None
 
-        # 2) Leer historial desde tank_readings con filtros opcionales
+        # historial
         params: List[Any] = [tank_id]
         where = ["tank_id = %s"]
-
         if df:
             where.append("ts >= %s::timestamptz")
             params.append(df)
         if dt:
             where.append("ts < %s::timestamptz")
             params.append(dt)
-
         params.extend([limit, offset])
 
         sql = f"""
@@ -121,7 +106,7 @@ def history_tank(
         items.append({
             "id": r.get("id"),
             "tank_id": r.get("tank_id"),
-            "ts": r.get("ts"),  # timestamptz → ISO8601
+            "ts": r.get("ts"),
             "level_percent": lvl,
             "volume_l": vol,
             "volume_source": vsrc,
