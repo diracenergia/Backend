@@ -81,7 +81,7 @@ def _filter_edges_by_nodes(raw_edges: List[Dict[str, Any]], node_keys: Set[str])
 def _load_nodes_for_org(cur) -> List[Dict[str, Any]]:
     """
     Carga nodos desde v_asset_nodes **filtrando por org** vía asset_locations.
-    No dependemos de columnas que pueden no existir (location_id en tablas base, etc.)
+    No dependemos de columnas que pueden no existir en tablas base.
     """
     try:
         cur.execute(
@@ -96,20 +96,123 @@ def _load_nodes_for_org(cur) -> List[Dict[str, Any]]:
             """
         )
         rows = cur.fetchall() or []
-        log.info(f"[infra] v_asset_nodes org={rows and 'ok' or 'empty'} count={len(rows)}")
+        log.info(f"[infra] v_asset_nodes org-filter ok count={len(rows)}")
         return rows
     except Exception as ex:
-        log.exception(f"[infra] _load_nodes_for_org fallback (no join): {ex}")
-        # Fallback extremo: sin filtro (NO ideal). Igual recortamos edges más adelante.
-        cur.execute("SELECT * FROM public.v_asset_nodes ORDER BY type, name;")
-        return cur.fetchall() or []
+        # Fallback seguro: NO devolver todo (evitamos fuga entre orgs).
+        log.exception(f"[infra] _load_nodes_for_org failed, returning empty. err={ex}")
+        return []
+
+
+def _load_tank_levels_for(cur, tank_ids: Set[int]) -> Dict[int, Any]:
+    out: Dict[int, Any] = {}
+    if not tank_ids:
+        return out
+
+    # 1) Intentar vista v_tank_latest (si existe)
+    try:
+        cur.execute(
+            """
+            SELECT v.tank_id, v.level_percent
+            FROM public.v_tank_latest v
+            JOIN public.asset_locations al
+              ON al.asset_type = 'tank'
+             AND al.asset_id   = v.tank_id
+            WHERE al.org_id = current_setting('app.org_id')::bigint
+            """
+        )
+        for r in cur.fetchall() or []:
+            tid = _safe_int(r.get("tank_id"))
+            if tid is not None and tid in tank_ids:
+                out[tid] = r.get("level_percent")
+        log.info(f"[infra] tank levels via v_tank_latest ok={len(out)}")
+        return out
+    except Exception as ex:
+        log.warning(f"[infra] v_tank_latest missing; fallback query. err={ex}")
+
+    # 2) Fallback directo sobre tank_readings: último por tanque
+    try:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (tr.tank_id)
+                   tr.tank_id, tr.level_percent
+            FROM public.tank_readings tr
+            JOIN public.asset_locations al
+              ON al.asset_type = 'tank'
+             AND al.asset_id   = tr.tank_id
+            WHERE al.org_id = current_setting('app.org_id')::bigint
+            ORDER BY tr.tank_id, tr.ts DESC
+            """
+        )
+        for r in cur.fetchall() or []:
+            tid = _safe_int(r.get("tank_id"))
+            if tid is not None and tid in tank_ids:
+                out[tid] = r.get("level_percent")
+        log.info(f"[infra] tank levels via fallback ok={len(out)}")
+    except Exception as ex2:
+        log.exception(f"[infra] tank levels fallback failed: {ex2}")
+    return out
+
+
+def _load_pump_status_for(cur, pump_ids: Set[int]) -> Dict[int, Any]:
+    out: Dict[int, Any] = {}
+    if not pump_ids:
+        return out
+
+    # 1) Intentar vista v_pump_latest (o v_latest_pump en algunos dumps)
+    for view_name in ("v_pump_latest", "v_latest_pump"):
+        try:
+            cur.execute(
+                f"""
+                SELECT v.pump_id, v.is_on
+                FROM public.{view_name} v
+                JOIN public.asset_locations al
+                  ON al.asset_type = 'pump'
+                 AND al.asset_id   = v.pump_id
+                WHERE al.org_id = current_setting('app.org_id')::bigint
+                """
+            )
+            rows = cur.fetchall() or []
+            for r in rows:
+                pid = _safe_int(r.get("pump_id"))
+                if pid is not None and pid in pump_ids:
+                    out[pid] = r.get("is_on")
+            if rows:
+                log.info(f"[infra] pump status via {view_name} ok={len(out)}")
+                return out
+        except Exception:
+            # probá siguiente variante
+            continue
+
+    # 2) Fallback directo sobre pump_readings: último por bomba
+    try:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (pr.pump_id)
+                   pr.pump_id, pr.is_on
+            FROM public.pump_readings pr
+            JOIN public.asset_locations al
+              ON al.asset_type = 'pump'
+             AND al.asset_id   = pr.pump_id
+            WHERE al.org_id = current_setting('app.org_id')::bigint
+            ORDER BY pr.pump_id, pr.ts DESC
+            """
+        )
+        for r in cur.fetchall() or []:
+            pid = _safe_int(r.get("pump_id"))
+            if pid is not None and pid in pump_ids:
+                out[pid] = r.get("is_on")
+        log.info(f"[infra] pump status via fallback ok={len(out)}")
+    except Exception as ex2:
+        log.exception(f"[infra] pump status fallback failed: {ex2}")
+    return out
 
 
 # ---------------------------------------------------------------------
 # Debug: ver qué org quedó aplicada en el request
 # ---------------------------------------------------------------------
 
-@router.get("/infra/__org_echo")
+@router.get("/__org_echo")
 def __org_echo(req: Request, _=Depends(device_id_dep), _org_id: int = Depends(require_org)):
     try:
         with get_conn() as conn, conn.cursor() as cur:
@@ -134,7 +237,7 @@ def __org_echo(req: Request, _=Depends(device_id_dep), _org_id: int = Depends(re
 # Graph (combinado)
 # ---------------------------------------------------------------------
 
-@router.get("/infra/graph")
+@router.get("/graph")
 def graph_all(
     _dev=Depends(device_id_dep),
     _org_id: int = Depends(require_org),  # asegura el GUC para todas las consultas
@@ -188,57 +291,34 @@ def graph_all(
             all_edges = cur.fetchall() or []
             raw_edges = _filter_edges_by_nodes(all_edges, node_keys)
 
-            # 3) Payloads: tank_config / v_tank_latest / v_pump_latest por org vía asset_locations
+            # 3) Payloads: tank_config / latest tank & pump por org vía asset_locations
             tank_config: Dict[int, Dict[str, Any]] = {}
             tank_levels: Dict[int, Any] = {}
             pump_statuses: Dict[int, Any] = {}
 
             if tank_ids:
-                cur.execute(
-                    """
-                    SELECT tc.tank_id, tc.low_pct, tc.high_pct, tc.low_low_pct, tc.high_high_pct
-                    FROM public.tank_config tc
-                    JOIN public.asset_locations al
-                      ON al.asset_type = 'tank'
-                     AND al.asset_id   = tc.tank_id
-                    WHERE al.org_id = current_setting('app.org_id')::bigint
-                    """
-                )
-                for r in cur.fetchall() or []:
-                    tid = _safe_int(r.get("tank_id"))
-                    if tid is not None and tid in tank_ids:
-                        tank_config[tid] = r
+                try:
+                    cur.execute(
+                        """
+                        SELECT tc.tank_id, tc.low_pct, tc.high_pct, tc.low_low_pct, tc.high_high_pct
+                        FROM public.tank_config tc
+                        JOIN public.asset_locations al
+                          ON al.asset_type = 'tank'
+                         AND al.asset_id   = tc.tank_id
+                        WHERE al.org_id = current_setting('app.org_id')::bigint
+                        """
+                    )
+                    for r in cur.fetchall() or []:
+                        tid = _safe_int(r.get("tank_id"))
+                        if tid is not None and tid in tank_ids:
+                            tank_config[tid] = r
+                except Exception as ex_tc:
+                    log.warning(f"[infra] tank_config not available or failed: {ex_tc}")
 
-                cur.execute(
-                    """
-                    SELECT v.tank_id, v.level_percent
-                    FROM public.v_tank_latest v
-                    JOIN public.asset_locations al
-                      ON al.asset_type = 'tank'
-                     AND al.asset_id   = v.tank_id
-                    WHERE al.org_id = current_setting('app.org_id')::bigint
-                    """
-                )
-                for r in cur.fetchall() or []:
-                    tid = _safe_int(r.get("tank_id"))
-                    if tid is not None and tid in tank_ids:
-                        tank_levels[tid] = r.get("level_percent")
+                tank_levels = _load_tank_levels_for(cur, tank_ids)
 
             if pump_ids:
-                cur.execute(
-                    """
-                    SELECT v.pump_id, v.is_on
-                    FROM public.v_pump_latest v
-                    JOIN public.asset_locations al
-                      ON al.asset_type = 'pump'
-                     AND al.asset_id   = v.pump_id
-                    WHERE al.org_id = current_setting('app.org_id')::bigint
-                    """
-                )
-                for r in cur.fetchall() or []:
-                    pid = _safe_int(r.get("pump_id"))
-                    if pid is not None and pid in pump_ids:
-                        pump_statuses[pid] = r.get("is_on")
+                pump_statuses = _load_pump_status_for(cur, pump_ids)
 
         # 4) Layouts guardados (por org)
         layout_map = _get_layout_map()
@@ -307,7 +387,7 @@ def graph_all(
 # Graph (endpoints separados)
 # ---------------------------------------------------------------------
 
-@router.get("/infra/graph/nodes")
+@router.get("/graph/nodes")
 def graph_nodes(
     _dev=Depends(device_id_dep),
     _org_id: int = Depends(require_org),
@@ -338,7 +418,7 @@ def graph_nodes(
         raise HTTPException(500, f"graph_nodes failed: {e}")
 
 
-@router.get("/infra/graph/edges")
+@router.get("/graph/edges")
 def graph_edges(
     _dev=Depends(device_id_dep),
     _org_id: int = Depends(require_org),
@@ -387,7 +467,7 @@ class NodePos(BaseModel):
     updated_by: Optional[str] = None  # opcional (ej. email o "ui-embed")
 
 
-@router.post("/infra/layout")
+@router.post("/layout")
 def save_layout(
     items: List[NodePos],
     _dev=Depends(device_id_dep),
@@ -422,7 +502,7 @@ def save_layout(
         raise HTTPException(500, f"save_layout failed: {e}")
 
 
-@router.get("/infra/layout")
+@router.get("/layout")
 def get_layout(
     _dev=Depends(device_id_dep),
     _org_id: int = Depends(require_org),

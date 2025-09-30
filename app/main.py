@@ -242,7 +242,6 @@ app.include_router(locations_router)
 app.include_router(ws_router)
 app.include_router(kpi_router)
 app.include_router(auth_router, prefix="")  # /auth/...
-
 app.include_router(viz_router)
 
 # ===== Utilitarios =====
@@ -414,21 +413,3 @@ def __diag_publish(payload: dict = Body(...)):
         return {"ok": True, "published": payload}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"publish failed: {e}")
-
-
-# ===== Debug de tenancy para /infra =====
-@app.get("/infra/__org_echo")
-def _infra_org_echo():
-    """
-    Devuelve el org_id que quedó seteado en el GUC 'app.org_id' para esta request.
-    Útil para verificar que el TenantContextMiddleware está aplicando en /infra/*.
-    """
-    try:
-        with get_conn() as conn, conn.cursor() as cur:
-            cur.execute("SELECT current_setting('app.org_id', true)")
-            raw = cur.fetchone()
-            val = (raw[0] if raw else None)
-            org_id = int(val) if val not in (None, "",) else None
-        return {"org_id": org_id}
-    except Exception as e:
-        raise HTTPException(500, f"org_echo failed: {e}")
