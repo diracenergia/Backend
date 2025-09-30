@@ -1,7 +1,7 @@
 # app/routes/graph_api.py
 from __future__ import annotations
 
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Any, Set
 
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
@@ -9,6 +9,7 @@ from psycopg.rows import dict_row
 
 from app.core.db import get_conn
 from app.core.security import device_id_dep
+from app.core.tenancy import require_org  # 👈 asegura GUC app.org_id por request
 
 router = APIRouter()
 
@@ -30,9 +31,41 @@ def _get_layout_map() -> Dict[str, Tuple[float, float]]:
             WHERE org_id = current_setting('app.org_id')::bigint
             """
         )
-        for r in cur.fetchall():
-            layout_map[r["node_uid"]] = (float(r["x"]), float(r["y"]))
+        for r in cur.fetchall() or []:
+            layout_map[str(r["node_uid"])] = (float(r["x"]), float(r["y"]))
     return layout_map
+
+
+def _node_uid(r: Dict[str, Any]) -> str:
+    """
+    ID único EXACTO, consistente con edges y con asset_layouts.node_uid:
+      - si hay code:  "type:code"
+      - si no:        "type_<asset_id>"
+    """
+    code = r.get("code")
+    t = r.get("type")
+    aid = r.get("asset_id")
+    return f"{t}:{code}" if code else f"{t}_{aid}"
+
+
+def _endpoint_key(t: Optional[str], asset_id: Any, code: Optional[str]) -> str:
+    """Clave para lookup rápido de extremos de aristas."""
+    t = (t or "node").lower()
+    return f"{t}:{code}" if code else f"{t}_{asset_id}"
+
+
+def _filter_edges_by_nodes(raw_edges: List[Dict[str, Any]], node_keys: Set[str]) -> List[Dict[str, Any]]:
+    """
+    Mantiene solo edges cuyos extremos existan en el conjunto de nodos cargados.
+    Blinda ante vistas sin filtro por org o datos viejos.
+    """
+    kept: List[Dict[str, Any]] = []
+    for e in raw_edges or []:
+        src_key = _endpoint_key(e.get("from_type"), e.get("from_id"), e.get("from_code"))
+        dst_key = _endpoint_key(e.get("to_type"),   e.get("to_id"),   e.get("to_code"))
+        if src_key in node_keys and dst_key in node_keys and (e.get("is_active", True) is True):
+            kept.append(e)
+    return kept
 
 
 # ---------------------------------------------------------------------
@@ -40,7 +73,10 @@ def _get_layout_map() -> Dict[str, Tuple[float, float]]:
 # ---------------------------------------------------------------------
 
 @router.get("/graph")
-def graph_all(_=Depends(device_id_dep)):
+def graph_all(
+    _dev=Depends(device_id_dep),
+    _org_id: int = Depends(require_org),  # 👈 setea app.org_id por request
+):
     """
     Devuelve:
       {
@@ -50,62 +86,91 @@ def graph_all(_=Depends(device_id_dep)):
         "edges": ["SRC>DST", ...]
       }
     Inyecta (x,y) desde public.asset_layouts si existen para la org del token.
+    Filtra NODOS y EDGES por org_id (vía locations) sin cambiar tu modelo.
     """
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-            # Nodos
-            cur.execute("SELECT * FROM v_asset_nodes ORDER BY type, name;")
-            raw_nodes = cur.fetchall()
+            # Nodos SOLO de la org actual (via locations)
+            cur.execute(
+                """
+                SELECT n.*
+                FROM public.v_asset_nodes n
+                JOIN public.locations l ON l.id = n.location_id
+                WHERE l.org_id = current_setting('app.org_id')::bigint
+                ORDER BY n.type, n.name;
+                """
+            )
+            raw_nodes = cur.fetchall() or []
 
-            # Edges (asumimos vista ya RLS/filtrada por org)
-            cur.execute("SELECT * FROM v_topology_edges WHERE is_active ORDER BY id;")
-            raw_edges = cur.fetchall()
+            # Edges SOLO dentro de la org (ambos extremos)
+            cur.execute(
+                """
+                SELECT e.*
+                FROM public.v_topology_edges e
+                JOIN public.v_asset_nodes nf
+                  ON nf.type = e.from_type AND nf.asset_id = e.from_id
+                JOIN public.locations lf ON lf.id = nf.location_id
+                JOIN public.v_asset_nodes nt
+                  ON nt.type = e.to_type   AND nt.asset_id = e.to_id
+                JOIN public.locations lt ON lt.id = nt.location_id
+                WHERE e.is_active
+                  AND lf.org_id = current_setting('app.org_id')::bigint
+                  AND lt.org_id = current_setting('app.org_id')::bigint
+                ORDER BY e.id;
+                """
+            )
+            all_edges = cur.fetchall() or []
+
+            # Por si viene algo “colado”, reforzamos por los nodos cargados:
+            node_keys: Set[str] = set()
+            for r in raw_nodes:
+                node_keys.add(_node_uid(r))
+            raw_edges = _filter_edges_by_nodes(all_edges, node_keys)
 
             # Config de tanques filtrada por org actual
             cur.execute(
                 """
                 SELECT tc.tank_id, tc.low_pct, tc.high_pct, tc.low_low_pct, tc.high_high_pct
                 FROM public.tank_config tc
-                JOIN public.tanks t    ON t.id = tc.tank_id
+                JOIN public.tanks t     ON t.id = tc.tank_id
                 JOIN public.locations l ON l.id = t.location_id
                 WHERE l.org_id = current_setting('app.org_id')::bigint
                 """
             )
-            tank_config = {row["tank_id"]: row for row in cur.fetchall()}
+            tank_config = {row["tank_id"]: row for row in (cur.fetchall() or [])}
 
             # Últimos niveles de tanques (filtrados por org)
             cur.execute(
                 """
                 SELECT v.tank_id, v.level_percent
-                FROM v_tank_latest v
-                JOIN public.tanks t    ON t.id = v.tank_id
+                FROM public.v_tank_latest v
+                JOIN public.tanks t     ON t.id = v.tank_id
                 JOIN public.locations l ON l.id = t.location_id
                 WHERE l.org_id = current_setting('app.org_id')::bigint
                 """
             )
-            tank_levels = {row["tank_id"]: row["level_percent"] for row in cur.fetchall()}
+            tank_levels = {row["tank_id"]: row["level_percent"] for row in (cur.fetchall() or [])}
 
             # Último estado de bombas (filtrado por org)
             cur.execute(
                 """
                 SELECT v.pump_id, v.is_on
-                FROM v_pump_latest v
-                JOIN public.pumps p    ON p.id = v.pump_id
+                FROM public.v_pump_latest v
+                JOIN public.pumps p     ON p.id = v.pump_id
                 JOIN public.locations l ON l.id = p.location_id
                 WHERE l.org_id = current_setting('app.org_id')::bigint
                 """
             )
-            pump_statuses = {row["pump_id"]: row["is_on"] for row in cur.fetchall()}
+            pump_statuses = {row["pump_id"]: row["is_on"] for row in (cur.fetchall() or [])}
 
-        # Layouts guardados
+        # Layouts guardados (por org)
         layout_map = _get_layout_map()
 
-        nodes = []
+        # Construcción de nodos de salida
+        nodes: List[Dict[str, Any]] = []
         for r in raw_nodes:
-            # ID único EXACTO (coincide con edges y con asset_layouts.node_uid)
-            code = r.get("code")
-            nid = f'{r["type"]}:{code}' if code else f'{r["type"]}_{r["asset_id"]}'
-            node = {"id": nid, "type": r["type"], "name": r["name"]}
+            nid = _node_uid(r)
+            node: Dict[str, Any] = {"id": nid, "type": r["type"], "name": r["name"]}
 
             # payload por tipo
             if r["type"] == "tank":
@@ -120,10 +185,12 @@ def graph_all(_=Depends(device_id_dep)):
 
             elif r["type"] == "pump":
                 node["status"] = pump_statuses.get(r["asset_id"], False)  # False=apagada
-                node["kW"] = r.get("rated_kw")
+                if r.get("rated_kw") is not None:
+                    node["kW"] = r.get("rated_kw")
 
             elif r["type"] == "valve":
-                node["state"] = r.get("valve_state")
+                if r.get("valve_state") is not None:
+                    node["state"] = r.get("valve_state")
 
             # Posiciones (si están guardadas)
             if nid in layout_map:
@@ -132,14 +199,15 @@ def graph_all(_=Depends(device_id_dep)):
 
             nodes.append(node)
 
-        # Edges
-        edges = []
+        # Edges → formateo compacto "SRC>DST"
+        edges: List[str] = []
         for e in raw_edges:
-            src = f'{e["from_type"]}:{e.get("from_code")}' if e.get("from_code") else f'{e["from_type"]}_{e["from_id"]}'
-            dst = f'{e["to_type"]}:{e.get("to_code")}'     if e.get("to_code")   else f'{e["to_type"]}_{e["to_id"]}'
+            src = f'{e.get("from_type")}:{e.get("from_code")}' if e.get("from_code") else f'{e.get("from_type")}_{e.get("from_id")}'
+            dst = f'{e.get("to_type")}:{e.get("to_code")}'     if e.get("to_code")   else f'{e.get("to_type")}_{e.get("to_id")}'
             edges.append(f"{src}>{dst}")
 
         return {"nodes": nodes, "edges": edges}
+
     except Exception as e:
         raise HTTPException(500, f"graph_all failed: {e}")
 
@@ -149,41 +217,59 @@ def graph_all(_=Depends(device_id_dep)):
 # ---------------------------------------------------------------------
 
 @router.get("/graph/nodes")
-def graph_nodes(_=Depends(device_id_dep)):
+def graph_nodes(
+    _dev=Depends(device_id_dep),
+    _org_id: int = Depends(require_org),
+):
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
                 SELECT
-                  type,
-                  asset_id AS id,
-                  name, code,
-                  level_ratio, capacity_liters,
-                  pump_status, rated_kw, valve_state,
-                  location_id, location_code, location_name
-                FROM v_asset_nodes
-                ORDER BY type, name;
+                  n.type,
+                  n.asset_id AS id,
+                  n.name, n.code,
+                  n.level_ratio, n.capacity_liters,
+                  n.pump_status, n.rated_kw, n.valve_state,
+                  n.location_id, n.location_code, n.location_name
+                FROM public.v_asset_nodes n
+                JOIN public.locations l ON l.id = n.location_id
+                WHERE l.org_id = current_setting('app.org_id')::bigint
+                ORDER BY n.type, n.name;
                 """
             )
-            return cur.fetchall()
+            return cur.fetchall() or []
     except Exception as e:
         raise HTTPException(500, f"graph_nodes failed: {e}")
 
 
 @router.get("/graph/edges")
-def graph_edges(_=Depends(device_id_dep)):
+def graph_edges(
+    _dev=Depends(device_id_dep),
+    _org_id: int = Depends(require_org),
+):
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
-                SELECT id, from_type, from_id, from_name, from_code,
-                       to_type, to_id, to_name, to_code,
-                       pipe_diameter_mm, length_m, is_active
-                FROM v_topology_edges
-                ORDER BY id;
+                SELECT e.id,
+                       e.from_type, e.from_id, e.from_name, e.from_code,
+                       e.to_type,   e.to_id,   e.to_name,   e.to_code,
+                       e.pipe_diameter_mm, e.length_m, e.is_active
+                FROM public.v_topology_edges e
+                JOIN public.v_asset_nodes nf
+                  ON nf.type = e.from_type AND nf.asset_id = e.from_id
+                JOIN public.locations lf ON lf.id = nf.location_id
+                JOIN public.v_asset_nodes nt
+                  ON nt.type = e.to_type AND nt.asset_id = e.to_id
+                JOIN public.locations lt ON lt.id = nt.location_id
+                WHERE e.is_active
+                  AND lf.org_id = current_setting('app.org_id')::bigint
+                  AND lt.org_id = current_setting('app.org_id')::bigint
+                ORDER BY e.id;
                 """
             )
-            return cur.fetchall()
+            return cur.fetchall() or []
     except Exception as e:
         raise HTTPException(500, f"graph_edges failed: {e}")
 
@@ -200,7 +286,11 @@ class NodePos(BaseModel):
 
 
 @router.post("/layout")
-def save_layout(items: List[NodePos], _=Depends(device_id_dep)):
+def save_layout(
+    items: List[NodePos],
+    _dev=Depends(device_id_dep),
+    _org_id: int = Depends(require_org),
+):
     """
     Guarda posiciones (UPSERT) en public.asset_layouts para la org del token.
     Body: [{ "id": "<node_uid>", "x": <num>, "y": <num>, "updated_by": "..." }, ...]
@@ -229,7 +319,10 @@ def save_layout(items: List[NodePos], _=Depends(device_id_dep)):
 
 
 @router.get("/layout")
-def get_layout(_=Depends(device_id_dep)):
+def get_layout(
+    _dev=Depends(device_id_dep),
+    _org_id: int = Depends(require_org),
+):
     """
     Devuelve todas las posiciones guardadas para la org del token (útil para debug).
     """
