@@ -2,25 +2,56 @@
 from __future__ import annotations
 from typing import List, Optional, Dict, Tuple, Any, Set
 
+import logging
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from psycopg.rows import dict_row
 
 from app.core.db import get_conn
 from app.core.security import device_id_dep
-from app.core.tenancy import require_org
+from app.core.tenancy import require_org  # resuelve org del request (header/api-key/etc)
 
 router = APIRouter()
+log = logging.getLogger("rdls.infra")
 
-# -----------------------------
+# ---------------------------------------------------------------------
 # Helpers
-# -----------------------------
+# ---------------------------------------------------------------------
 
 def _set_org(cur, org_id: int) -> None:
+    """
+    Fija el GUC app.org_id **en ESTA conexión** (pool-safe).
+    is_local=True evita que 'contagie' a otras conexiones.
+    """
     cur.execute("SELECT set_config('app.org_id', %s, true)", (str(int(org_id)),))
 
+def _safe_rollback(conn):
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+def _has_col(cur, relname: str, col: str, schema: str = "public") -> bool:
+    """
+    Chequea en information_schema si (schema.relname) tiene la columna.
+    Evita disparar SELECTs que rompan por columnas inexistentes.
+    """
+    try:
+        cur.execute(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s AND column_name = %s
+            LIMIT 1
+            """,
+            (schema, relname, col),
+        )
+        return cur.fetchone() is not None
+    except Exception:
+        return False
+
 def _node_uid(r: Dict[str, Any]) -> str:
-    t = r.get("type") or "node"
+    t = (r.get("type") or "node").lower()
     aid = r.get("asset_id")
     code = r.get("code")
     return f"{t}:{code}" if code else f"{t}_{aid}"
@@ -38,53 +69,61 @@ def _filter_edges_by_nodes(raw_edges: List[Dict[str, Any]], node_keys: Set[str])
             kept.append(e)
     return kept
 
-def _load_nodes_filtered(cur) -> List[Dict[str, Any]]:
+def _load_nodes_filtered(conn, cur) -> List[Dict[str, Any]]:
     """
-    Intenta filtrar v_asset_nodes por org sin depender del esquema físico.
-    1) Si la vista tiene org_id → filtro directo.
-    2) Si no, pruebo JOIN con locations.
-    3) Si nada sirve, cargo todo (y luego blindo edges/payload).
+    Intenta filtrar v_asset_nodes por org sin romper la transacción:
+    1) Si la vista tiene org_id -> filtro directo
+    2) Si tiene location_id y existe locations.org_id -> join por locations
+    3) Si no, fallback sin filtro (y más tarde blindamos edges/payload)
+    Loguea la 'estrategia' elegida.
     """
-    # 1) por org_id en la vista
+    # 1) org_id en la vista
     try:
-        cur.execute(
-            """
-            SELECT n.*
-              FROM v_asset_nodes n
-             WHERE n.org_id = current_setting('app.org_id')::bigint
-             ORDER BY n.type, n.name;
-            """
-        )
-        rows = cur.fetchall()
-        if rows:
+        if _has_col(cur, "v_asset_nodes", "org_id"):
+            cur.execute(
+                """
+                SELECT n.*
+                FROM v_asset_nodes n
+                WHERE n.org_id = current_setting('app.org_id')::bigint
+                ORDER BY n.type, n.name;
+                """
+            )
+            rows = cur.fetchall() or []
+            log.info("[infra] nodes via n.org_id (rows=%s)", len(rows))
             return rows
-        # si no hay filas pero no falló, igual retorno (puede ser org vacía)
-        return rows or []
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("[infra] nodes via n.org_id failed: %s", e)
+        _safe_rollback(conn)
 
-    # 2) por locations si existe
+    # 2) join por locations (si ambas columnas existen)
     try:
-        cur.execute(
-            """
-            SELECT n.*
-              FROM v_asset_nodes n
-              JOIN public.locations l ON l.id = n.location_id
-             WHERE l.org_id = current_setting('app.org_id')::bigint
-             ORDER BY n.type, n.name;
-            """
-        )
-        return cur.fetchall() or []
-    except Exception:
-        pass
+        if _has_col(cur, "v_asset_nodes", "location_id") and _has_col(cur, "locations", "org_id"):
+            cur.execute(
+                """
+                SELECT n.*
+                FROM v_asset_nodes n
+                JOIN public.locations l ON l.id = n.location_id
+                WHERE l.org_id = current_setting('app.org_id')::bigint
+                ORDER BY n.type, n.name;
+                """
+            )
+            rows = cur.fetchall() or []
+            log.info("[infra] nodes via JOIN locations (rows=%s)", len(rows))
+            return rows
+    except Exception as e:
+        log.warning("[infra] nodes via JOIN locations failed: %s", e)
+        _safe_rollback(conn)
 
     # 3) fallback sin filtro
     cur.execute("SELECT * FROM v_asset_nodes ORDER BY type, name;")
-    return cur.fetchall() or []
+    rows = cur.fetchall() or []
+    log.info("[infra] nodes fallback (NO FILTER) (rows=%s)", len(rows))
+    return rows
 
 def _get_layout_map(org_id: int) -> Dict[str, Tuple[float, float]]:
     """
-    Lee posiciones guardadas PARA ESA ORG (usa org_id explícito + set_config local).
+    Lee posiciones guardadas PARA ESA ORG (usa org_id explícito).
+    También setea el GUC local para consistencia.
     """
     layout_map: Dict[str, Tuple[float, float]] = {}
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -92,8 +131,8 @@ def _get_layout_map(org_id: int) -> Dict[str, Tuple[float, float]]:
         cur.execute(
             """
             SELECT node_uid, x, y
-              FROM public.asset_layouts
-             WHERE org_id = %s
+            FROM public.asset_layouts
+            WHERE org_id = %s
             """,
             (int(org_id),),
         )
@@ -104,9 +143,17 @@ def _get_layout_map(org_id: int) -> Dict[str, Tuple[float, float]]:
                 pass
     return layout_map
 
-# -----------------------------
-# Graph combinado
-# -----------------------------
+# ---------------------------------------------------------------------
+# Debug: ver org efectiva
+# ---------------------------------------------------------------------
+
+@router.get("/__org_echo")
+def __org_echo(_org_id: int = Depends(require_org)):
+    return {"org_id": _org_id}
+
+# ---------------------------------------------------------------------
+# Graph (combinado)
+# ---------------------------------------------------------------------
 
 @router.get("/graph")
 def graph_all(
@@ -114,20 +161,26 @@ def graph_all(
     _org_id: int = Depends(require_org),
 ):
     """
-    Devuelve {"nodes": [...], "edges": [...]}
-    - Setea app.org_id en la conexión (pool-safe).
-    - Nodos: v_asset_nodes (varias estrategias de filtro).
-    - Edges/payloads: sin joins a tablas base; filtro por IDs presentes.
-    - Layouts: por org explícita.
+    Devuelve:
+      {
+        "nodes": [{ "id": "type:code"| "type_<asset_id>", "type": "...", "name": "...", (x,y?) ... }],
+        "edges": ["SRC>DST", ...]
+      }
+    Estrategia:
+      - Setea app.org_id en la conexión (pool-safe).
+      - Nodos: v_asset_nodes (varias estrategias de filtro, con logs).
+      - Edges/payloads: no dependen de tablas base; se recortan por los nodos cargados.
+      - Layouts: por org explícita.
     """
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
             _set_org(cur, _org_id)
+            log.info("[infra] /graph start org=%s", _org_id)
 
             # NODOS
-            raw_nodes = _load_nodes_filtered(cur)
+            raw_nodes = _load_nodes_filtered(conn, cur)
 
-            # Índices de control
+            # Índices/sets de control
             node_keys: Set[str] = set()
             tank_ids: Set[int] = set()
             pump_ids: Set[int] = set()
@@ -144,19 +197,22 @@ def graph_all(
                 elif t == "pump" and aid is not None:
                     pump_ids.add(aid)
 
+            log.info("[infra] nodes=%s tanks=%s pumps=%s", len(raw_nodes), len(tank_ids), len(pump_ids))
+
             # EDGES (sin join; blindo por node_keys)
             cur.execute(
                 """
                 SELECT e.*
-                  FROM v_topology_edges e
-                 WHERE e.is_active
-                 ORDER BY e.id;
+                FROM v_topology_edges e
+                WHERE e.is_active
+                ORDER BY e.id;
                 """
             )
             all_edges = cur.fetchall() or []
             raw_edges = _filter_edges_by_nodes(all_edges, node_keys)
+            log.info("[infra] edges all=%s kept=%s", len(all_edges), len(raw_edges))
 
-            # PAYLOADS: sólo lo que está en los nodos
+            # PAYLOADS: sólo para IDs presentes
             tank_config: Dict[int, Dict[str, Any]] = {}
             tank_levels: Dict[int, Any] = {}
             pump_statuses: Dict[int, Any] = {}
@@ -165,44 +221,48 @@ def graph_all(
                 cur.execute(
                     """
                     SELECT tc.tank_id, tc.low_pct, tc.high_pct, tc.low_low_pct, tc.high_high_pct
-                      FROM public.tank_config tc
-                     WHERE tc.tank_id = ANY(%s);
+                    FROM public.tank_config tc
+                    WHERE tc.tank_id = ANY(%s);
                     """,
                     (list(tank_ids),),
                 )
-                for r in cur.fetchall() or []:
-                    tid = r.get("tank_id")
+                for rr in cur.fetchall() or []:
+                    tid = rr.get("tank_id")
                     if isinstance(tid, int) and tid in tank_ids:
-                        tank_config[tid] = r
+                        tank_config[tid] = rr
 
                 cur.execute(
                     """
                     SELECT v.tank_id, v.level_percent
-                      FROM v_tank_latest v
-                     WHERE v.tank_id = ANY(%s);
+                    FROM v_tank_latest v
+                    WHERE v.tank_id = ANY(%s);
                     """,
                     (list(tank_ids),),
                 )
-                for r in cur.fetchall() or []:
-                    tid = r.get("tank_id")
+                for rr in cur.fetchall() or []:
+                    tid = rr.get("tank_id")
                     if isinstance(tid, int) and tid in tank_ids:
-                        tank_levels[tid] = r.get("level_percent")
+                        tank_levels[tid] = rr.get("level_percent")
+
+                log.info("[infra] payload tanks cfg=%s levels=%s", len(tank_config), len(tank_levels))
 
             if pump_ids:
                 cur.execute(
                     """
                     SELECT v.pump_id, v.is_on
-                      FROM v_pump_latest v
-                     WHERE v.pump_id = ANY(%s);
+                    FROM v_pump_latest v
+                    WHERE v.pump_id = ANY(%s);
                     """,
                     (list(pump_ids),),
                 )
-                for r in cur.fetchall() or []:
-                    pid = r.get("pump_id")
+                for rr in cur.fetchall() or []:
+                    pid = rr.get("pump_id")
                     if isinstance(pid, int) and pid in pump_ids:
-                        pump_statuses[pid] = r.get("is_on")
+                        pump_statuses[pid] = rr.get("is_on")
 
-        # Layouts por org explícito
+                log.info("[infra] payload pumps latest=%s", len(pump_statuses))
+
+        # Layouts por org explícita
         layout_map = _get_layout_map(_org_id)
 
         # Construcción de nodos
@@ -251,16 +311,18 @@ def graph_all(
             dst = f'{e.get("to_type")}:{e.get("to_code")}'     if e.get("to_code")   else f'{e.get("to_type")}_{e.get("to_id")}'
             edges.append(f"{src}>{dst}")
 
+        log.info("[infra] /graph done org=%s nodes=%s edges=%s", _org_id, len(nodes), len(edges))
         return {"nodes": nodes, "edges": edges}
 
     except HTTPException:
         raise
     except Exception as e:
+        log.exception("[infra] /graph failed: %s", e)
         raise HTTPException(500, f"graph_all failed: {e}")
 
-# -----------------------------
-# Endpoints separados
-# -----------------------------
+# ---------------------------------------------------------------------
+# Graph (endpoints separados)
+# ---------------------------------------------------------------------
 
 @router.get("/graph/nodes")
 def graph_nodes(
@@ -270,7 +332,7 @@ def graph_nodes(
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
             _set_org(cur, _org_id)
-            rows = _load_nodes_filtered(cur)
+            rows = _load_nodes_filtered(conn, cur)
             out = []
             for r in rows:
                 out.append({
@@ -287,8 +349,10 @@ def graph_nodes(
                     "location_code": r.get("location_code"),
                     "location_name": r.get("location_name"),
                 })
+            log.info("[infra] /graph/nodes org=%s rows=%s", _org_id, len(out))
             return out
     except Exception as e:
+        log.exception("[infra] /graph/nodes failed: %s", e)
         raise HTTPException(500, f"graph_nodes failed: {e}")
 
 @router.get("/graph/edges")
@@ -299,7 +363,7 @@ def graph_edges(
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
             _set_org(cur, _org_id)
-            nodes = _load_nodes_filtered(cur)
+            nodes = _load_nodes_filtered(conn, cur)
             node_keys = {_node_uid(r) for r in nodes}
 
             cur.execute(
@@ -308,26 +372,28 @@ def graph_edges(
                        e.from_type, e.from_id, e.from_name, e.from_code,
                        e.to_type,   e.to_id,   e.to_name,   e.to_code,
                        e.pipe_diameter_mm, e.length_m, e.is_active
-                  FROM v_topology_edges e
-                 WHERE e.is_active
-                 ORDER BY e.id;
+                FROM v_topology_edges e
+                WHERE e.is_active
+                ORDER BY e.id;
                 """
             )
             edges = cur.fetchall() or []
-            edges = _filter_edges_by_nodes(edges, node_keys)
-            return edges
+            kept = _filter_edges_by_nodes(edges, node_keys)
+            log.info("[infra] /graph/edges org=%s edges_all=%s edges_kept=%s", _org_id, len(edges), len(kept))
+            return kept
     except Exception as e:
+        log.exception("[infra] /graph/edges failed: %s", e)
         raise HTTPException(500, f"graph_edges failed: {e}")
 
-# -----------------------------
-# Layout (por org)
-# -----------------------------
+# ---------------------------------------------------------------------
+# Layout Autosave (DB)
+# ---------------------------------------------------------------------
 
 class NodePos(BaseModel):
     id: str
     x: float
     y: float
-    updated_by: Optional[str] = None
+    updated_by: Optional[str] = None  # opcional (ej. email o "ui-embed")
 
 @router.post("/layout")
 def save_layout(
@@ -335,11 +401,16 @@ def save_layout(
     _dev=Depends(device_id_dep),
     _org_id: int = Depends(require_org),
 ):
+    """
+    Guarda posiciones (UPSERT) por org explícita.
+    Body: [{ "id": "<node_uid>", "x": <num>, "y": <num>, "updated_by": "..." }, ...]
+    """
     if not items:
         return {"ok": True, "saved": 0}
     try:
         with get_conn() as conn, conn.cursor() as cur:
             _set_org(cur, _org_id)
+            cnt = 0
             for it in items:
                 cur.execute(
                     """
@@ -353,8 +424,11 @@ def save_layout(
                     """,
                     (int(_org_id), it.id, it.x, it.y, it.updated_by or "ui-embed"),
                 )
-        return {"ok": True, "saved": len(items)}
+                cnt += 1
+        log.info("[infra] /layout POST org=%s saved=%s", _org_id, cnt)
+        return {"ok": True, "saved": cnt}
     except Exception as e:
+        log.exception("[infra] /layout POST failed: %s", e)
         raise HTTPException(500, f"save_layout failed: {e}")
 
 @router.get("/layout")
@@ -362,18 +436,24 @@ def get_layout(
     _dev=Depends(device_id_dep),
     _org_id: int = Depends(require_org),
 ):
+    """
+    Devuelve todas las posiciones guardadas para la org del token.
+    """
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
             _set_org(cur, _org_id)
             cur.execute(
                 """
                 SELECT node_uid AS id, x, y, updated_by, updated_at
-                  FROM public.asset_layouts
-                 WHERE org_id = %s
-                 ORDER BY updated_at DESC
+                FROM public.asset_layouts
+                WHERE org_id = %s
+                ORDER BY updated_at DESC
                 """,
                 (int(_org_id),),
             )
-            return cur.fetchall() or []
+            rows = cur.fetchall() or []
+        log.info("[infra] /layout GET org=%s rows=%s", _org_id, len(rows))
+        return rows
     except Exception as e:
+        log.exception("[infra] /layout GET failed: %s", e)
         raise HTTPException(500, f"get_layout failed: {e}")
