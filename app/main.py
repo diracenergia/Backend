@@ -5,7 +5,7 @@ import time
 import logging
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Body, Request, Query
+from fastapi import FastAPI, HTTPException, Body, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
@@ -15,17 +15,17 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # === Import robusto para ClientDisconnect (Starlette moderno -> requests; viejo -> exceptions)
 try:
-    from starlette.requests import ClientDisconnect  # Starlette >= ~0.14
+    from starlette.requests import ClientDisconnect  # Starlette >= ~0.14 en adelante
 except Exception:
     try:
-        from starlette.exceptions import ClientDisconnect  # fallback
-    except Exception:  # último fallback: definimos la clase
+        from starlette.exceptions import ClientDisconnect  # fallback p/ versiones antiguas
+    except Exception:  # último fallback: definimos la clase para evitar NameError
         class ClientDisconnect(Exception):
             pass
 
 import anyio
 
-# ===== Routers =====
+# Routers varios
 from app.routes.control import control_router
 from app.routes.kpi import router as kpi_router
 
@@ -44,12 +44,14 @@ from app.routes.history_pump import router as history_pump_router
 from app.routes.configs_pump import router as configs_pump_router
 from app.routes.commands_pumps import router as commands_pump_router
 
+from app.routes.alarms import router as alarms_router
 from app.routes.audit import router as audit_router
+from app.routes.diag_listener import router as diag_listener_router
 from app.ws import router as ws_router
 from app.routes.live_view import viz_router
 
 from app.auth.router import router as auth_router
-from app.auth.deps import conn_with_rls  # noqa: F401 (side-effects)
+from app.auth.deps import conn_with_rls  # noqa: F401
 
 # ===== LOGGING GLOBAL =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -134,6 +136,7 @@ from app.core.tenancy import tenant_ctx_dep
 _PUBLIC_PATHS = {
     "/", "/health", "/health/db", "/favicon.ico",
     "/__config", "/openapi.json", "/docs", "/redoc",
+    "/__alarm_poller_status", "/__which_alarms_eval", "/__which_alarm_events",
 }
 # ⚠️ Importante: NO incluir "/infra" acá para que aplique el tenant_ctx_dep a esos endpoints
 _PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws", "/ingest", "/auth")
@@ -172,19 +175,17 @@ if TRUSTED_HOSTS:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
     print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
 
-# ===== CORS (externo; dejar AL FINAL de middlewares custom) =====
+# ===== CORS (el más externo: agregarlo AL FINAL) =====
 _raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
 _origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
-ALLOW_CREDENTIALS = _get_env("CORS_ALLOW_CREDENTIALS", "1").lower() in ("1", "true", "yes")
-
-if _raw == "*" and ALLOW_CREDENTIALS:
-    # No se puede usar wildcard con credenciales: lista explícita segura para dev
-    ALLOW_ALL_ORIGINS = False
-    ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+if _raw == "*":
+    ALLOW_ALL_ORIGINS = True
+    ALLOWED_ORIGINS = ["*"]
 else:
-    ALLOW_ALL_ORIGINS = (_raw == "*")
-    ALLOWED_ORIGINS = ["*"] if ALLOW_ALL_ORIGINS else [o.strip() for o in _raw.split(",") if o.strip()]
+    ALLOW_ALL_ORIGINS = False
+    ALLOWED_ORIGINS = [o.strip() for o in _raw.split(",") if o.strip()]
 
+ALLOW_CREDENTIALS = False
 ALLOW_METHODS = ["*"]
 ALLOW_HEADERS = ["*"]
 
@@ -210,8 +211,9 @@ if WEB_DIR.exists():
 else:
     print(f"⚠️ /ui deshabilitado: no existe {WEB_DIR}")
 
-# ===== Routers (orden aproximado) =====
-# Ingesta y lecturas
+# ===== Routers =====
+app.include_router(diag_listener_router)
+
 app.include_router(ingest_tank_router)
 app.include_router(latest_tank_router)
 app.include_router(history_tank_router)
@@ -224,21 +226,19 @@ app.include_router(history_pump_router)
 app.include_router(configs_pump_router)
 app.include_router(commands_pump_router)
 
-# Tanks extra (opcional)
 try:
     from app.routes.tanks import router as tanks_router
     app.include_router(tanks_router)
 except Exception as e:
     print(f"⚠️ tanks router no disponible: {e}")
 
-# Audit
+app.include_router(alarms_router)
 app.include_router(audit_router)
 
 # Infra graph bajo /infra (pasa por TenantContextMiddleware)
 app.include_router(graph_router, prefix="/infra", tags=["infra-graph"])
 app.include_router(locations_router)
 
-# WS / KPI / Auth / Vistas
 app.include_router(ws_router)
 app.include_router(kpi_router)
 app.include_router(auth_router, prefix="")  # /auth/...
@@ -294,12 +294,15 @@ def cfg_echo():
     }
 
 
-# ===== (Opcional) Stub de alarmas para evitar 404 en el front mientras DISABLE_ALARMS=1 =====
-if _get_env("DISABLE_ALARMS", "0").lower() in ("1", "true", "yes"):
-    @app.get("/alarms")
-    def list_alarms_stub(active: bool = Query(default=True)):
-        # Devolvemos lista vacía para compatibilidad con el front existente.
-        return []
+@app.get("/__tg_env")
+def tg_env():
+    token = _get_env("TELEGRAM_BOT_TOKEN", "")
+    return {
+        "ENABLED": _get_env("TELEGRAM_ENABLED", ""),
+        "BOT_head": (token[:8] + "...") if token else "",
+        "CHAT": _get_env("TELEGRAM_CHAT_ID", ""),
+    }
+
 
 # ===== Conexión (diagnóstico) =====
 try:
@@ -307,3 +310,106 @@ try:
     app.include_router(conn_router)
 except Exception as e:
     print(f"⚠️ conn router no disponible: {e}")
+
+# ===== Alarm Poller opcional =====
+try:
+    from app.services.alarm_poller import start_alarm_poller, stop_alarm_poller
+    _HAS_ALARM_POLLER = True
+except Exception as e:
+    print(f"⚠️ alarm-poller no disponible: {e}")
+    start_alarm_poller = None
+    stop_alarm_poller = None
+    _HAS_ALARM_POLLER = False
+
+
+@app.on_event("startup")
+def _startup_listeners():
+    if _HAS_ALARM_POLLER and callable(start_alarm_poller):
+        try:
+            start_alarm_poller()
+            print("[alarm-poller] started")
+        except Exception as e:
+            print(f"⚠️ error al iniciar alarm-poller: {e}")
+
+
+@app.on_event("shutdown")
+def _shutdown_listeners():
+    if _HAS_ALARM_POLLER and callable(stop_alarm_poller):
+        try:
+            stop_alarm_poller()
+            print("[alarm-poller] stopped")
+        except Exception as e:
+            print(f"⚠️ error al detener alarm-poller: {e}")
+
+
+@app.get("/__alarm_poller_status")
+def poller_status():
+    try:
+        from app.services import alarm_poller as ap
+    except Exception as e:
+        return {"alive": False, "error": f"import_error: {e}"}
+    alive = bool(getattr(ap, "_thread", None) and getattr(ap._thread, "is_alive", lambda: False)())
+    return {
+        "alive": alive,
+        "batch": getattr(ap, "BATCH", None),
+        "sleep_empty": getattr(ap, "SLEEP_EMPTY", None),
+        "sleep_busy": getattr(ap, "SLEEP_BUSY", None),
+    }
+
+
+@app.post("/__alarm_poller_stop")
+def poller_stop():
+    if _HAS_ALARM_POLLER and callable(stop_alarm_poller):
+        try:
+            stop_alarm_poller()
+            return {"stopped": True}
+        except Exception as e:
+            return {"stopped": False, "error": str(e)}
+    return {"stopped": False, "error": "poller no disponible"}
+
+
+@app.get("/__which_alarms_eval")
+def which_alarms_eval():
+    import importlib
+    try:
+        mod = importlib.import_module("app.services.alarms_eval")
+        return {
+            "file": getattr(mod, "__file__", None),
+            "version": getattr(mod, "__VERSION__", None),
+            "has_eval": hasattr(mod, "eval_tank_alarm"),
+            "is_callable": callable(getattr(mod, "eval_tank_alarm", None)),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/__which_alarm_events")
+def which_alarm_events():
+    import importlib, inspect
+    try:
+        mod = importlib.import_module("app.services.alarm_events")
+        try:
+            src = inspect.getsource(mod._notify)
+            uses_pg = "pg_notify(" in src
+            preview = src.strip().splitlines()[:5]
+        except Exception:
+            uses_pg = None
+            preview = ["<no source>"]
+        return {
+            "file": getattr(mod, "__file__", None),
+            "version": getattr(mod, "__VERSION__", None),
+            "uses_pg_notify": uses_pg,
+            "notify_src_preview": preview,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/__diag_publish")
+def __diag_publish(payload: dict = Body(...)):
+    try:
+        from app.services import alarm_events
+        alarm_events._notify(payload)
+        return {"ok": True, "published": payload}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"publish failed: {e}")
