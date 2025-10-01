@@ -9,18 +9,22 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 import psycopg
-from psycopg import pq  # para chequear el estado de transacción
+from psycopg import pq  # para chequear estado de transacción
 
-# Nota: si usás pool
+# ------------------------------------------------------------------------------
+# Pool (psycopg_pool)
+# ------------------------------------------------------------------------------
 try:
-    from psycopg_pool import ConnectionPool  # type: ignore
+    from psycopg_pool import ConnectionPool, PoolTimeout  # type: ignore
 except Exception:  # pragma: no cover
     ConnectionPool = None  # type: ignore
+    class PoolTimeout(Exception):  # fallback por si no está instalado
+        pass
 
 log = logging.getLogger("rdls.db")
 
 # ------------------------------------------------------------------------------
-# Carga .env desde la raíz del repo (Render también inyecta envs)
+# Carga .env (en Render las envs ya vienen inyectadas)
 # ------------------------------------------------------------------------------
 load_dotenv()
 
@@ -28,7 +32,7 @@ load_dotenv()
 # Helpers DSN
 # ------------------------------------------------------------------------------
 def _clean(v: str | None) -> str:
-    # Quita espacios/saltos (\n, \r) que rompen psycopg, p.ej. "require\n"
+    # Quita espacios/saltos (\n, \r) que rompen psycopg (p.ej. "require\n")
     return (v or "").strip()
 
 
@@ -38,19 +42,17 @@ def _main_raw_dsn() -> str:
 
 
 def _events_raw_dsn() -> str:
-    # DSN especial para LISTEN/NOTIFY.
-    # Si no está seteado, cae al DSN principal.
+    # DSN para LISTEN/NOTIFY; si no está, usa el principal
     return os.getenv("EVENTS_DB_URL") or _main_raw_dsn()
 
 
 def _ensure_dsn_params(dsn: str) -> str:
     """
-    Garantiza parámetros seguros/recomendados para Supabase/Render:
+    Garantiza parámetros compatibles con Supabase/Render:
     - sslmode=require
     - channel_binding=disable
     """
     dsn = _clean(dsn)
-    # Si viene en URL estilo postgresql://...?... agregá como query params
     glue = "&" if "?" in dsn else "?"
     if "sslmode=" not in dsn:
         dsn += f"{glue}sslmode=require"
@@ -63,14 +65,14 @@ def _ensure_dsn_params(dsn: str) -> str:
 DSN = _ensure_dsn_params(_main_raw_dsn())
 EVENTS_DSN = _ensure_dsn_params(_events_raw_dsn())
 
-# Logs opcionales (no exponen secrets salvo que vos lo habilites)
+# Debug opcional (no imprimir secrets a menos que vos lo pidas)
 if os.getenv("DEBUG_DB_DSN") == "1":
     print(f"[DB] DSN (repr): {DSN!r}")
 if os.getenv("DEBUG_EVENTS_DSN") == "1":
     print(f"[DB] EVENTS_DSN (repr): {EVENTS_DSN!r}")
 
 # ------------------------------------------------------------------------------
-# IPv4 forzado (Render sin egress IPv6)
+# IPv4 forzado (útil en Render si hay egress IPv6 raro)
 # ------------------------------------------------------------------------------
 FORCE_IPV4 = os.getenv("DB_FORCE_IPV4") == "1"
 
@@ -91,33 +93,28 @@ if FORCE_IPV4:
     print(f"[DB] FORCE_IPV4=1 MAIN_IPV4={MAIN_IPV4} EVENTS_IPV4={EVENTS_IPV4}")
 
 # ------------------------------------------------------------------------------
-# Contexto multi-tenant (org/user/role) para RLS
+# Contexto multi-tenant (RLS)
 # ------------------------------------------------------------------------------
-# Importamos perezosamente por si aún no existe tenancy.py en dev.
+# Import perezoso por si en dev aún no existe tenancy.py
 try:
-    from app.core.tenancy import get_context  # devuelve (user_id, org_id, role)
+    from app.core.tenancy import get_context  # -> (user_id, org_id, role)
 except Exception:  # pragma: no cover
     def get_context():
         return (None, None, None)
 
 
 def _begin_if_idle(cur: "psycopg.Cursor") -> None:
-    """
-    Abre una transacción solo si la conexión está IDLE.
-    Evita 'ERROR: there is already a transaction in progress'.
-    """
+    """Abre una transacción solo si la conexión está IDLE."""
     conn = cur.connection
     status = conn.pgconn.transaction_status
     if status == pq.TransactionStatus.IDLE:
         cur.execute("BEGIN")
-    # si está INTRANS/ACTIVE ya hay TX; si INERROR dejá que el caller maneje.
 
 
 def _apply_rls_context(conn: "psycopg.Connection") -> None:
     """
-    Asegura una transacción abierta y setea variables de sesión
-    scopeadas a la TX actual: app.org_id, app.user_id, app.role.
-    Usamos set_config(..., ..., true/false) (SET LOCAL no soporta bind params).
+    Setea variables de sesión (GUC) en la TX actual:
+      - app.org_id, app.user_id, app.role
     """
     try:
         user_id, org_id, role = get_context()
@@ -126,8 +123,6 @@ def _apply_rls_context(conn: "psycopg.Connection") -> None:
 
     with conn.cursor() as cur:
         _begin_if_idle(cur)
-
-        # IMPORTANTE: set_config recibe strings
         if org_id is not None:
             cur.execute("SELECT set_config('app.org_id', %s, false)", (str(int(org_id)),))
         if user_id is not None:
@@ -135,163 +130,141 @@ def _apply_rls_context(conn: "psycopg.Connection") -> None:
         if role is not None:
             cur.execute("SELECT set_config('app.role', %s, true)", (str(role),))
 
+# ------------------------------------------------------------------------------
+# Pool global
+# ------------------------------------------------------------------------------
+DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "0"))
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "8"))          # conservador para free tier
+POOL_TIMEOUT = float(os.getenv("DB_POOL_TIMEOUT", "30"))  # tiempo máx. para obtener conn del pool
 
-# ------------------------------------------------------------------------------
-# Pool para operaciones normales (HTTP/API, repos, etc.)
-# ------------------------------------------------------------------------------
-pool = None
+pool: ConnectionPool | None = None
 try:
     if ConnectionPool is not None:
-        # Parámetros que pasarán a psycopg.connect(...)
         pool_connect_kwargs = {
             "connect_timeout": 10,
-            # Evita prepared statements (pgbouncer transaction pooling)
+            # ⚠ CLAVE para PgBouncer (transaction pooling)
             "prepare_threshold": 0,
-            # Keepalives agresivos (sobre todo en Render free)
+            # keepalives (evitar cortes silenciosos)
             "keepalives": 1,
             "keepalives_idle": 30,
             "keepalives_interval": 10,
             "keepalives_count": 3,
-            # Limitar queries colgados y transacciones idle
+            # cortar queries colgadas / idle in transaction
             "options": "-c statement_timeout=8000 -c idle_in_transaction_session_timeout=5000",
         }
         if MAIN_IPV4:
-            # Fuerza IPv4 explícito en cada conexión del pool
             pool_connect_kwargs["hostaddr"] = MAIN_IPV4
 
         pool = ConnectionPool(
             conninfo=DSN,
-            # Free tier: ser conservador con conexiones simultáneas
-            min_size=int(os.getenv("DB_POOL_MIN", "0")),
-            max_size=int(os.getenv("DB_POOL_MAX", "4")),
+            min_size=DB_POOL_MIN,
+            max_size=DB_POOL_MAX,
             max_idle=30,
-            timeout=10,  # espera máx. para obtener una conexión del pool
-            kwargs=pool_connect_kwargs,  # pasa tal cual a psycopg.connect(...)
+            max_lifetime=1800,   # recicla conexiones cada 30 minutos
+            timeout=POOL_TIMEOUT,
+            kwargs=pool_connect_kwargs,
         )
-        print(f"[DB] ConnectionPool OK (min={os.getenv('DB_POOL_MIN','0')}, max={os.getenv('DB_POOL_MAX','4')})")
+        print(f"[DB] ConnectionPool OK (min={DB_POOL_MIN}, max={DB_POOL_MAX}, timeout={POOL_TIMEOUT}s)")
 except Exception as e:
     print(f"[DB] psycopg_pool no disponible o fallo creando pool: {e}")
     pool = None
 
-
+# ------------------------------------------------------------------------------
+# Obtener conexión (con pool + fallback)
+# ------------------------------------------------------------------------------
 @contextmanager
 def get_conn():
     """
-    Conexión para operaciones normales de la app.
-    Usa pool si está disponible.
-    - Abre una transacción y setea GUCs app.* (RLS/tenancy) en la TX actual.
-    - Tus repos pueden usar conn.cursor() y hacer commit/rollback cuando quieran.
-    - Si olvidan commit, al cerrar la conexión el driver hace rollback.
+    Devuelve una conexión para operaciones normales.
+    - Usa el pool global si está disponible.
+    - Aplica GUCs de RLS en la transacción actual.
+    - Fallback a conexión directa si el pool está saturado (pico transitorio).
     """
     if pool is not None:
-        with pool.connection() as conn:
-            _apply_rls_context(conn)
-            yield conn
-    else:
-        # Conexión directa (sin pool), con fallback IPv4 si corresponde
-        if MAIN_IPV4:
+        try:
+            with pool.connection(timeout=POOL_TIMEOUT) as conn:
+                _apply_rls_context(conn)
+                yield conn
+                return
+        except PoolTimeout:
+            # Fallback de emergencia para evitar 500 en ráfagas cortas
+            extra = {"hostaddr": MAIN_IPV4} if MAIN_IPV4 else {}
             with psycopg.connect(
                 DSN,
                 connect_timeout=10,
-                hostaddr=MAIN_IPV4,
-                prepare_threshold=0,
-                keepalives=1,
-                keepalives_idle=30,
-                keepalives_interval=10,
-                keepalives_count=3,
+                prepare_threshold=0,  # ⚠ evita prepared statements con PgBouncer
+                keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
                 options="-c statement_timeout=8000 -c idle_in_transaction_session_timeout=5000",
+                **extra,
             ) as conn:
                 _apply_rls_context(conn)
                 yield conn
-        else:
-            with psycopg.connect(
-                DSN,
-                connect_timeout=10,
-                prepare_threshold=0,
-                keepalives=1,
-                keepalives_idle=30,
-                keepalives_interval=10,
-                keepalives_count=3,
-                options="-c statement_timeout=8000 -c idle_in_transaction_session_timeout=5000",
-            ) as conn:
-                _apply_rls_context(conn)
-                yield conn
+                return
 
+    # Sin pool (o falló al crear): conexión directa
+    extra = {"hostaddr": MAIN_IPV4} if MAIN_IPV4 else {}
+    with psycopg.connect(
+        DSN,
+        connect_timeout=10,
+        prepare_threshold=0,
+        keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
+        options="-c statement_timeout=8000 -c idle_in_transaction_session_timeout=5000",
+        **extra,
+    ) as conn:
+        _apply_rls_context(conn)
+        yield conn
 
 # ------------------------------------------------------------------------------
-# Conexión dedicada para LISTEN/NOTIFY (alarm listener)
-# IMPORTANTE: esta conexión NO debe pasar por PgBouncer en modo transaction.
-# Apuntá EVENTS_DB_URL a un pooler en *session* o directo :5432 (sslmode=require).
+# Conexión dedicada para LISTEN/NOTIFY
+#  - NO pasar por PgBouncer en modo transaction.
+#  - Usar EVENTS_DB_URL apuntando a :5432 (directo) o pooler en modo session.
 # ------------------------------------------------------------------------------
 @contextmanager
 def get_events_conn():
     """
-    Conexión dedicada para el listener (LISTEN/NOTIFY).
-    - autocommit=True para que LISTEN reciba notificaciones.
-    - No usa pool.
-    - No setea GUCs por defecto (no lo necesitás para escuchar),
-      pero podés agregarlos si el listener consulta tablas multi-tenant.
+    Conexión dedicada al listener (LISTEN/NOTIFY).
+    - autocommit=True para recibir notificaciones.
+    - prepare_threshold=0 por consistencia (y por si se hacen consultas).
+    - No setea GUCs por defecto (no suele hacer falta para escuchar).
     """
+    extra = {"hostaddr": EVENTS_IPV4} if EVENTS_IPV4 else {}
     try:
-        if EVENTS_IPV4:
-            with psycopg.connect(
-                EVENTS_DSN,
-                autocommit=True,
-                connect_timeout=10,
-                hostaddr=EVENTS_IPV4,
-                prepare_threshold=0,
-                keepalives=1,
-                keepalives_idle=30,
-                keepalives_interval=10,
-                keepalives_count=3,
-                options="-c statement_timeout=8000 -c idle_in_transaction_session_timeout=5000",
-            ) as conn:
-                yield conn
-                return
-
         with psycopg.connect(
             EVENTS_DSN,
             autocommit=True,
             connect_timeout=10,
             prepare_threshold=0,
-            keepalives=1,
-            keepalives_idle=30,
-            keepalives_interval=10,
-            keepalives_count=3,
+            keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
             options="-c statement_timeout=8000 -c idle_in_transaction_session_timeout=5000",
+            **extra,
         ) as conn:
             yield conn
             return
-
     except psycopg.OperationalError as e:
-        # Fallback IPv4 explícito si el host resolvió a IPv6 y la red no lo soporta
+        # Intento de fallback IPv4 si la red no admite IPv6 y no pudimos resolver antes
         if ("Network is unreachable" in str(e) or "No route to host" in str(e)) and os.getenv("DB_FORCE_IPV4") == "1":
             u = urlparse(EVENTS_DSN)
             host = u.hostname
-            try:
-                ipv4 = socket.getaddrinfo(host, None, family=socket.AF_INET)[0][4][0]
-                with psycopg.connect(
-                    EVENTS_DSN,
-                    autocommit=True,
-                    connect_timeout=10,
-                    hostaddr=ipv4,
-                    prepare_threshold=0,
-                    keepalives=1,
-                    keepalives_idle=30,
-                    keepalives_interval=10,
-                    keepalives_count=3,
-                    options="-c statement_timeout=8000 -c idle_in_transaction_session_timeout=5000",
-                ) as conn:
-                    yield conn
-                    return
-            except Exception:
-                pass
-        # Relevantar la excepción original si no hubo fallback
+            if host:
+                try:
+                    ipv4 = socket.getaddrinfo(host, None, family=socket.AF_INET)[0][4][0]
+                    with psycopg.connect(
+                        EVENTS_DSN,
+                        autocommit=True,
+                        connect_timeout=10,
+                        hostaddr=ipv4,
+                        prepare_threshold=0,
+                        keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
+                        options="-c statement_timeout=8000 -c idle_in_transaction_session_timeout=5000",
+                    ) as conn:
+                        yield conn
+                        return
+                except Exception:
+                    pass
         raise
 
-
 # ------------------------------------------------------------------------------
-# Healthcheck simple para /health/db
+# Healthcheck simple (para /health/db)
 # ------------------------------------------------------------------------------
 def db_health_ok() -> bool:
     try:
