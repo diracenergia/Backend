@@ -15,11 +15,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # === Import robusto para ClientDisconnect (Starlette moderno -> requests; viejo -> exceptions)
 try:
-    from starlette.requests import ClientDisconnect  # Starlette >= ~0.14 en adelante
+    from starlette.requests import ClientDisconnect  # Starlette >= ~0.14
 except Exception:
     try:
-        from starlette.exceptions import ClientDisconnect  # fallback p/ versiones antiguas
-    except Exception:  # último fallback: definimos la clase para evitar NameError
+        from starlette.exceptions import ClientDisconnect  # fallback
+    except Exception:
         class ClientDisconnect(Exception):
             pass
 
@@ -44,7 +44,6 @@ from app.routes.history_pump import router as history_pump_router
 from app.routes.configs_pump import router as configs_pump_router
 from app.routes.commands_pumps import router as commands_pump_router
 
-from app.routes.alarms import router as alarms_router
 from app.routes.audit import router as audit_router
 from app.routes.diag_listener import router as diag_listener_router
 from app.ws import router as ws_router
@@ -118,7 +117,6 @@ class LoggingMiddleware(BaseHTTPMiddleware):
             return response
 
         except (ClientDisconnect, anyio.EndOfStream):
-            # Cliente abortó la conexión (abort() en fetch, navegación, etc.)
             self._log.info(f"[DISCONNECT] {request.method} {request.url.path} (client closed connection)")
             return Response(status_code=499)
 
@@ -136,9 +134,8 @@ from app.core.tenancy import tenant_ctx_dep
 _PUBLIC_PATHS = {
     "/", "/health", "/health/db", "/favicon.ico",
     "/__config", "/openapi.json", "/docs", "/redoc",
-    "/__alarm_poller_status", "/__which_alarms_eval", "/__which_alarm_events",
 }
-# ⚠️ Importante: NO incluir "/infra" acá para que aplique el tenant_ctx_dep a esos endpoints
+# ⚠️ No incluir "/infra" acá para que aplique el tenant_ctx_dep a esos endpoints
 _PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws", "/ingest", "/auth")
 
 
@@ -175,7 +172,7 @@ if TRUSTED_HOSTS:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
     print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
 
-# ===== CORS (el más externo: agregarlo AL FINAL) =====
+# ===== CORS (agregarlo AL FINAL) =====
 _raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
 _origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
 if _raw == "*":
@@ -232,7 +229,6 @@ try:
 except Exception as e:
     print(f"⚠️ tanks router no disponible: {e}")
 
-app.include_router(alarms_router)
 app.include_router(audit_router)
 
 # Infra graph bajo /infra (pasa por TenantContextMiddleware)
@@ -293,123 +289,9 @@ def cfg_echo():
         "version": APP_VERSION or None,
     }
 
-
-@app.get("/__tg_env")
-def tg_env():
-    token = _get_env("TELEGRAM_BOT_TOKEN", "")
-    return {
-        "ENABLED": _get_env("TELEGRAM_ENABLED", ""),
-        "BOT_head": (token[:8] + "...") if token else "",
-        "CHAT": _get_env("TELEGRAM_CHAT_ID", ""),
-    }
-
-
 # ===== Conexión (diagnóstico) =====
 try:
     from app.routes.conn import router as conn_router
     app.include_router(conn_router)
 except Exception as e:
     print(f"⚠️ conn router no disponible: {e}")
-
-# ===== Alarm Poller opcional =====
-try:
-    from app.services.alarm_poller import start_alarm_poller, stop_alarm_poller
-    _HAS_ALARM_POLLER = True
-except Exception as e:
-    print(f"⚠️ alarm-poller no disponible: {e}")
-    start_alarm_poller = None
-    stop_alarm_poller = None
-    _HAS_ALARM_POLLER = False
-
-
-@app.on_event("startup")
-def _startup_listeners():
-    if _HAS_ALARM_POLLER and callable(start_alarm_poller):
-        try:
-            start_alarm_poller()
-            print("[alarm-poller] started")
-        except Exception as e:
-            print(f"⚠️ error al iniciar alarm-poller: {e}")
-
-
-@app.on_event("shutdown")
-def _shutdown_listeners():
-    if _HAS_ALARM_POLLER and callable(stop_alarm_poller):
-        try:
-            stop_alarm_poller()
-            print("[alarm-poller] stopped")
-        except Exception as e:
-            print(f"⚠️ error al detener alarm-poller: {e}")
-
-
-@app.get("/__alarm_poller_status")
-def poller_status():
-    try:
-        from app.services import alarm_poller as ap
-    except Exception as e:
-        return {"alive": False, "error": f"import_error: {e}"}
-    alive = bool(getattr(ap, "_thread", None) and getattr(ap._thread, "is_alive", lambda: False)())
-    return {
-        "alive": alive,
-        "batch": getattr(ap, "BATCH", None),
-        "sleep_empty": getattr(ap, "SLEEP_EMPTY", None),
-        "sleep_busy": getattr(ap, "SLEEP_BUSY", None),
-    }
-
-
-@app.post("/__alarm_poller_stop")
-def poller_stop():
-    if _HAS_ALARM_POLLER and callable(stop_alarm_poller):
-        try:
-            stop_alarm_poller()
-            return {"stopped": True}
-        except Exception as e:
-            return {"stopped": False, "error": str(e)}
-    return {"stopped": False, "error": "poller no disponible"}
-
-
-@app.get("/__which_alarms_eval")
-def which_alarms_eval():
-    import importlib
-    try:
-        mod = importlib.import_module("app.services.alarms_eval")
-        return {
-            "file": getattr(mod, "__file__", None),
-            "version": getattr(mod, "__VERSION__", None),
-            "has_eval": hasattr(mod, "eval_tank_alarm"),
-            "is_callable": callable(getattr(mod, "eval_tank_alarm", None)),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/__which_alarm_events")
-def which_alarm_events():
-    import importlib, inspect
-    try:
-        mod = importlib.import_module("app.services.alarm_events")
-        try:
-            src = inspect.getsource(mod._notify)
-            uses_pg = "pg_notify(" in src
-            preview = src.strip().splitlines()[:5]
-        except Exception:
-            uses_pg = None
-            preview = ["<no source>"]
-        return {
-            "file": getattr(mod, "__file__", None),
-            "version": getattr(mod, "__VERSION__", None),
-            "uses_pg_notify": uses_pg,
-            "notify_src_preview": preview,
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.post("/__diag_publish")
-def __diag_publish(payload: dict = Body(...)):
-    try:
-        from app.services import alarm_events
-        alarm_events._notify(payload)
-        return {"ok": True, "published": payload}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"publish failed: {e}")
