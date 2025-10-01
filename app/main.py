@@ -127,9 +127,6 @@ class LoggingMiddleware(BaseHTTPMiddleware):
             raise
 
 
-app.add_middleware(GZipMiddleware, minimum_size=1024)
-app.add_middleware(LoggingMiddleware)
-
 # ===== Tenancy (RLS) =====
 from app.core.tenancy import tenant_ctx_dep
 
@@ -166,16 +163,11 @@ class TenantContextMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-app.add_middleware(TenantContextMiddleware)
-
-# ===== Trusted hosts (opcional) =====
+# ===== Trusted hosts (lista y flag; el add_middleware va más abajo) =====
 _trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
 TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
-if TRUSTED_HOSTS:
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
-    print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
 
-# ===== CORS (el más externo) =====
+# ===== CORS (debe ser el MÁS EXTERNO) =====
 def _env_bool(name: str, default: bool = False) -> bool:
     v = (_get_env(name, "1" if default else "0") or "").strip().lower()
     return v in ("1", "true", "t", "yes", "y")
@@ -193,15 +185,29 @@ if _raw == "*":
 else:
     allowed_origins = [o.strip() for o in _raw.split(",") if o.strip()]
 
+# Middleware CORS primero (outermost)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,          # lista explícita
     allow_origin_regex=_origin_regex,       # o regex, si lo definiste
-    allow_credentials=allow_credentials,    # <- ahora lee de env
+    allow_credentials=allow_credentials,    # <- lee de env
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Derivados para /__config
+ALLOW_ALL_ORIGINS = (_raw == "*")
+ALLOWED_ORIGINS = allowed_origins
+ALLOW_CREDENTIALS = allow_credentials
+
+# ===== Resto de middlewares (orden recomendado) =====
+if TRUSTED_HOSTS:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
+    print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
+
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+app.add_middleware(LoggingMiddleware)
+app.add_middleware(TenantContextMiddleware)
 
 # ===== UI estática =====
 REPO_ROOT = Path(__file__).resolve().parents[1]
