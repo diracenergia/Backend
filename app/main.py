@@ -5,7 +5,7 @@ import time
 import logging
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Body, Request, Query
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
@@ -13,19 +13,19 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 
-# === Import robusto para ClientDisconnect
+# === Import robusto para ClientDisconnect (Starlette moderno -> requests; viejo -> exceptions)
 try:
     from starlette.requests import ClientDisconnect  # Starlette >= ~0.14
 except Exception:
     try:
         from starlette.exceptions import ClientDisconnect  # fallback
-    except Exception:
+    except Exception:  # último fallback: definimos la clase
         class ClientDisconnect(Exception):
             pass
 
 import anyio
 
-# Routers varios
+# ===== Routers =====
 from app.routes.control import control_router
 from app.routes.kpi import router as kpi_router
 
@@ -49,7 +49,7 @@ from app.ws import router as ws_router
 from app.routes.live_view import viz_router
 
 from app.auth.router import router as auth_router
-from app.auth.deps import conn_with_rls  # noqa: F401
+from app.auth.deps import conn_with_rls  # noqa: F401 (side-effects)
 
 # ===== LOGGING GLOBAL =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -116,6 +116,7 @@ class LoggingMiddleware(BaseHTTPMiddleware):
             return response
 
         except (ClientDisconnect, anyio.EndOfStream):
+            # Cliente abortó la conexión (abort() en fetch, navegación, etc.)
             self._log.info(f"[DISCONNECT] {request.method} {request.url.path} (client closed connection)")
             return Response(status_code=499)
 
@@ -134,13 +135,13 @@ _PUBLIC_PATHS = {
     "/", "/health", "/health/db", "/favicon.ico",
     "/__config", "/openapi.json", "/docs", "/redoc",
 }
-# ⚠️ No incluir "/infra" acá para que aplique el tenant_ctx_dep a esos endpoints
+# ⚠️ Importante: NO incluir "/infra" acá para que aplique el tenant_ctx_dep a esos endpoints
 _PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws", "/ingest", "/auth")
 
 
 class TenantContextMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # Preflight CORS
+        # Preflight CORS: dejar pasar
         if request.method == "OPTIONS":
             return await call_next(request)
 
@@ -171,17 +172,19 @@ if TRUSTED_HOSTS:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
     print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
 
-# ===== CORS (al final) =====
+# ===== CORS (externo; dejar AL FINAL de middlewares custom) =====
 _raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
 _origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
-if _raw == "*":
-    ALLOW_ALL_ORIGINS = True
-    ALLOWED_ORIGINS = ["*"]
-else:
-    ALLOW_ALL_ORIGINS = False
-    ALLOWED_ORIGINS = [o.strip() for o in _raw.split(",") if o.strip()]
+ALLOW_CREDENTIALS = _get_env("CORS_ALLOW_CREDENTIALS", "1").lower() in ("1", "true", "yes")
 
-ALLOW_CREDENTIALS = False
+if _raw == "*" and ALLOW_CREDENTIALS:
+    # No se puede usar wildcard con credenciales: lista explícita segura para dev
+    ALLOW_ALL_ORIGINS = False
+    ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+else:
+    ALLOW_ALL_ORIGINS = (_raw == "*")
+    ALLOWED_ORIGINS = ["*"] if ALLOW_ALL_ORIGINS else [o.strip() for o in _raw.split(",") if o.strip()]
+
 ALLOW_METHODS = ["*"]
 ALLOW_HEADERS = ["*"]
 
@@ -207,7 +210,8 @@ if WEB_DIR.exists():
 else:
     print(f"⚠️ /ui deshabilitado: no existe {WEB_DIR}")
 
-# ===== Routers =====
+# ===== Routers (orden aproximado) =====
+# Ingesta y lecturas
 app.include_router(ingest_tank_router)
 app.include_router(latest_tank_router)
 app.include_router(history_tank_router)
@@ -220,18 +224,21 @@ app.include_router(history_pump_router)
 app.include_router(configs_pump_router)
 app.include_router(commands_pump_router)
 
+# Tanks extra (opcional)
 try:
     from app.routes.tanks import router as tanks_router
     app.include_router(tanks_router)
 except Exception as e:
     print(f"⚠️ tanks router no disponible: {e}")
 
+# Audit
 app.include_router(audit_router)
 
 # Infra graph bajo /infra (pasa por TenantContextMiddleware)
 app.include_router(graph_router, prefix="/infra", tags=["infra-graph"])
 app.include_router(locations_router)
 
+# WS / KPI / Auth / Vistas
 app.include_router(ws_router)
 app.include_router(kpi_router)
 app.include_router(auth_router, prefix="")  # /auth/...
@@ -285,6 +292,14 @@ def cfg_echo():
         "trusted_hosts": TRUSTED_HOSTS or None,
         "version": APP_VERSION or None,
     }
+
+
+# ===== (Opcional) Stub de alarmas para evitar 404 en el front mientras DISABLE_ALARMS=1 =====
+if _get_env("DISABLE_ALARMS", "0").lower() in ("1", "true", "yes"):
+    @app.get("/alarms")
+    def list_alarms_stub(active: bool = Query(default=True)):
+        # Devolvemos lista vacía para compatibilidad con el front existente.
+        return []
 
 # ===== Conexión (diagnóstico) =====
 try:
