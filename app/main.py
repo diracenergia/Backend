@@ -175,33 +175,33 @@ if TRUSTED_HOSTS:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
     print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
 
-# ===== CORS (el más externo: agregarlo AL FINAL) =====
+# ===== CORS (el más externo) =====
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = (_get_env(name, "1" if default else "0") or "").strip().lower()
+    return v in ("1", "true", "t", "yes", "y")
+
 _raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
-_origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
+_origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip() or None
+allow_credentials = _env_bool("CORS_ALLOW_CREDENTIALS", True)
+
 if _raw == "*":
-    ALLOW_ALL_ORIGINS = True
-    ALLOWED_ORIGINS = ["*"]
+    # Con credenciales, NO se puede usar '*' → usá regex o lista explícita
+    allowed_origins = []  # vacío si vas a usar regex
+    if allow_credentials and not _origin_regex:
+        # Acepta localhost/127.0.0.1 en cualquier puerto 51xx (ajustá a gusto)
+        _origin_regex = r"^https?://(localhost|127\.0\.0\.1):51\d{2}$"
 else:
-    ALLOW_ALL_ORIGINS = False
-    ALLOWED_ORIGINS = [o.strip() for o in _raw.split(",") if o.strip()]
-
-ALLOW_CREDENTIALS = False
-ALLOW_METHODS = ["*"]
-ALLOW_HEADERS = ["*"]
-
-print("[CORS] allow_all          =", ALLOW_ALL_ORIGINS)
-print("[CORS] allow_origins      =", ALLOWED_ORIGINS)
-print("[CORS] allow_origin_regex =", _origin_regex or "(none)")
-print("[CORS] allow_credentials  =", ALLOW_CREDENTIALS)
+    allowed_origins = [o.strip() for o in _raw.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=_origin_regex or None,
-    allow_credentials=ALLOW_CREDENTIALS,
-    allow_methods=ALLOW_METHODS,
-    allow_headers=ALLOW_HEADERS,
+    allow_origins=allowed_origins,          # lista explícita
+    allow_origin_regex=_origin_regex,       # o regex, si lo definiste
+    allow_credentials=allow_credentials,    # <- ahora lee de env
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
 
 # ===== UI estática =====
 REPO_ROOT = Path(__file__).resolve().parents[1]
