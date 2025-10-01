@@ -5,7 +5,7 @@ import time
 import logging
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Body, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
@@ -13,7 +13,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 
-# === Import robusto para ClientDisconnect (Starlette moderno -> requests; viejo -> exceptions)
+# === Import robusto para ClientDisconnect
 try:
     from starlette.requests import ClientDisconnect  # Starlette >= ~0.14
 except Exception:
@@ -45,7 +45,6 @@ from app.routes.configs_pump import router as configs_pump_router
 from app.routes.commands_pumps import router as commands_pump_router
 
 from app.routes.audit import router as audit_router
-from app.routes.diag_listener import router as diag_listener_router
 from app.ws import router as ws_router
 from app.routes.live_view import viz_router
 
@@ -141,7 +140,7 @@ _PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws", "/ingest", "/auth")
 
 class TenantContextMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # Preflight CORS: dejar pasar
+        # Preflight CORS
         if request.method == "OPTIONS":
             return await call_next(request)
 
@@ -172,7 +171,7 @@ if TRUSTED_HOSTS:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
     print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
 
-# ===== CORS (agregarlo AL FINAL) =====
+# ===== CORS (al final) =====
 _raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
 _origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
 if _raw == "*":
@@ -209,8 +208,6 @@ else:
     print(f"⚠️ /ui deshabilitado: no existe {WEB_DIR}")
 
 # ===== Routers =====
-app.include_router(diag_listener_router)
-
 app.include_router(ingest_tank_router)
 app.include_router(latest_tank_router)
 app.include_router(history_tank_router)
