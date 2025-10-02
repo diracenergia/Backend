@@ -3,7 +3,6 @@ import os
 import sys
 import time
 import logging
-import re
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Body, Request
@@ -16,11 +15,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # === Import robusto para ClientDisconnect (Starlette moderno -> requests; viejo -> exceptions)
 try:
-    from starlette.requests import ClientDisconnect  # Starlette >= ~0.14 en adelante
+    from starlette.requests import ClientDisconnect  # Starlette >= ~0.14
 except Exception:
     try:
-        from starlette.exceptions import ClientDisconnect  # fallback p/ versiones antiguas
-    except Exception:  # último fallback: definimos la clase para evitar NameError
+        from starlette.exceptions import ClientDisconnect  # fallback
+    except Exception:  # último fallback
         class ClientDisconnect(Exception):
             pass
 
@@ -120,7 +119,6 @@ class LoggingMiddleware(BaseHTTPMiddleware):
             return response
 
         except (ClientDisconnect, anyio.EndOfStream):
-            # Cliente abortó la conexión (abort() en fetch, navegación, etc.)
             self._log.info(f"[DISCONNECT] {request.method} {request.url.path} (client closed connection)")
             return Response(status_code=499)
 
@@ -137,7 +135,7 @@ _PUBLIC_PATHS = {
     "/__config", "/openapi.json", "/docs", "/redoc",
     "/__alarm_poller_status", "/__which_alarms_eval", "/__which_alarm_events",
 }
-# ⚠️ Importante: NO incluir "/infra" acá para que aplique el tenant_ctx_dep a esos endpoints
+# ⚠️ NO incluir "/infra" acá para que aplique tenant_ctx_dep
 _PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws", "/ingest", "/auth")
 
 
@@ -165,87 +163,56 @@ class TenantContextMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-# ===== Trusted hosts (lista y flag; el add_middleware va más abajo) =====
-_trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
-TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
-
-# ===== CORS (debe ser el MÁS EXTERNO) =====
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = (_get_env(name, "1" if default else "0") or "").strip().lower()
-    return v in ("1", "true", "t", "yes", "y")
-
-_raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
-_origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip() or None
-allow_credentials = _env_bool("CORS_ALLOW_CREDENTIALS", True)
-
-if _raw == "*":
-    # Con credenciales, NO se puede usar '*' → usá regex o lista explícita
-    allowed_origins = []  # vacío si vas a usar regex
-    if allow_credentials and not _origin_regex:
-        # Acepta localhost/127.0.0.1 en cualquier puerto 51xx (ajustá a gusto)
-        _origin_regex = r"^https?://(localhost|127\.0\.0\.1):51\d{2}$"
-else:
-    allowed_origins = [o.strip() for o in _raw.split(",") if o.strip()]
-
-# Middleware CORS primero (outermost)
+# ======== CORS: Modo MVP súper permisivo (sin credenciales) ========
+# 1) CORSMiddleware con '*' (válido porque NO usamos cookies en el navegador)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,          # lista explícita
-    allow_origin_regex=_origin_regex,       # o regex, si lo definiste
-    allow_credentials=allow_credentials,    # <- lee de env
+    allow_origins=["*"],       # ACAO: *
+    allow_credentials=False,   # clave: con False, el browser acepta '*'
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
-# Derivados para /__config
-ALLOW_ALL_ORIGINS = (_raw == "*")
-ALLOWED_ORIGINS = allowed_origins
-ALLOW_CREDENTIALS = allow_credentials
-
-# ---- Fijador de CORS para cualquier respuesta (incluye 500) ----
-class EnsureCorsHeaderMiddleware(BaseHTTPMiddleware):
+# 2) Forzar headers CORS también en errores 4xx/5xx
+class ForceCorsStarMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        response = await call_next(request)
-
-        origin = request.headers.get("origin")
-        ok = False
-        if origin:
-            if origin in ALLOWED_ORIGINS:
-                ok = True
-            elif _origin_regex and re.match(_origin_regex, origin):
-                ok = True
-
-        if ok:
-            # Si por algún motivo aún no vino el header, lo agregamos
-            low_keys = {k.lower() for k in response.headers.keys()}
-            if "access-control-allow-origin" not in low_keys:
-                response.headers["Access-Control-Allow-Origin"] = origin
-            if ALLOW_CREDENTIALS:
-                response.headers["Access-Control-Allow-Credentials"] = "true"
-
-            # Para caches intermedios (CDN/proxy)
-            vary = response.headers.get("Vary")
-            response.headers["Vary"] = "Origin" if not vary else (vary + ", Origin")
-
-            # Headers “por si acaso”
-            if "access-control-allow-methods" not in low_keys:
-                response.headers["Access-Control-Allow-Methods"] = "*"
-            if "access-control-allow-headers" not in low_keys:
-                response.headers["Access-Control-Allow-Headers"] = "*"
-
+        try:
+            response = await call_next(request)
+        except Exception as e:
+            # Garantiza JSON 500 visible desde el browser
+            response = JSONResponse(status_code=500, content={"detail": f"internal error: {e.__class__.__name__}"})
+        # Inyecta '*' SIEMPRE
+        h = response.headers
+        h.setdefault("Access-Control-Allow-Origin", "*")
+        h.setdefault("Access-Control-Allow-Methods", "*")
+        req_hdrs = request.headers.get("access-control-request-headers")
+        h.setdefault("Access-Control-Allow-Headers", req_hdrs or "*")
         return response
 
-# Registrar el fijador inmediatamente después del CORS
-app.add_middleware(EnsureCorsHeaderMiddleware)
+app.add_middleware(ForceCorsStarMiddleware)
 
-# ===== Resto de middlewares (orden recomendado) =====
+# ===== Trusted hosts (opcional) =====
+_trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
+TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
 if TRUSTED_HOSTS:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
     print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
 
+# ===== GZip + Logging + Tenant =====
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(LoggingMiddleware)
 app.add_middleware(TenantContextMiddleware)
+
+# ===== Catch-all OPTIONS (por si algún proxy frena el preflight)
+@app.options("/{rest_of_path:path}")
+def _catchall_options(rest_of_path: str, request: Request):
+    resp = Response(status_code=200)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "*"
+    req_hdrs = request.headers.get("access-control-request-headers")
+    resp.headers["Access-Control-Allow-Headers"] = req_hdrs or "*"
+    return resp
 
 # ===== UI estática =====
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -327,12 +294,7 @@ def health_db():
 @app.get("/__config")
 def cfg_echo():
     return {
-        "cors": {
-            "allow_all": ALLOW_ALL_ORIGINS,
-            "allow_origins": ALLOWED_ORIGINS,
-            "allow_origin_regex": _origin_regex or None,
-            "allow_credentials": ALLOW_CREDENTIALS,
-        },
+        "cors": {"mode": "star_no_credentials", "allow_origin": "*"},
         "trusted_hosts": TRUSTED_HOSTS or None,
         "version": APP_VERSION or None,
     }
