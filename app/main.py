@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import logging
+import re
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Body, Request
@@ -95,6 +96,7 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         t0 = time.time()
         hdr = request.headers
         safe_headers = {
+            "origin": hdr.get("origin"),
             "x-org-id": hdr.get("x-org-id"),
             "x-device-id": hdr.get("x-device-id"),
             "x-api-key-present": bool(hdr.get("x-api-key")),
@@ -126,9 +128,6 @@ class LoggingMiddleware(BaseHTTPMiddleware):
             self._log.exception(f"[ERR] {request.method} {request.url.path} crashed")
             raise
 
-
-app.add_middleware(GZipMiddleware, minimum_size=1024)
-app.add_middleware(LoggingMiddleware)
 
 # ===== Tenancy (RLS) =====
 from app.core.tenancy import tenant_ctx_dep
@@ -166,42 +165,87 @@ class TenantContextMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-app.add_middleware(TenantContextMiddleware)
-
-# ===== Trusted hosts (opcional) =====
+# ===== Trusted hosts (lista y flag; el add_middleware va más abajo) =====
 _trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
 TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
+
+# ===== CORS (debe ser el MÁS EXTERNO) =====
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = (_get_env(name, "1" if default else "0") or "").strip().lower()
+    return v in ("1", "true", "t", "yes", "y")
+
+_raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
+_origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip() or None
+allow_credentials = _env_bool("CORS_ALLOW_CREDENTIALS", True)
+
+if _raw == "*":
+    # Con credenciales, NO se puede usar '*' → usá regex o lista explícita
+    allowed_origins = []  # vacío si vas a usar regex
+    if allow_credentials and not _origin_regex:
+        # Acepta localhost/127.0.0.1 en cualquier puerto 51xx (ajustá a gusto)
+        _origin_regex = r"^https?://(localhost|127\.0\.0\.1):51\d{2}$"
+else:
+    allowed_origins = [o.strip() for o in _raw.split(",") if o.strip()]
+
+# Middleware CORS primero (outermost)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,          # lista explícita
+    allow_origin_regex=_origin_regex,       # o regex, si lo definiste
+    allow_credentials=allow_credentials,    # <- lee de env
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Derivados para /__config
+ALLOW_ALL_ORIGINS = (_raw == "*")
+ALLOWED_ORIGINS = allowed_origins
+ALLOW_CREDENTIALS = allow_credentials
+
+# ---- Fijador de CORS para cualquier respuesta (incluye 500) ----
+class EnsureCorsHeaderMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+
+        origin = request.headers.get("origin")
+        ok = False
+        if origin:
+            if origin in ALLOWED_ORIGINS:
+                ok = True
+            elif _origin_regex and re.match(_origin_regex, origin):
+                ok = True
+
+        if ok:
+            # Si por algún motivo aún no vino el header, lo agregamos
+            low_keys = {k.lower() for k in response.headers.keys()}
+            if "access-control-allow-origin" not in low_keys:
+                response.headers["Access-Control-Allow-Origin"] = origin
+            if ALLOW_CREDENTIALS:
+                response.headers["Access-Control-Allow-Credentials"] = "true"
+
+            # Para caches intermedios (CDN/proxy)
+            vary = response.headers.get("Vary")
+            response.headers["Vary"] = "Origin" if not vary else (vary + ", Origin")
+
+            # Headers “por si acaso”
+            if "access-control-allow-methods" not in low_keys:
+                response.headers["Access-Control-Allow-Methods"] = "*"
+            if "access-control-allow-headers" not in low_keys:
+                response.headers["Access-Control-Allow-Headers"] = "*"
+
+        return response
+
+# Registrar el fijador inmediatamente después del CORS
+app.add_middleware(EnsureCorsHeaderMiddleware)
+
+# ===== Resto de middlewares (orden recomendado) =====
 if TRUSTED_HOSTS:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
     print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
 
-# ===== CORS (el más externo: agregarlo AL FINAL) =====
-_raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
-_origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
-if _raw == "*":
-    ALLOW_ALL_ORIGINS = True
-    ALLOWED_ORIGINS = ["*"]
-else:
-    ALLOW_ALL_ORIGINS = False
-    ALLOWED_ORIGINS = [o.strip() for o in _raw.split(",") if o.strip()]
-
-ALLOW_CREDENTIALS = False
-ALLOW_METHODS = ["*"]
-ALLOW_HEADERS = ["*"]
-
-print("[CORS] allow_all          =", ALLOW_ALL_ORIGINS)
-print("[CORS] allow_origins      =", ALLOWED_ORIGINS)
-print("[CORS] allow_origin_regex =", _origin_regex or "(none)")
-print("[CORS] allow_credentials  =", ALLOW_CREDENTIALS)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=_origin_regex or None,
-    allow_credentials=ALLOW_CREDENTIALS,
-    allow_methods=ALLOW_METHODS,
-    allow_headers=ALLOW_HEADERS,
-)
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+app.add_middleware(LoggingMiddleware)
+app.add_middleware(TenantContextMiddleware)
 
 # ===== UI estática =====
 REPO_ROOT = Path(__file__).resolve().parents[1]
