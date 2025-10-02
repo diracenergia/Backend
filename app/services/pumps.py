@@ -1,51 +1,86 @@
-from typing import List, Dict, Any, Optional
-from fastapi import APIRouter, Depends, Query
-from psycopg import OperationalError, errors as psy_errors
-from psycopg.rows import dict_row
+from fastapi import HTTPException
+from app.repos import pumps as repo
+from app.repos import pump_commands as cmd_repo
 
-from app.core.db import get_conn
-from app.core.security import device_id_dep
-from app.core.tenancy import require_org
+def _to_bool_loose(v):
+    if isinstance(v, bool) or v is None:
+        return v
+    s = str(v).strip().lower()
+    if s in ("1","true","yes","on","auto","remoto"):
+        return True
+    if s in ("0","false","no","off","manual","local"):
+        return False
+    return None
 
-router = APIRouter(prefix="/pumps", tags=["pumps"])
+def queue_command(pump_id: int, cmd: str, user: str, speed_pct: int | None):
+    # 1) Config normalizada (vista)
+    row = repo.get_normalized_pump_config(pump_id)
+    if not row:
+        raise HTTPException(404, "Bomba no encontrada")
+    (_id, drive_type, remote_enabled, vfd_min, vfd_max, vfd_default) = row
 
-@router.get("/config")
-def pumps_config(user_id: Optional[int] = Query(default=None), _=Depends(device_id_dep)) -> List[Dict[str, Any]]:
-    org_id = require_org()
-    try:
-        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-            # 🔑 Seteamos GUC para RLS
-            cur.execute("select set_config('app.org_id', %s, true)", (str(int(org_id)),))
+    if not remote_enabled:
+        raise HTTPException(403, detail={"message": "Comando remoto deshabilitado para esta bomba"})
 
-            cur.execute(
-                """
-                SELECT
-                  p.id    AS pump_id,
-                  p.name  AS pump_name,
-                  p.org_id,
-                  COALESCE(pc.remote_enabled, p.remote_enabled)              AS remote_enabled,
-                  COALESCE(pc.drive_type,     p.drive_type::text)            AS drive_type,
-                  COALESCE(pc.vfd_min_speed_pct,     p.vfd_min_speed_pct)    AS vfd_min_speed_pct,
-                  COALESCE(pc.vfd_max_speed_pct,     p.vfd_max_speed_pct)    AS vfd_max_speed_pct,
-                  COALESCE(pc.vfd_default_speed_pct, p.vfd_default_speed_pct) AS vfd_default_speed_pct,
-                  al.location_id,
-                  l.code  AS location_code,
-                  l.name  AS location_name
-                FROM public.pumps p
-                LEFT JOIN public.pump_configs pc
-                  ON pc.pump_id = p.id
-                  AND (pc.org_id = p.org_id OR pc.org_id IS NULL)
-                LEFT JOIN public.asset_locations al
-                  ON al.asset_type = 'pump' AND al.asset_id = p.id
-                LEFT JOIN public.locations l
-                  ON l.id = al.location_id
-                WHERE p.org_id = %s
-                ORDER BY p.id
-                """,
-                (org_id,),
-            )
-            return cur.fetchall()
-    except (OperationalError, psy_errors.AdminShutdown, psy_errors.CannotConnectNow, TimeoutError):
-        return []
-    except Exception:
-        return []
+    # 2) Última lectura para detectar MANUAL/lockout
+    last = repo.get_last_pump_reading(pump_id)
+    last_ts, mode, lock_col, raw = (last or (None, None, None, None))
+    raw = raw or {}
+
+    selector_norm = (str(mode or raw.get("selector") or raw.get("control_mode") or raw.get("modo") or "").strip().lower())
+    remote_bool   = _to_bool_loose(raw.get("remote") or raw.get("remote_enabled") or raw.get("remoto"))
+    manual_lockout = bool(lock_col) or selector_norm in {"manual","man","local","lockout","lock-out"}
+    if remote_bool is False:
+        manual_lockout = True
+
+    if manual_lockout:
+        raise HTTPException(
+            403,
+            detail={
+                "message": "Selector en MANUAL: no se aceptan comandos remotos",
+                "pump_id": pump_id,
+                "latest_ts": last_ts,
+                "selector_norm": selector_norm or None,
+                "remote_bool": remote_bool,
+            }
+        )
+
+    # 3) Validaciones SPEED
+    payload: dict | None = None
+    if cmd == "SPEED":
+        if drive_type != "vfd":
+            raise HTTPException(400, "La bomba no es VFD; no admite SPEED")
+        sp = speed_pct if speed_pct is not None else vfd_default
+        if sp is None:
+            raise HTTPException(400, "speed_pct requerido (o default configurado) para SPEED")
+        mn = vfd_min if vfd_min is not None else 0
+        mx = vfd_max if vfd_max is not None else 100
+        if not (mn <= sp <= mx):
+            raise HTTPException(400, f"speed_pct fuera de rango permitido [{mn}..{mx}]")
+        payload = {"speed_pct": int(sp)}
+
+    # 4) Encolar
+    return cmd_repo.enqueue_pump_command(pump_id, cmd, payload, user)
+
+# Transiciones de estado (igual que tanques)
+VALID = {
+    "queued": {"sent", "expired", "failed"},
+    "sent":   {"acked", "failed", "expired"},
+    "acked":  set(),
+    "failed": set(),
+    "expired": set(),
+}
+
+def update_command_status(pump_id: int, cmd_id: int, new_status: str, error: str | None):
+    prev = cmd_repo.get_command_status(cmd_id, pump_id)
+    if not prev:
+        raise HTTPException(404, "Comando no encontrado para esa bomba")
+    if new_status not in VALID.get(prev, set()):
+        raise HTTPException(409, f"Transición inválida {prev} → {new_status}")
+
+    if new_status == "sent":
+        return cmd_repo.mark_sent(cmd_id)
+    elif new_status == "acked":
+        return cmd_repo.mark_acked(cmd_id)
+    else:
+        return cmd_repo.mark_other(cmd_id, new_status, error)
