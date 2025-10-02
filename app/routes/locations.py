@@ -1,4 +1,3 @@
-# app/routes/locations.py
 from typing import List, Dict, Any
 from fastapi import APIRouter, Depends
 from psycopg import OperationalError, errors as psy_errors
@@ -8,20 +7,16 @@ from app.core.db import get_conn
 from app.core.security import device_id_dep
 from app.core.tenancy import require_org
 
-# ⚠️ Esto faltaba y por eso explotaba el import
 router = APIRouter(prefix="/infra", tags=["infra"])
 
 @router.get("/locations")
 def list_locations(_=Depends(device_id_dep)) -> List[Dict[str, Any]]:
-    """
-    Devuelve las localidades con cantidad de bombas y tanques.
-    - Filtra por la organización actual (require_org()).
-    - Tolera errores de DB devolviendo [] (no rompe el front).
-    """
     org_id = require_org()
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-            # Contamos assets SOLO dentro de locations de la misma org
+            # 🔑 Seteamos GUC para RLS (por si hay RLS en assets/locations)
+            cur.execute("select set_config('app.org_id', %s, true)", (str(int(org_id)),))
+
             cur.execute(
                 """
                 WITH pump_counts AS (
@@ -52,7 +47,6 @@ def list_locations(_=Depends(device_id_dep)) -> List[Dict[str, Any]]:
             )
             return cur.fetchall()
     except (OperationalError, psy_errors.AdminShutdown, psy_errors.CannotConnectNow, TimeoutError):
-        # Nunca 500: devolvemos vacío para no frenar el boot del front
         return []
     except Exception:
         return []
