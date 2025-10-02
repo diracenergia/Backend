@@ -1,91 +1,63 @@
 # app/routes/configs_pump.py
 from __future__ import annotations
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Path, Body, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException
 from psycopg.rows import dict_row
+import psycopg
 
-from app.schemas.pumps import PumpConfigIn
-from app.repos import pumps as repo
 from app.core.security import device_id_dep
-from app.core.db import get_conn
+from app.auth.deps import conn_with_rls
 
-router = APIRouter(prefix="/pumps", tags=["config"])
-
-
-@router.get("")
-def list_pumps(_=Depends(device_id_dep)):
-    """
-    Lista bombas visibles para la org actual (vía RLS).
-    """
-    return repo.list_pumps()
-
+router = APIRouter(prefix="/pumps", tags=["pump-config"])
 
 @router.get("/config")
-def list_pumps_with_config(_=Depends(device_id_dep)):
-    """
-    Lista bombas con su configuración (vista/consulta del repo).
-    """
-    return repo.list_pumps_with_config()
-
-
-@router.get("/{pump_id}/config")
-def get_pump_config(pump_id: int = Path(..., ge=1), _=Depends(device_id_dep)):
-    """
-    Devuelve la config de una bomba. Si no existe, el repo puede
-    devolver valores nulos/por defecto.
-    """
-    # Si querés validar pertenencia a la org antes de consultar:
-    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(
-            """
-            SELECT p.id
-            FROM public.pumps p
-            JOIN public.locations l ON l.id = p.location_id
-            WHERE p.id = %s
-              AND l.org_id = current_setting('app.org_id')::bigint
-            """,
-            (pump_id,),
-        )
-        if not cur.fetchone():
-            raise HTTPException(404, "pump not found")
-
-    # Delegamos al repo (que ya usa RLS vía get_conn)
-    return repo.get_pump_config(pump_id)
-
-
-@router.put("/{pump_id}/config")
-def upsert_pump_config_put(
-    pump_id: int = Path(..., ge=1),
-    body: PumpConfigIn = Body(...),
+def list_configs(
+    location_id: Optional[int] = Query(None, description="Filtra por location_id"),
     _=Depends(device_id_dep),
-):
+    conn=Depends(conn_with_rls),
+) -> List[Dict[str, Any]]:
     """
-    Upsert de configuración (método preferido por el front).
-    Valida que la bomba pertenezca a la org actual.
+    Devuelve config de bombas (un row por bomba) combinando:
+      - public.pumps (datos básicos)
+      - public.pump_config (umbrales/config; si falta, se usa lo que haya en pumps)
+      - public.asset_locations -> public.locations (ubicación)
+    Scopeado por org actual via current_setting('app.org_id').
     """
-    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(
-            """
-            SELECT p.id
-            FROM public.pumps p
-            JOIN public.locations l ON l.id = p.location_id
-            WHERE p.id = %s
-              AND l.org_id = current_setting('app.org_id')::bigint
-            """,
-            (pump_id,),
-        )
-        if not cur.fetchone():
-            raise HTTPException(404, "pump not found")
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT
+                  p.id   AS pump_id,
+                  p.name AS pump_name,
+                  p.model,
+                  p.max_flow_lpm,
 
-    cfg = repo.upsert_pump_config(pump_id, body)
-    return {"ok": True, "config": cfg}
+                  -- Preferimos valores de pump_config; si no hay, caemos a columnas de pumps
+                  COALESCE(pc.remote_enabled, p.remote_enabled)                 AS remote_enabled,
+                  COALESCE(pc.drive_type,     p.drive_type::text)              AS drive_type,
+                  COALESCE(pc.vfd_min_speed_pct,     p.vfd_min_speed_pct)      AS vfd_min_speed_pct,
+                  COALESCE(pc.vfd_max_speed_pct,     p.vfd_max_speed_pct)      AS vfd_max_speed_pct,
+                  COALESCE(pc.vfd_default_speed_pct, p.vfd_default_speed_pct)  AS vfd_default_speed_pct,
 
-
-# Fallback por compatibilidad (el front intenta PUT y, si recibe 405, hace POST)
-@router.post("/{pump_id}/config")
-def upsert_pump_config_post(
-    pump_id: int = Path(..., ge=1),
-    body: PumpConfigIn = Body(...),
-    _=Depends(device_id_dep),
-):
-    return upsert_pump_config_put(pump_id, body)  # reutilizamos la misma lógica
+                  al.location_id,
+                  l.code AS location_code,
+                  l.name AS location_name
+                FROM public.pumps p
+                LEFT JOIN public.pump_config pc
+                  ON pc.pump_id = p.id
+                LEFT JOIN public.asset_locations al
+                  ON al.asset_type = 'pump' AND al.asset_id = p.id
+                LEFT JOIN public.locations l
+                  ON l.id = al.location_id
+                WHERE p.org_id = current_setting('app.org_id')::bigint
+                  AND (%s::bigint IS NULL OR al.location_id = %s)
+                ORDER BY l.name NULLS LAST, p.name;
+                """,
+                (location_id, location_id),
+            )
+            return [dict(r) for r in cur.fetchall()]
+    except psycopg.OperationalError:
+        # mismo mensaje que estás viendo en el front, pero más claro
+        raise HTTPException(status_code=500, detail="internal error: OperationalError")
