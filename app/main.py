@@ -1,21 +1,23 @@
 # app/main.py
+from __future__ import annotations
+
 import os
 import sys
 import time
 import logging
 from pathlib import Path
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Body, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
-from starlette.middleware.trustedhost import TrustedHostMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
-# === Import robusto para ClientDisconnect (Starlette moderno -> requests; viejo -> exceptions)
+# ---- starlette ClientDisconnect (compat) ----
 try:
-    from starlette.requests import ClientDisconnect  # Starlette >= ~0.14
+    from starlette.requests import ClientDisconnect  # Starlette recientes
 except Exception:
     try:
         from starlette.exceptions import ClientDisconnect  # fallback
@@ -25,71 +27,31 @@ except Exception:
 
 import anyio
 
-# Routers varios
-from app.routes.control import control_router
-from app.routes.kpi import router as kpi_router
-
-from app.routes.graph_api import router as graph_router
-from app.routes.locations import router as locations_router
-
-from app.routes.ingest import router as ingest_tank_router
-from app.routes.latest import router as latest_tank_router
-from app.routes.history import router as history_tank_router
-from app.routes.configs import router as configs_tank_router
-from app.routes.commands_tanks import router as commands_tank_router
-
-from app.routes.ingest_pump import router as ingest_pump_router
-from app.routes.latest_pump import router as latest_pump_router
-from app.routes.history_pump import router as history_pump_router
-from app.routes.configs_pump import router as configs_pump_router
-from app.routes.commands_pumps import router as commands_pump_router
-
-from app.routes.alarms import router as alarms_router
-from app.routes.audit import router as audit_router
-from app.routes.diag_listener import router as diag_listener_router
-from app.ws import router as ws_router
-from app.routes.live_view import viz_router
-
-from app.auth.router import router as auth_router
-from app.auth.deps import conn_with_rls  # noqa: F401
-
-# ===== LOGGING GLOBAL =====
+# =========================
+# LOGGING
+# =========================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("rdls")
-logger.info(f"[boot] LOG_LEVEL={LOG_LEVEL}")
+log = logging.getLogger("ops")
 
-# ===== Config centralizada =====
-try:
-    from app.core.config import settings  # opcional
-except Exception:
-    settings = None
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except Exception:
-        pass
+# =========================
+# APP
+# =========================
+APP_TITLE = os.getenv("APP_TITLE", "SCADA API")
+APP_VERSION = os.getenv("APP_VERSION") or os.getenv("RENDER_GIT_COMMIT", "")[:8] or None
+app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 
-
-def _get_env(name: str, default: str = "") -> str:
-    if settings and hasattr(settings, name):
-        return str(getattr(settings, name))
-    return os.getenv(name, default)
-
-
-APP_TITLE = _get_env("APP_TITLE", "ESP32 Tank/Pump API")
-APP_VERSION = _get_env("APP_VERSION", "") or _get_env("RENDER_GIT_COMMIT", "")[:8]
-app = FastAPI(title=APP_TITLE, version=APP_VERSION or None)
-
-# ===== Middleware de LOG =====
+# =========================
+# MIDDLEWARES
+# =========================
 class LoggingMiddleware(BaseHTTPMiddleware):
     def __init__(self, app):
         super().__init__(app)
-        self._log = logging.getLogger("rdls.http")
+        self._log = logging.getLogger("ops.http")
 
     async def dispatch(self, request: Request, call_next):
         t0 = time.time()
@@ -97,111 +59,38 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         safe_headers = {
             "origin": hdr.get("origin"),
             "x-org-id": hdr.get("x-org-id"),
-            "x-device-id": hdr.get("x-device-id"),
-            "x-api-key-present": bool(hdr.get("x-api-key")),
             "authorization-present": bool(hdr.get("authorization")),
-            "content-type": hdr.get("content-type"),
         }
-
-        body_text = None
-        if (request.url.path, request.method) in {("/ingest/tank", "POST"), ("/ingest/pump", "POST")}:
-            try:
-                body_bytes = await request.body()
-                body_text = body_bytes.decode("utf-8")[:2000]
-            except Exception as e:
-                body_text = f"<no-body: {e}>"
-
-        self._log.info(f"[REQ] {request.method} {request.url.path} {safe_headers} body={body_text}")
+        self._log.info(f"[REQ] {request.method} {request.url.path} {safe_headers}")
         try:
             response = await call_next(request)
             dt = (time.time() - t0) * 1000
             self._log.info(f"[RES] {request.method} {request.url.path} status={response.status_code} {dt:.1f}ms")
             return response
-
         except (ClientDisconnect, anyio.EndOfStream):
-            self._log.info(f"[DISCONNECT] {request.method} {request.url.path} (client closed connection)")
+            self._log.info(f"[DISCONNECT] {request.method} {request.url.path}")
             return Response(status_code=499)
-
         except Exception:
-            self._log.exception(f"[ERR] {request.method} {request.url.path} crashed")
+            self._log.exception(f"[ERR] {request.method} {request.url.path}")
             raise
 
-
-# ===== Tenancy (RLS) =====
-from app.core.tenancy import tenant_ctx_dep
-
-_PUBLIC_PATHS = {
-    "/", "/health", "/health/db", "/favicon.ico",
-    "/__config", "/openapi.json", "/docs", "/redoc",
-    "/__alarm_poller_status", "/__which_alarms_eval", "/__which_alarm_events",
-}
-# ⚠️ NO incluir "/infra" acá para que aplique tenant_ctx_dep
-_PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws", "/ingest", "/auth")
-
-
-# ... arriba igual ...
-
-class TenantContextMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        # Preflight: dejar pasar
-        if request.method == "OPTIONS":
-            return await call_next(request)
-
-        path = request.url.path
-        if path in _PUBLIC_PATHS or any(path.startswith(p) for p in _PUBLIC_PREFIXES):
-            return await call_next(request)
-
-        # === 🔧 NUEVO: derivar org_id del JWT si no vino x-org-id
-        auth = request.headers.get("authorization")
-        x_org = request.headers.get("x-org-id")
-        if not x_org and auth:
-            try:
-                import jwt  # usa PyJWT que ya tienes
-                # Para MVP podemos leer sin verificar firma (solo para extraer claims)
-                token = auth.split(" ", 1)[1] if " " in auth else auth
-                payload = jwt.decode(token, options={"verify_signature": False})
-                claim_org = payload.get("org_id")
-                if claim_org is not None:
-                    x_org = str(claim_org)
-            except Exception:
-                # si falla, seguimos sin x_org y lo resolverá tenant_ctx_dep
-                pass
-
-        try:
-            await tenant_ctx_dep(
-                request,
-                authorization=auth,
-                x_org_id=x_org,  # ← pasa el derivado
-                x_user_id=request.headers.get("x-user-id"),
-                x_role=request.headers.get("x-role"),
-            )
-        except HTTPException as e:
-            return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
-
-        return await call_next(request)
-
-
-
-# ======== CORS: Modo MVP súper permisivo (sin credenciales) ========
-# 1) CORSMiddleware con '*' (válido porque NO usamos cookies en el navegador)
+# CORS sin credenciales -> ACAO: *
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # ACAO: *
-    allow_credentials=False,   # clave: con False, el browser acepta '*'
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
 
-# 2) Forzar headers CORS también en errores 4xx/5xx
+# Fuerza headers CORS incluso en errores
 class ForceCorsStarMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         try:
             response = await call_next(request)
         except Exception as e:
-            # Garantiza JSON 500 visible desde el browser
             response = JSONResponse(status_code=500, content={"detail": f"internal error: {e.__class__.__name__}"})
-        # Inyecta '*' SIEMPRE
         h = response.headers
         h.setdefault("Access-Control-Allow-Origin", "*")
         h.setdefault("Access-Control-Allow-Methods", "*")
@@ -210,20 +99,57 @@ class ForceCorsStarMiddleware(BaseHTTPMiddleware):
         return response
 
 app.add_middleware(ForceCorsStarMiddleware)
-
-# ===== Trusted hosts (opcional) =====
-_trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
-TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
-if TRUSTED_HOSTS:
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
-    print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
-
-# ===== GZip + Logging + Tenant =====
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(LoggingMiddleware)
+
+# =========================
+# TENANT CONTEXT (liviano)
+# =========================
+try:
+    from app.core.tenancy import tenant_ctx_dep  # setea contexto global por request
+except Exception:
+    tenant_ctx_dep = None  # tipo: ignore
+
+class TenantContextMiddleware(BaseHTTPMiddleware):
+    PUBLIC_PATHS = {"/", "/health", "/db/ping", "/health/db", "/openapi.json", "/docs", "/redoc", "/favicon.ico"}
+    PUBLIC_PREFIXES = ("/ui", "/static", "/assets")
+
+    async def dispatch(self, request: Request, call_next):
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        path = request.url.path
+        if path in self.PUBLIC_PATHS or any(path.startswith(p) for p in self.PUBLIC_PREFIXES):
+            return await call_next(request)
+
+        if tenant_ctx_dep is not None:
+            # Derivar org de header o del JWT (sin verificar firma, solo para extraer claim)
+            x_org: Optional[str] = request.headers.get("x-org-id")
+            auth = request.headers.get("authorization")
+            if not x_org and auth:
+                try:
+                    import jwt  # PyJWT
+                    token = auth.split(" ", 1)[1] if " " in auth else auth
+                    payload = jwt.decode(token, options={"verify_signature": False})
+                    claim_org = payload.get("org_id")
+                    if claim_org is not None:
+                        x_org = str(claim_org)
+                except Exception:
+                    pass
+            try:
+                await tenant_ctx_dep(
+                    request,
+                    authorization=auth,
+                    x_org_id=x_org,
+                    x_user_id=request.headers.get("x-user-id"),
+                    x_role=request.headers.get("x-role"),
+                )
+            except HTTPException as e:
+                return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
+        return await call_next(request)
+
 app.add_middleware(TenantContextMiddleware)
 
-# ===== Catch-all OPTIONS (por si algún proxy frena el preflight)
+# Catch-all OPTIONS (por si algún proxy corta preflight)
 @app.options("/{rest_of_path:path}")
 def _catchall_options(rest_of_path: str, request: Request):
     resp = Response(status_code=200)
@@ -233,7 +159,9 @@ def _catchall_options(rest_of_path: str, request: Request):
     resp.headers["Access-Control-Allow-Headers"] = req_hdrs or "*"
     return resp
 
-# ===== UI estática =====
+# =========================
+# UI estática (opcional)
+# =========================
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WEB_DIR = REPO_ROOT / "web"
 if WEB_DIR.exists():
@@ -241,200 +169,47 @@ if WEB_DIR.exists():
 else:
     print(f"⚠️ /ui deshabilitado: no existe {WEB_DIR}")
 
-# ===== Routers =====
-app.include_router(diag_listener_router)
+# =========================
+# ROUTER ÚNICO: Operaciones
+# =========================
+from app.routes.ops import router as ops_router
+app.include_router(ops_router)  # -> GET /ops/overview
 
-app.include_router(ingest_tank_router)
-app.include_router(latest_tank_router)
-app.include_router(history_tank_router)
-app.include_router(configs_tank_router)
-app.include_router(commands_tank_router)
-
-app.include_router(ingest_pump_router)
-app.include_router(latest_pump_router)
-app.include_router(history_pump_router)
-app.include_router(configs_pump_router)
-app.include_router(commands_pump_router)
-
-try:
-    from app.routes.tanks import router as tanks_router
-    app.include_router(tanks_router)
-except Exception as e:
-    print(f"⚠️ tanks router no disponible: {e}")
-
-app.include_router(alarms_router)
-app.include_router(audit_router)
-
-# Infra graph bajo /infra (pasa por TenantContextMiddleware)
-app.include_router(graph_router, prefix="/infra", tags=["infra-graph"])
-app.include_router(locations_router)
-
-app.include_router(ws_router)
-app.include_router(kpi_router)
-app.include_router(auth_router, prefix="")  # /auth/...
-app.include_router(viz_router)
-
-# ===== Utilitarios =====
+# =========================
+# HEALTH / PING
+# =========================
 from app.core.db import get_conn
-
 
 @app.get("/")
 def root():
     return {
         "ok": True,
         "service": APP_TITLE,
-        "version": APP_VERSION or None,
+        "version": APP_VERSION,
         "docs": "/docs",
         "health": "/health",
+        "overview": "/ops/overview",
     }
-
 
 @app.get("/favicon.ico")
 def favicon_noop():
     return {}
 
-
 @app.get("/health")
 def health():
     return {"ok": True}
 
-
-@app.get("/health/db")
-def health_db():
+@app.get("/db/ping")
+def db_ping():
     try:
         with get_conn() as conn, conn.cursor() as cur:
-            cur.execute("SELECT 1")
+            cur.execute("select 1")
             cur.fetchone()
-        return {"ok": True, "db": "up"}
+        return {"ok": True}
     except Exception as e:
-        raise HTTPException(500, f"DB error: {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
-
-@app.get("/__config")
-def cfg_echo():
-    return {
-        "cors": {"mode": "star_no_credentials", "allow_origin": "*"},
-        "trusted_hosts": TRUSTED_HOSTS or None,
-        "version": APP_VERSION or None,
-    }
-
-
-@app.get("/__tg_env")
-def tg_env():
-    token = _get_env("TELEGRAM_BOT_TOKEN", "")
-    return {
-        "ENABLED": _get_env("TELEGRAM_ENABLED", ""),
-        "BOT_head": (token[:8] + "...") if token else "",
-        "CHAT": _get_env("TELEGRAM_CHAT_ID", ""),
-    }
-
-
-# ===== Conexión (diagnóstico) =====
-try:
-    from app.routes.conn import router as conn_router
-    app.include_router(conn_router)
-except Exception as e:
-    print(f"⚠️ conn router no disponible: {e}")
-
-# ===== Alarm Poller opcional =====
-try:
-    from app.services.alarm_poller import start_alarm_poller, stop_alarm_poller
-    _HAS_ALARM_POLLER = True
-except Exception as e:
-    print(f"⚠️ alarm-poller no disponible: {e}")
-    start_alarm_poller = None
-    stop_alarm_poller = None
-    _HAS_ALARM_POLLER = False
-
-
-@app.on_event("startup")
-def _startup_listeners():
-    if _HAS_ALARM_POLLER and callable(start_alarm_poller):
-        try:
-            start_alarm_poller()
-            print("[alarm-poller] started")
-        except Exception as e:
-            print(f"⚠️ error al iniciar alarm-poller: {e}")
-
-
-@app.on_event("shutdown")
-def _shutdown_listeners():
-    if _HAS_ALARM_POLLER and callable(stop_alarm_poller):
-        try:
-            stop_alarm_poller()
-            print("[alarm-poller] stopped")
-        except Exception as e:
-            print(f"⚠️ error al detener alarm-poller: {e}")
-
-
-@app.get("/__alarm_poller_status")
-def poller_status():
-    try:
-        from app.services import alarm_poller as ap
-    except Exception as e:
-        return {"alive": False, "error": f"import_error: {e}"}
-    alive = bool(getattr(ap, "_thread", None) and getattr(ap._thread, "is_alive", lambda: False)())
-    return {
-        "alive": alive,
-        "batch": getattr(ap, "BATCH", None),
-        "sleep_empty": getattr(ap, "SLEEP_EMPTY", None),
-        "sleep_busy": getattr(ap, "SLEEP_BUSY", None),
-    }
-
-
-@app.post("/__alarm_poller_stop")
-def poller_stop():
-    if _HAS_ALARM_POLLER and callable(stop_alarm_poller):
-        try:
-            stop_alarm_poller()
-            return {"stopped": True}
-        except Exception as e:
-            return {"stopped": False, "error": str(e)}
-    return {"stopped": False, "error": "poller no disponible"}
-
-
-@app.get("/__which_alarms_eval")
-def which_alarms_eval():
-    import importlib
-    try:
-        mod = importlib.import_module("app.services.alarms_eval")
-        return {
-            "file": getattr(mod, "__file__", None),
-            "version": getattr(mod, "__VERSION__", None),
-            "has_eval": hasattr(mod, "eval_tank_alarm"),
-            "is_callable": callable(getattr(mod, "eval_tank_alarm", None)),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/__which_alarm_events")
-def which_alarm_events():
-    import importlib, inspect
-    try:
-        mod = importlib.import_module("app.services.alarm_events")
-        try:
-            src = inspect.getsource(mod._notify)
-            uses_pg = "pg_notify(" in src
-            preview = src.strip().splitlines()[:5]
-        except Exception:
-            uses_pg = None
-            preview = ["<no source>"]
-        return {
-            "file": getattr(mod, "__file__", None),
-            "version": getattr(mod, "__VERSION__", None),
-            "uses_pg_notify": uses_pg,
-            "notify_src_preview": preview,
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.post("/__diag_publish")
-def __diag_publish(payload: dict = Body(...)):
-    try:
-        from app.services import alarm_events
-        alarm_events._notify(payload)
-        return {"ok": True, "published": payload}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"publish failed: {e}")
+# Compat con lo que ya usabas:
+@app.get("/health/db")
+def health_db():
+    return db_ping()
