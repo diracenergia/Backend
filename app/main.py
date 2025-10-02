@@ -139,9 +139,11 @@ _PUBLIC_PATHS = {
 _PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws", "/ingest", "/auth")
 
 
+# ... arriba igual ...
+
 class TenantContextMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # Preflight CORS: dejar pasar
+        # Preflight: dejar pasar
         if request.method == "OPTIONS":
             return await call_next(request)
 
@@ -149,11 +151,27 @@ class TenantContextMiddleware(BaseHTTPMiddleware):
         if path in _PUBLIC_PATHS or any(path.startswith(p) for p in _PUBLIC_PREFIXES):
             return await call_next(request)
 
+        # === 🔧 NUEVO: derivar org_id del JWT si no vino x-org-id
+        auth = request.headers.get("authorization")
+        x_org = request.headers.get("x-org-id")
+        if not x_org and auth:
+            try:
+                import jwt  # usa PyJWT que ya tienes
+                # Para MVP podemos leer sin verificar firma (solo para extraer claims)
+                token = auth.split(" ", 1)[1] if " " in auth else auth
+                payload = jwt.decode(token, options={"verify_signature": False})
+                claim_org = payload.get("org_id")
+                if claim_org is not None:
+                    x_org = str(claim_org)
+            except Exception:
+                # si falla, seguimos sin x_org y lo resolverá tenant_ctx_dep
+                pass
+
         try:
             await tenant_ctx_dep(
                 request,
-                authorization=request.headers.get("authorization"),
-                x_org_id=request.headers.get("x-org-id"),
+                authorization=auth,
+                x_org_id=x_org,  # ← pasa el derivado
                 x_user_id=request.headers.get("x-user-id"),
                 x_role=request.headers.get("x-role"),
             )
@@ -161,6 +179,7 @@ class TenantContextMiddleware(BaseHTTPMiddleware):
             return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
 
         return await call_next(request)
+
 
 
 # ======== CORS: Modo MVP súper permisivo (sin credenciales) ========
