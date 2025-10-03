@@ -17,7 +17,8 @@ def list_tanks_config():
       high_pct,
       high_high_pct,
       updated_by,
-      updated_at
+      updated_at,
+      level_pct            -- << nueva columna desde v_tanks_with_config
     from public.v_tanks_with_config
     order by tank_id
     """
@@ -38,5 +39,6 @@ def list_tanks_config():
             "high_high_pct":  float(r["high_high_pct"])  if r["high_high_pct"]  is not None else None,
             "updated_by":     r["updated_by"],
             "updated_at":     r["updated_at"],
+            "level_pct":      float(r["level_pct"])      if r.get("level_pct")  is not None else None,  # << agregado
         })
     return out
