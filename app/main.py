@@ -83,6 +83,17 @@ APP_TITLE = _get_env("APP_TITLE", "ESP32 Tank/Pump API")
 APP_VERSION = _get_env("APP_VERSION", "") or _get_env("RENDER_GIT_COMMIT", "")[:8]
 app = FastAPI(title=APP_TITLE, version=APP_VERSION or None)
 
+# ===== CORS (modo abierto: equivalente a “sin CORS” en navegador) =====
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],        # todos los orígenes
+    allow_methods=["*"],        # todos los métodos
+    allow_headers=["*"],        # todos los headers
+    allow_credentials=False,    # debe ser False si usamos "*"
+    expose_headers=["*"],
+    max_age=3600,
+)
+
 # ===== Middleware de LOG de request/response (antes de tenancy para ver TODO) =====
 class LoggingMiddleware(BaseHTTPMiddleware):
     def __init__(self, app):
@@ -126,17 +137,6 @@ class LoggingMiddleware(BaseHTTPMiddleware):
             raise
 
 app.add_middleware(LoggingMiddleware)
-
-# ===== CORS (modo abierto: equivalente a “sin CORS” en navegador) =====
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],        # todos los orígenes
-    allow_methods=["*"],        # todos los métodos
-    allow_headers=["*"],        # todos los headers
-    allow_credentials=False,    # debe ser False si usamos "*"
-    expose_headers=["*"],
-    max_age=3600,
-)
 
 # ===== Trusted hosts (opcional) =====
 _trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
