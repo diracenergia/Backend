@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
+from app.routes.db_diag import router as db_diag_router
 
 # === Import robusto para ClientDisconnect (Starlette moderno -> requests; viejo -> exceptions)
 try:
@@ -173,6 +174,8 @@ app.include_router(viz_router)
 
 # 👉 Nuevo: incluir Operaciones
 app.include_router(operaciones_router)  # /operaciones
+
+app.include_router(db_diag_router)
 
 # ===== Utilitarios =====
 from app.core.db import get_conn
