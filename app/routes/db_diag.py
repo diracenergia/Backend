@@ -1,5 +1,6 @@
 from fastapi import APIRouter
-from app.core.db import get_conn, PRIMARY_DSN, FALLBACK_DSN
+import psycopg
+from app.core.db import PRIMARY_DSN, FALLBACK_DSN
 from urllib.parse import urlparse
 
 router = APIRouter()
@@ -11,17 +12,21 @@ def hostport(dsn: str):
     except Exception:
         return None
 
-@router.get("/__db_diag")
-def db_diag():
-    info = {
-        "primary": hostport(PRIMARY_DSN),
-        "fallback": hostport(FALLBACK_DSN),
-    }
+def test_dsn(dsn: str):
+    if not dsn:
+        return {"ok": False, "error": "empty DSN"}
     try:
-        with get_conn() as conn, conn.cursor() as cur:
-            cur.execute("select inet_server_addr(), inet_server_port()")
-            a, p = cur.fetchone()
-        info["connect"] = {"ok": True, "server_addr": str(a), "server_port": p}
+        with psycopg.connect(dsn, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute("select inet_server_addr(), inet_server_port()")
+                a, p = cur.fetchone()
+            return {"ok": True, "server_addr": str(a), "server_port": p}
     except Exception as e:
-        info["connect"] = {"ok": False, "error": str(e)}
-    return info
+        return {"ok": False, "error": str(e)}
+
+@router.get("/__db_diag_full")
+def db_diag_full():
+    return {
+        "primary": {"dsn": hostport(PRIMARY_DSN),  "result": test_dsn(PRIMARY_DSN)},
+        "fallback": {"dsn": hostport(FALLBACK_DSN), "result": test_dsn(FALLBACK_DSN)},
+    }
