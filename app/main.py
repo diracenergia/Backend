@@ -9,17 +9,15 @@ from fastapi import FastAPI, HTTPException, Body, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
-from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
-from fastapi.middleware.cors import CORSMiddleware
 
 # === Import robusto para ClientDisconnect (Starlette moderno -> requests; viejo -> exceptions)
 try:
-    from starlette.requests import ClientDisconnect  # Starlette >= ~0.14 en adelante
+    from starlette.requests import ClientDisconnect  # Starlette >= ~0.14
 except Exception:
     try:
-        from starlette.exceptions import ClientDisconnect  # fallback p/ versiones antiguas
-    except Exception:  # último fallback: definimos la clase para evitar NameError
+        from starlette.exceptions import ClientDisconnect  # fallback
+    except Exception:  # último fallback
         class ClientDisconnect(Exception):
             pass
 
@@ -52,6 +50,9 @@ from app.routes.live_view import viz_router
 
 from app.auth.router import router as auth_router
 from app.auth.deps import conn_with_rls  # noqa: F401
+
+# 🔥 Nuevo: router de Operaciones (archivo que acabamos de crear)
+from app.routes.operaciones import router as operaciones_router
 
 # ===== LOGGING GLOBAL =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -116,7 +117,6 @@ class LoggingMiddleware(BaseHTTPMiddleware):
             return response
 
         except (ClientDisconnect, anyio.EndOfStream):
-            # Cliente abortó la conexión (abort() en fetch, navegación, etc.)
             self._log.info(f"[DISCONNECT] {request.method} {request.url.path} (client closed connection)")
             return Response(status_code=499)
 
@@ -127,76 +127,8 @@ class LoggingMiddleware(BaseHTTPMiddleware):
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(LoggingMiddleware)
 
-# ===== Tenancy (RLS) =====
-from app.core.tenancy import tenant_ctx_dep
-
-_PUBLIC_PATHS = {
-    "/", "/health", "/health/db", "/favicon.ico",
-    "/__config", "/openapi.json", "/docs", "/redoc",
-    "/__alarm_poller_status", "/__which_alarms_eval", "/__which_alarm_events",
-}
-# Agregamos "/auth" para login público
-_PUBLIC_PREFIXES = ("/ui", "/static", "/assets", "/ws", "/ingest", "/infra", "/auth")
-
-class TenantContextMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        # Preflight CORS: dejar pasar
-        if request.method == "OPTIONS":
-            return await call_next(request)
-
-        path = request.url.path
-        if path in _PUBLIC_PATHS or any(path.startswith(p) for p in _PUBLIC_PREFIXES):
-            return await call_next(request)
-
-        try:
-            await tenant_ctx_dep(
-                request,
-                authorization=request.headers.get("authorization"),
-                x_org_id=request.headers.get("x-org-id"),
-                x_user_id=request.headers.get("x-user-id"),
-                x_role=request.headers.get("x-role"),
-            )
-        except HTTPException as e:
-            return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
-
-        return await call_next(request)
-
-app.add_middleware(TenantContextMiddleware)
-
-# ===== Trusted hosts (opcional) =====
-_trusted_hosts_raw = _get_env("TRUSTED_HOSTS", "").strip()
-TRUSTED_HOSTS = [h.strip() for h in _trusted_hosts_raw.split(",") if h.strip()]
-if TRUSTED_HOSTS:
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
-    print("[TrustedHost] enabled ->", TRUSTED_HOSTS)
-
-# ===== CORS (el más externo: agregarlo AL FINAL) =====
-_raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
-_origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
-if _raw == "*":
-    ALLOW_ALL_ORIGINS = True
-    ALLOWED_ORIGINS = ["*"]
-else:
-    ALLOW_ALL_ORIGINS = False
-    ALLOWED_ORIGINS = [o.strip() for o in _raw.split(",") if o.strip()]
-
-ALLOW_CREDENTIALS = False
-ALLOW_METHODS = ["*"]
-ALLOW_HEADERS = ["*"]
-
-print("[CORS] allow_all          =", ALLOW_ALL_ORIGINS)
-print("[CORS] allow_origins      =", ALLOWED_ORIGINS)
-print("[CORS] allow_origin_regex =", _origin_regex or "(none)")
-print("[CORS] allow_credentials  =", ALLOW_CREDENTIALS)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=_origin_regex or None,
-    allow_credentials=ALLOW_CREDENTIALS,
-    allow_methods=ALLOW_METHODS,
-    allow_headers=ALLOW_HEADERS,
-)
+# ⚠️ Seguridad/Multi-tenant/CORS/TrustedHost deshabilitados en DEV para no complicar
+# - Se quitaron: TenantContextMiddleware, TrustedHostMiddleware y CORS middleware.
 
 # ===== UI estática =====
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -239,6 +171,9 @@ app.include_router(auth_router, prefix="")  # /auth/...
 
 app.include_router(viz_router)
 
+# 👉 Nuevo: incluir Operaciones
+app.include_router(operaciones_router)  # /operaciones
+
 # ===== Utilitarios =====
 from app.core.db import get_conn
 
@@ -273,13 +208,11 @@ def health_db():
 @app.get("/__config")
 def cfg_echo():
     return {
-        "cors": {
-            "allow_all": ALLOW_ALL_ORIGINS,
-            "allow_origins": ALLOWED_ORIGINS,
-            "allow_origin_regex": _origin_regex or None,
-            "allow_credentials": ALLOW_CREDENTIALS,
+        "security": {
+            "cors": "disabled",
+            "trusted_hosts": "disabled",
+            "tenant_ctx": "disabled",
         },
-        "trusted_hosts": TRUSTED_HOSTS or None,
         "version": APP_VERSION or None,
     }
 
