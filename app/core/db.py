@@ -30,8 +30,10 @@ if os.getenv("DEBUG_DB_DSN") == "1":
     print(f"[DB] FALLBACK_DSN (repr): {FALLBACK_DSN!r}")
 
 CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "5"))
-FORCE_IPV4 = os.getenv("DB_FORCE_IPV4") == "1"
 
+# =========================
+# IPv4 helper (forzamos IPv4 si existe)
+# =========================
 def _ipv4_for_host(host: Optional[str]) -> Optional[str]:
     if not host:
         return None
@@ -41,10 +43,16 @@ def _ipv4_for_host(host: Optional[str]) -> Optional[str]:
         return None
 
 def _hostaddr_for(dsn: str) -> Optional[str]:
-    if not (dsn and FORCE_IPV4):
+    """
+    Siempre intentamos resolver IPv4 del host del DSN.
+    Si existe, lo devolvemos para pasarlo como hostaddr=... a psycopg,
+    evitando intentos IPv6 que en algunos entornos fallan.
+    """
+    try:
+        host = urlparse(dsn).hostname
+        return _ipv4_for_host(host)
+    except Exception:
         return None
-    host = urlparse(dsn).hostname
-    return _ipv4_for_host(host)
 
 # =========================
 # Tenancy / RLS helpers (GUCs)
@@ -83,10 +91,10 @@ def _connect(dsn: str) -> psycopg.Connection:
     if not dsn:
         raise RuntimeError("DSN vacío (DB_URL/DATABASE_URL no definido)")
     kw = {"connect_timeout": CONNECT_TIMEOUT}
-    ha = _hostaddr_for(dsn)
+    ha = _hostaddr_for(dsn)  # intentamos siempre IPv4
     if ha:
         kw["hostaddr"] = ha
-        log.info("[db] connect (ipv4) -> %s", ha)
+        log.info("[db] connect (hostaddr=%s)", ha)
     else:
         log.info("[db] connect -> %s", "pooler" if "pooler" in dsn else "direct")
     return psycopg.connect(dsn, **kw)
@@ -146,7 +154,7 @@ def get_events_conn():
     """
     try:
         kw = {"autocommit": True, "connect_timeout": CONNECT_TIMEOUT}
-        ha = _hostaddr_for(EVENTS_DSN)
+        ha = _hostaddr_for(EVENTS_DSN)  # también forzamos IPv4 si está
         if ha:
             kw["hostaddr"] = ha
         with psycopg.connect(EVENTS_DSN, **kw) as conn:
