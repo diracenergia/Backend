@@ -1,107 +1,103 @@
 # app/services/alarm_listener.py
-import os, json, asyncio, logging
-import psycopg
-from psycopg.rows import dict_row
-from .telegram import send
+from __future__ import annotations
+import os, json, time, threading, logging
+from typing import Optional, Dict, Any
 
-log = logging.getLogger("alarm_listener")
+from app.core.db import get_events_conn  # ⬅️ usar la conexión directa
+from app.services import notify_alarm
 
-EMO_SEV = {"CRITICAL": "🔴", "WARNING": "🟠", "INFO": "ℹ️"}
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="ts=%(asctime)s level=%(levelname)s module=%(name)s msg=%(message)s",
+)
+log = logging.getLogger("alarm-listener")
 
-def _label(asset_type: str, asset_id, name: str | None):
-    nice = {"tank": "Tanque", "pump": "Bomba", "valve": "Válvula", "manifold": "Colectora"}.get(
-        (asset_type or "").lower(), asset_type
-    )
-    return f"{nice} {name or asset_id}"
+CHAN = os.getenv("ALARM_NOTIFY_CHANNEL", "alarm_events")
 
-def _format(payload: dict, name: str | None) -> str:
-    op   = str(payload.get("op") or payload.get("event") or "").upper()  # RAISED / CLEARED
-    code = str(payload.get("code") or "").upper()
-    sev  = str(payload.get("severity") or "INFO").upper()
-    a_t  = str(payload.get("asset_type") or payload.get("type") or "")
-    a_id = payload.get("asset_id") or payload.get("id")
-    msg  = payload.get("message") or ""
-    val  = payload.get("value") or payload.get("level_percent")
-    thr  = payload.get("threshold") or payload.get("threshold_pct")
+_thread: Optional[threading.Thread] = None
+_stop = threading.Event()
+_last_sent: list[dict] = []
 
-    # Normalizar op
-    if op == "RAISE": op = "RAISED"
-    if op == "CLEAR": op = "CLEARED"
+_RETRY_BASE = 1.5
+_RETRY_MAX = 30.0
 
-    # Bombas ON/OFF (code RUNNING)
-    if a_t == "pump" and code == "RUNNING":
-        verb = "ON ▶️" if op == "RAISED" else "OFF ⏹️"
-        return f"💡 {_label(a_t, a_id, name)} {verb}"
-
-    # Tanques por umbral
-    if a_t == "tank" and code:
-        bits = []
-        if thr is not None: bits.append(f"umbral {thr}")
-        if val is not None: bits.append(f"nivel {val}%")
-        tail = f" ({', '.join(bits)})" if bits else ""
-        emoji = EMO_SEV.get(sev, "ℹ️")
-        state = "ALERTA" if op == "RAISED" else "NORMAL"
-        return f"{emoji} {_label(a_t, a_id, name)}: {code} {state}{tail}"
-
-    # Genérico
-    emoji = EMO_SEV.get(sev, "ℹ️")
-    base = msg or code or op or "evento"
-    return f"{emoji} {_label(a_t, a_id, name)}: {base}"
-
-async def _get_name(aconn: psycopg.AsyncConnection, asset_type: str, asset_id):
+def _decode_payload(payload: str) -> Dict[str, Any]:
     try:
-        async with aconn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                "SELECT name FROM public.v_asset_nodes WHERE type=%s AND asset_id=%s LIMIT 1;",
-                (asset_type, asset_id),
-            )
-            row = await cur.fetchone()
-            return row["name"] if row else None
-    except Exception:
-        return None
-
-async def _mark_notified(aconn: psycopg.AsyncConnection, alarm_id):
-    if not alarm_id:
-        return
-    try:
-        async with aconn.cursor() as cur:
-            await cur.execute(
-                "UPDATE public.alarms SET tg_notified_at = now() WHERE id=%s;",
-                (int(alarm_id),),
-            )
+        data = json.loads(payload)
+        return data if isinstance(data, dict) else {}
     except Exception as e:
-        log.warning("mark_notified failed: %s", e)
+        log.exception("decode error err=%s payload=%r", e, payload[:200])
+        return {}
 
-async def listen_alarm_events():
-    # gating por envs
-    if os.getenv("TELEGRAM_ENABLED", "").lower() not in ("1","true","yes","on"):
-        log.info("Telegram disabled; listener no iniciado")
-        return
-    dsn = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or os.getenv("PG_DSN")
-    if not dsn:
-        log.warning("DATABASE_URL no definido; listener no iniciado")
-        return
+def _should_send(evt: Dict[str, Any]) -> bool:
+    op = evt.get("op")
+    ok = bool(op in ("RAISED", "CLEARED") and evt.get("asset_type") and evt.get("asset_id") is not None and evt.get("code"))
+    log.info("should_send op=%s decision=%s", op, ok)
+    return ok
 
-    aconn = await psycopg.AsyncConnection.connect(dsn)
-    await aconn.execute("LISTEN alarm_events;")
-    log.info("LISTEN alarm_events listo")
-
+def _dispatch(evt: Dict[str, Any]) -> None:
     try:
-        while True:
-            note = await aconn.notifies.get()  # queue de psycopg3
+        log.info("dispatch start op=%s asset=%s-%s code=%s", evt.get("op"), evt.get("asset_type"), evt.get("asset_id"), evt.get("code"))
+        status = notify_alarm.send(evt)
+        _last_sent.append({"ts": time.time(), "evt": evt, "status": status})
+        if len(_last_sent) > 100:
+            _last_sent.pop(0)
+        log.info("dispatch done status=%s", status)
+    except Exception as e:
+        log.exception("dispatch error err=%s evt=%r", e, evt)
+
+def _listen_once() -> None:
+    log.info("db_conn opening(channel=%s)", CHAN)
+    with get_events_conn() as conn, conn.cursor() as cur:
+        cur.execute(f'LISTEN "{CHAN}"')
+        # autocommit=True en la conexión; no hace falta commit extra
+        log.info("listen_subscribed channel=%s dsn=%s", CHAN, getattr(conn, "dsn", "<hidden>"))
+
+        while not _stop.is_set():
             try:
-                payload = json.loads(note.payload)
-            except Exception:
-                log.exception("payload invalido: %r", note.payload)
+                # psycopg3: iterador de notificaciones
+                for notify in conn.notifies(timeout=5.0):
+                    log.info("notify_recv pid=%s payload_len=%s", getattr(notify, "pid", None), len(notify.payload))
+                    evt = _decode_payload(notify.payload)
+                    if evt and _should_send(evt):
+                        _dispatch(evt)
+            except TimeoutError:
+                # quiet period; seguir
                 continue
+            except Exception as e:
+                log.exception("notifies loop error err=%s", e)
+                break
+    log.info("db_conn closed")
 
-            name = await _get_name(aconn, payload.get("asset_type"), payload.get("asset_id"))
-            text = _format(payload, name)
+def _listen_loop() -> None:
+    attempt = 0
+    while not _stop.is_set():
+        try:
+            _listen_once()
+            attempt = 0
+        except Exception as e:
+            attempt += 1
+            wait_s = min(_RETRY_MAX, _RETRY_BASE ** attempt)
+            log.exception("loop error err=%r; retry in %.1fs", e, wait_s)
+            t_end = time.time() + wait_s
+            while time.time() < t_end and not _stop.is_set():
+                time.sleep(0.1)
+    log.info("loop stopped")
 
-            # send() es sincrónico → ejecutarlo en pool de hilos
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, send, text)
+def start_alarm_listener() -> None:
+    global _thread
+    if _thread and _thread.is_alive():
+        log.info("already running")
+        return
+    _stop.clear()
+    _thread = threading.Thread(target=_listen_loop, name="alarm-listener", daemon=True)
+    _thread.start()
+    log.info("thread started")
 
-            await _mark_notified(aconn, payload.get("alarm_id"))
-    finally:
-        await aconn.close()
+def stop_alarm_listener() -> None:
+    global _thread
+    _stop.set()
+    if _thread:
+        _thread.join(timeout=5)
+    log.info("thread stopped")
