@@ -18,67 +18,14 @@ def _to_dict(model):
     return model.dict(exclude_unset=True)
 
 
-# ==============================
-# STATUS: declarar ANTES que "/{tank_id}"
-# ==============================
-
-@router.get("/status")
-def list_tanks_status(
-    user_id: Optional[int] = Query(default=None),
-    _=Depends(device_id_dep),
-):
-    """
-    Devuelve estado/color por tanque, basado en:
-      - v_tank_latest_full (has_data)
-      - alarms LEVEL activas (severity -> warning/critical)
-    Gris si has_data=False, amarillo si warning/info, rojo si critical (opcional), verde si ok.
-    """
-    org_id = require_org()
-    try:
-        return repo.list_tank_status_from_alarms(org_id=org_id, user_id=user_id)
-    except Exception as e:
-        print(f"[tanks] status list error: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="status list failed")
-
-
-@router.get("/{tank_id}/status")
-def get_tank_status(
-    tank_id: int,
-    _=Depends(device_id_dep),
-):
-    """
-    Estado/color para un tanque puntual.
-    """
-    org_id = require_org()
-    try:
-        rows = repo.list_tank_status_from_alarms(org_id=org_id, user_id=None)
-        for r in rows:
-            if r.get("tank_id") == tank_id:
-                return r
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tank status not found")
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[tanks] status get error: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="status get failed")
-
-
-# ==============================
-# CRUD
-# ==============================
-
 @router.get("", response_model=List[TankOut])
 def list_tanks(
     user_id: Optional[int] = Query(default=None),
     _=Depends(device_id_dep),
 ):
     org_id = require_org()
-    try:
-        # repo.list_tanks debe filtrar por org_id
-        return repo.list_tanks(org_id=org_id, user_id=user_id)
-    except Exception as e:
-        print(f"[tanks] list error: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="list failed")
+    # repo.list_tanks debe filtrar por org_id
+    return repo.list_tanks(org_id=org_id, user_id=user_id)
 
 
 @router.get("/{tank_id}", response_model=TankOut)
@@ -87,16 +34,10 @@ def get_tank(
     _=Depends(device_id_dep),
 ):
     org_id = require_org()
-    try:
-        t = repo.get_tank(org_id=org_id, tank_id=tank_id)
-        if not t:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tank not found")
-        return t
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[tanks] get error: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="get failed")
+    t = repo.get_tank(org_id=org_id, tank_id=tank_id)
+    if not t:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tank not found")
+    return t
 
 
 @router.post("", response_model=TankOut, status_code=status.HTTP_201_CREATED)
@@ -135,3 +76,39 @@ def update_tank(
     except Exception as e:
         print(f"[tanks] update error: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="update failed")
+
+
+# ==============================
+# NUEVO: endpoints de STATUS
+# ==============================
+
+@router.get("/status")
+def list_tanks_status(
+    user_id: Optional[int] = Query(default=None),
+    _=Depends(device_id_dep),
+):
+    """
+    Devuelve estado/color por tanque, basado en:
+      - v_tank_latest_full (has_data)
+      - alarms LEVEL activas (severity -> warning/critical)
+    Gris si has_data=False, amarillo si warning/info, rojo si critical (opcional), verde si ok.
+    """
+    org_id = require_org()
+    return repo.list_tank_status_from_alarms(org_id=org_id, user_id=user_id)
+
+
+@router.get("/{tank_id}/status")
+def get_tank_status(
+    tank_id: int,
+    _=Depends(device_id_dep),
+):
+    """
+    Estado/color para un tanque puntual.
+    """
+    org_id = require_org()
+    # Ideal: repo.get_tank_status(org_id, tank_id). Si no existe, reusamos la lista.
+    rows = repo.list_tank_status_from_alarms(org_id=org_id, user_id=None)
+    for r in rows:
+        if r.get("tank_id") == tank_id:
+            return r
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tank status not found")
