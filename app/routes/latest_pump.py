@@ -1,68 +1,46 @@
-from __future__ import annotations
-
-from fastapi import APIRouter, HTTPException, Depends, Path
+# app/routes/latest_pump.py
+from fastapi import APIRouter, HTTPException
 from psycopg.rows import dict_row
+from app.core.db import get_conn
 
-from app.core.security import device_id_dep
-from app.auth.deps import conn_with_rls
+router = APIRouter(tags=["latest"])
 
-router = APIRouter(prefix="/pumps", tags=["latest"])
-
-@router.get("/{pump_id}/latest")
-def latest_pump(
-    pump_id: int = Path(..., ge=1),
-    _=Depends(device_id_dep),
-    conn=Depends(conn_with_rls),
-):
+@router.get("/pumps/{pump_id}/latest")
+def latest_pump(pump_id: int):
     """
     - 200 con una fila SIEMPRE (has_data=false si no hay lecturas)
-    - 404 si la bomba no pertenece a la org actual
+    - 404 solo si la bomba NO existe
     """
-    with conn.cursor(row_factory=dict_row) as cur:
-        # 1) Validar org_id directo (pumps tiene org_id)
-        cur.execute(
-            """
-            SELECT id, name
-            FROM public.pumps
-            WHERE id = %s
-              AND org_id = current_setting('app.org_id')::bigint
-            """,
-            (pump_id,),
-        )
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        # 1) ¿existe la bomba?
+        cur.execute("SELECT id, name FROM pumps WHERE id=%s;", (pump_id,))
         pump = cur.fetchone()
         if not pump:
-            raise HTTPException(404, "pump not found")
+            raise HTTPException(404, "Pump not found")
 
-        # 2) Vista "full" si existe
+        # 2) Última lectura desde la vista "full"
+        #    (devuelve una fila por bomba; ts y demás pueden ser NULL)
         try:
-            cur.execute(
-                """
-                SELECT pump_id, pump_name, ts, is_on, flow_lpm, pressure_bar, voltage_v, current_a,
-                       control_mode, manual_lockout, raw_json, has_data
-                FROM public.v_pump_latest_full
-                WHERE pump_id = %s
-                LIMIT 1
-                """,
-                (pump_id,),
-            )
+            cur.execute("SELECT * FROM v_pump_latest_full WHERE pump_id=%s;", (pump_id,))
             row = cur.fetchone()
             if row:
                 return row
         except Exception:
+            # Si la vista no existe, seguimos con el fallback de abajo
             pass
 
-    # 3) Fallback defensivo
-    return {
-        "pump_id": pump["id"],
-        "pump_name": pump["name"],
-        "ts": None,
-        "is_on": None,
-        "flow_lpm": None,
-        "pressure_bar": None,
-        "voltage_v": None,
-        "current_a": None,
-        "control_mode": None,
-        "manual_lockout": None,
-        "raw_json": None,
-        "has_data": False,
-    }
+        # 3) Fallback defensivo (sin lecturas / sin vista)
+        return {
+            "pump_id": pump["id"],
+            "pump_name": pump["name"],
+            "ts": None,
+            "is_on": None,
+            "flow_lpm": None,
+            "pressure_bar": None,
+            "voltage_v": None,
+            "current_a": None,
+            "control_mode": None,
+            "manual_lockout": None,
+            "raw_json": None,
+            "has_data": False,
+        }

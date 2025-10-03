@@ -1,49 +1,41 @@
-from __future__ import annotations
-from typing import Any, Dict, List, Optional
-
-from fastapi import APIRouter, Depends, Query
-from psycopg.rows import dict_row
-
+# app/routes/configs.py
+from fastapi import APIRouter, Depends, Path, Body
+from datetime import datetime
 from app.core.security import device_id_dep
-from app.auth.deps import conn_with_rls
+from app.repos import tanks as repo
+from app.schemas.configs import TankConfigIn, TankConfigOut
 
-router = APIRouter(prefix="/tanks", tags=["tank-config"])
+router = APIRouter(prefix="/tanks", tags=["config"])
 
+# 1) LISTA TODAS LAS CONFIGS (usa la vista v_tanks_with_config)
 @router.get("/config")
-def list_configs(
-    location_id: Optional[int] = Query(None, description="Filtra por location_id"),
-    _=Depends(device_id_dep),
-    conn=Depends(conn_with_rls),
-) -> List[Dict[str, Any]]:
-    """
-    Devuelve config de umbrales por tanque + datos mínimos, scopeado por org actual.
-    Usa public.tank_config (singular) y no asume t.location_id (se apoya en asset_locations).
-    """
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(
-            """
-            SELECT
-              t.id                AS tank_id,
-              t.name              AS tank_name,
-              t.capacity_m3,
-              c.low_pct,
-              c.low_low_pct,
-              c.high_pct,
-              c.high_high_pct,
-              al.location_id,
-              l.code              AS location_code,
-              l.name              AS location_name
-            FROM public.tanks t
-            LEFT JOIN public.tank_config c
-              ON c.tank_id = t.id
-            LEFT JOIN public.asset_locations al
-              ON al.asset_type = 'tank' AND al.asset_id = t.id
-            LEFT JOIN public.locations l
-              ON l.id = al.location_id
-            WHERE t.org_id = current_setting('app.org_id')::bigint
-              AND (%s::bigint IS NULL OR al.location_id = %s)
-            ORDER BY l.name NULLS LAST, t.name;
-            """,
-            (location_id, location_id),
-        )
-        return [dict(r) for r in cur.fetchall()]
+def list_configs(_=Depends(device_id_dep)):
+    return repo.list_tanks_with_config()
+
+# 2) LEE UNA CONFIG
+@router.get("/{tank_id}/config", response_model=TankConfigOut)
+def get_config(tank_id: int = Path(..., ge=1), _=Depends(device_id_dep)):
+    cfg = repo.get_tank_config(tank_id)
+    if not cfg:
+        return {
+            "tank_id": tank_id,
+            "low_pct": None,
+            "low_low_pct": None,
+            "high_pct": None,
+            "high_high_pct": None,
+            "updated_by": None,
+            "updated_at": datetime.utcnow(),  # campo requerido en el schema
+        }
+    return cfg
+
+# 3) UPSERT
+@router.put("/{tank_id}/config", response_model=TankConfigOut)
+def upsert_config(tank_id: int, payload: TankConfigIn = Body(...), _=Depends(device_id_dep)):
+    return repo.upsert_tank_config(
+        tank_id,
+        low_pct=payload.low_pct,
+        low_low_pct=payload.low_low_pct,
+        high_pct=payload.high_pct,
+        high_high_pct=payload.high_high_pct,
+        updated_by=payload.updated_by,
+    )
