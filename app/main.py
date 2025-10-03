@@ -206,7 +206,8 @@ def health_db():
             cur.fetchone()
         return {"ok": True, "db": "up"}
     except Exception as e:
-        raise HTTPException(500, f"DB error: {e}")
+        # no explota; muestra el error en el body
+        return JSONResponse(status_code=200, content={"ok": False, "error": str(e)})
 
 @app.get("/__config")
 def cfg_echo():
