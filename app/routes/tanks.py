@@ -1,3 +1,4 @@
+# app/routes/tanks.py
 from fastapi import APIRouter
 from app.db import get_conn
 from psycopg.rows import dict_row
@@ -18,7 +19,9 @@ def list_tanks_config():
       high_high_pct,
       updated_by,
       updated_at,
-      level_pct            -- << nueva columna desde v_tanks_with_config
+      level_pct,        -- último nivel (de v_tank_latest)
+      age_sec,          -- antigüedad de la última lectura (segundos)
+      online            -- true/false según umbral de 60s
     from public.v_tanks_with_config
     order by tank_id
     """
@@ -39,6 +42,10 @@ def list_tanks_config():
             "high_high_pct":  float(r["high_high_pct"])  if r["high_high_pct"]  is not None else None,
             "updated_by":     r["updated_by"],
             "updated_at":     r["updated_at"],
-            "level_pct":      float(r["level_pct"])      if r.get("level_pct")  is not None else None,  # << agregado
+
+            # 🔻 campos “runtime” que vienen de v_tank_latest
+            "level_pct":      float(r["level_pct"]) if r.get("level_pct") is not None else None,
+            "age_sec":        int(r["age_sec"])     if r.get("age_sec")   is not None else None,
+            "online":         bool(r["online"])     if r.get("online")    is not None else None,
         })
     return out

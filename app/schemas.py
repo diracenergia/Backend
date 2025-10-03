@@ -13,12 +13,19 @@ class TankConfigOut(BaseModel):
     name: Optional[str] = None
     location_id: Optional[int] = None
     location_name: Optional[str] = None
+
+    # Umbrales de configuración
     low_pct: Optional[float] = None
     low_low_pct: Optional[float] = None
     high_pct: Optional[float] = None
     high_high_pct: Optional[float] = None
     updated_by: Optional[str] = None
     updated_at: Optional[str] = None  # o datetime
+
+    # Campos runtime (desde v_tanks_with_config)
+    level_pct: Optional[float] = None
+    age_sec: Optional[int] = None
+    online: Optional[bool] = None
 
 class PumpConfigIn(BaseModel):
     low_pct: Optional[float] = None
