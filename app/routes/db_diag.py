@@ -1,3 +1,4 @@
+# app/routes/db_diag.py
 from fastapi import APIRouter
 import time, os, psycopg
 from urllib.parse import urlparse
@@ -20,6 +21,30 @@ def _safe(s: str | None) -> str:
         return u._replace(netloc=netloc).geturl()
     except Exception:
         return s or ""
+
+def _ssl_status(cur) -> dict:
+    """
+    Intenta leer estado TLS desde pg_stat_ssl (preferido).
+    Si no existe la vista/permiso, cae a SHOW ssl.
+    """
+    try:
+        cur.execute("""
+            select ssl, version, cipher
+            from pg_stat_ssl
+            where pid = pg_backend_pid()
+        """)
+        row = cur.fetchone()
+        if row is not None:
+            ssl_on, ver, cipher = row
+            return {"ssl": bool(ssl_on), "tls_version": ver, "cipher": cipher}
+    except Exception:
+        pass
+    try:
+        cur.execute("SHOW ssl")
+        v = (cur.fetchone() or ["off"])[0]
+        return {"ssl": v.lower() in ("on","true","1")}
+    except Exception:
+        return {"ssl": None}
 
 @router.get("/__db_diag_full")
 def db_diag_full():
@@ -50,18 +75,20 @@ def db_diag_full():
             with _connect_once(dsn) as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
-                        select inet_server_addr()::text,
-                               inet_server_port(),
-                               current_database(),
-                               current_user,
-                               ssl_is_used()
+                        select
+                          inet_server_addr()::text,
+                          inet_server_port(),
+                          current_database(),
+                          current_user
                     """)
-                    a, p, db, u, ssl = cur.fetchone()
+                    a, p, db, u = cur.fetchone()
+                    ssl_info = _ssl_status(cur)
             dt = (time.time() - t0) * 1000
             out["attempts"].append({
                 **meta, "ok": True,
                 "server_addr": a, "server_port": p,
-                "db": db, "user": u, "ssl": bool(ssl),
+                "db": db, "user": u,
+                **ssl_info,
                 "duration_ms": round(dt, 1)
             })
         except Exception as e:
