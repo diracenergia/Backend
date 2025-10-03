@@ -15,9 +15,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from app.routes.control import control_router
 
-
-
-
 # ===== LOGGING GLOBAL =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -61,7 +58,6 @@ from app.ws import router as ws_router
 
 # Visor en vivo (WS /viz/ws y GET /viz/state)
 from app.routes.live_view import viz_router
-
 
 # ===== Config centralizada (pydantic Settings) con fallback a .env =====
 try:
@@ -131,33 +127,15 @@ class LoggingMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(LoggingMiddleware)
 
-# ===== CORS =====
-_raw = _get_env("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip()
-_origin_regex = _get_env("CORS_ALLOW_ORIGIN_REGEX", "").strip()
-
-if _raw == "*":
-    ALLOW_ALL_ORIGINS = True
-    ALLOWED_ORIGINS = ["*"]
-else:
-    ALLOW_ALL_ORIGINS = False
-    ALLOWED_ORIGINS = [o.strip() for o in _raw.split(",") if o.strip()]
-
-ALLOW_CREDENTIALS = False
-ALLOW_METHODS = ["*"]
-ALLOW_HEADERS = ["*"]
-
-print("[CORS] allow_all          =", ALLOW_ALL_ORIGINS)
-print("[CORS] allow_origins      =", ALLOWED_ORIGINS)
-print("[CORS] allow_origin_regex =", _origin_regex or "(none)")
-print("[CORS] allow_credentials  =", ALLOW_CREDENTIALS)
-
+# ===== CORS (modo abierto: equivalente a “sin CORS” en navegador) =====
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=_origin_regex or None,
-    allow_credentials=ALLOW_CREDENTIALS,
-    allow_methods=ALLOW_METHODS,
-    allow_headers=ALLOW_HEADERS,
+    allow_origins=["*"],        # todos los orígenes
+    allow_methods=["*"],        # todos los métodos
+    allow_headers=["*"],        # todos los headers
+    allow_credentials=False,    # debe ser False si usamos "*"
+    expose_headers=["*"],
+    max_age=3600,
 )
 
 # ===== Trusted hosts (opcional) =====
@@ -172,7 +150,6 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # ===== Contexto multi-tenant (RLS) =====
 from app.core.tenancy import tenant_ctx_dep
-
 
 app.include_router(control_router)
 
@@ -255,12 +232,8 @@ app.include_router(ws_router)
 # KPI
 app.include_router(kpi_router)
 
-# INFRA
-
-
 # Visor en vivo (estado + websocket)
 app.include_router(viz_router)
-
 
 # ===== Endpoints utilitarios =====
 from app.core.db import get_conn
@@ -298,10 +271,10 @@ def health_db():
 def cfg_echo():
     return {
         "cors": {
-            "allow_all": ALLOW_ALL_ORIGINS,
-            "allow_origins": ALLOWED_ORIGINS,
-            "allow_origin_regex": _origin_regex or None,
-            "allow_credentials": ALLOW_CREDENTIALS,
+            "allow_all": True,
+            "allow_origins": ["*"],
+            "allow_origin_regex": None,
+            "allow_credentials": False,
         },
         "trusted_hosts": TRUSTED_HOSTS or None,
         "version": APP_VERSION or None,
