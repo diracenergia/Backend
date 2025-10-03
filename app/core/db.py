@@ -1,7 +1,9 @@
+# app/core/db.py
 from __future__ import annotations
-import os, logging
+import os, logging, socket
 from contextlib import contextmanager
 from typing import Iterator, Optional, List, Tuple
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 from dotenv import load_dotenv
 import psycopg
@@ -15,6 +17,32 @@ FALLBACK_DSN = (os.getenv("DB_URL_FALLBACK") or os.getenv("DB_FALLBACK_URL") or 
 EVENTS_DSN   = (os.getenv("EVENTS_DB_URL") or PRIMARY_DSN).strip()
 
 CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "15"))
+FORCE_IPV4 = (os.getenv("DB_FORCE_IPV4") or "0").strip().lower() in ("1", "true", "yes")
+
+def _dsn_force_ipv4(dsn: str) -> str:
+    """
+    Si DB_FORCE_IPV4=1, resuelve el hostname a IPv4 y lo inyecta como hostaddr=<ipv4>
+    manteniendo host=<fqdn> para que SNI/SSL sigan correctos.
+    """
+    if not FORCE_IPV4 or not dsn:
+        return dsn
+    try:
+        u = urlparse(dsn)
+        if not u.scheme.startswith("postgresql") or not u.hostname:
+            return dsn
+        port = u.port or 5432
+        # Primera A-record (IPv4)
+        infos = socket.getaddrinfo(u.hostname, port, socket.AF_INET, socket.SOCK_STREAM)
+        ipv4 = infos[0][4][0]
+        # rearmar query con hostaddr=<ipv4>
+        q = dict(parse_qsl(u.query, keep_blank_values=True))
+        q["hostaddr"] = ipv4
+        new_q = urlencode(q)
+        new_dsn = urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
+        return new_dsn
+    except Exception as e:
+        log.warning("[db] _dsn_force_ipv4 skip: %s", e)
+        return dsn
 
 def _connect_once(dsn: str, *, autocommit: bool = False) -> psycopg.Connection:
     if not dsn:
@@ -22,8 +50,9 @@ def _connect_once(dsn: str, *, autocommit: bool = False) -> psycopg.Connection:
     kw = {"connect_timeout": CONNECT_TIMEOUT}
     if autocommit:
         kw["autocommit"] = True
-    log.info("[db] try dsn=%s", dsn.split("@")[-1].split("?")[0])
-    return psycopg.connect(dsn, **kw)
+    dsn2 = _dsn_force_ipv4(dsn)
+    log.info("[db] try dsn=%s", dsn2.split("@")[-1].split("?")[0])
+    return psycopg.connect(dsn2, **kw)
 
 def _candidate_attempts() -> List[Tuple[str, str]]:
     attempts: List[Tuple[str, str]] = []
