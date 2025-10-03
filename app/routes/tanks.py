@@ -21,7 +21,10 @@ def list_tanks_config():
       updated_at,
       level_pct,        -- último nivel (de v_tank_latest)
       age_sec,          -- antigüedad de la última lectura (segundos)
-      online            -- true/false según umbral de 60s
+      online,           -- true/false según umbral de 60s
+      -- NUEVO (si tu vista ya lo tiene):
+      alarma,
+      alarma_sev
     from public.v_tanks_with_config
     order by tank_id
     """
@@ -29,8 +32,34 @@ def list_tanks_config():
         cur.execute(sql)
         rows = cur.fetchall()
 
+    def compute_alarm(level_pct, low_low, low, high, high_high):
+        # devuelve ("normal"|"alerta"|"critico", sev: 0|1|2)
+        if level_pct is None:
+            return "normal", 0
+        # defaults por si faltan
+        low_low  = float(low_low)  if low_low  is not None else 10.0
+        low      = float(low)      if low      is not None else 25.0
+        high     = float(high)     if high     is not None else 80.0
+        high_high= float(high_high)if high_high is not None else 90.0
+        x = float(level_pct)
+        if x <= low_low or x >= high_high: return "critico", 2
+        if x <= low     or x >= high:      return "alerta",  1
+        return "normal", 0
+
     out = []
     for r in rows:
+        # Fallback si la vista aún no trae alarma/alarma_sev
+        alarm_txt = r.get("alarma")
+        alarm_sev = r.get("alarma_sev")
+        if alarm_txt is None or alarm_sev is None:
+            alarm_txt, alarm_sev = compute_alarm(
+                r.get("level_pct"),
+                r.get("low_low_pct"),
+                r.get("low_pct"),
+                r.get("high_pct"),
+                r.get("high_high_pct"),
+            )
+
         out.append({
             "tank_id":        r["tank_id"],
             "name":           r["name"],
@@ -43,9 +72,13 @@ def list_tanks_config():
             "updated_by":     r["updated_by"],
             "updated_at":     r["updated_at"],
 
-            # 🔻 campos “runtime” que vienen de v_tank_latest
+            # runtime
             "level_pct":      float(r["level_pct"]) if r.get("level_pct") is not None else None,
             "age_sec":        int(r["age_sec"])     if r.get("age_sec")   is not None else None,
             "online":         bool(r["online"])     if r.get("online")    is not None else None,
+
+            # NUEVO
+            "alarma":         str(alarm_txt),
+            "alarma_sev":     int(alarm_sev),
         })
     return out
