@@ -1,5 +1,11 @@
+# app/schemas.py
 from typing import Optional
-from pydantic import BaseModel
+from datetime import datetime
+from pydantic import BaseModel, conint, confloat
+
+# =========================
+# Tanks - Config
+# =========================
 
 class TankConfigIn(BaseModel):
     low_pct: Optional[float] = None
@@ -27,6 +33,11 @@ class TankConfigOut(BaseModel):
     age_sec: Optional[int] = None
     online: Optional[bool] = None
 
+
+# =========================
+# Pumps - Config
+# =========================
+
 class PumpConfigIn(BaseModel):
     low_pct: Optional[float] = None
     low_low_pct: Optional[float] = None
@@ -45,3 +56,19 @@ class PumpConfigOut(BaseModel):
     high_high_pct: Optional[float] = None
     updated_by: Optional[str] = None
     updated_at: Optional[str] = None
+
+
+# =========================
+# Tanks - Ingesta de lecturas
+# =========================
+
+class TankIngestIn(BaseModel):
+    tank_id: conint(gt=0)
+    level_pct: confloat(ge=0, le=100)
+    created_at: Optional[datetime] = None  # si no se envía, el backend usa NOW()
+
+class TankIngestOut(BaseModel):
+    id: int
+    tank_id: int
+    level_pct: float
+    created_at: datetime

@@ -1,12 +1,17 @@
-import os, sys, logging
+# app/main.py
+import os
+import sys
+import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
+from app.db import get_conn
 from app.routes.tanks import router as tanks_router
 from app.routes.pumps import router as pumps_router
-from app.db import get_conn
+from app.routes.ingest import router as ingest_router  # <<< NUEVO
 
+# ===== Logging simple =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -14,8 +19,12 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 
-app = FastAPI(title="Backend MIN API", version=os.getenv("RENDER_GIT_COMMIT","")[:8] or None)
+app = FastAPI(
+    title="Backend MIN API",
+    version=(os.getenv("RENDER_GIT_COMMIT", "")[:8] or None),
+)
 
+# ===== CORS totalmente abierto =====
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,8 +35,10 @@ app.add_middleware(
     max_age=3600,
 )
 
+# (Opcional) gzip para respuestas grandes
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
+# ===== Health =====
 @app.get("/")
 def root():
     return {"ok": True, "service": "Backend MIN API", "docs": "/docs", "health": "/health"}
@@ -43,6 +54,7 @@ def health_db():
         cur.fetchone()
     return {"ok": True, "db": "up"}
 
-# Solo lo que usamos
-app.include_router(tanks_router)
-app.include_router(pumps_router)
+# ===== Rutas que realmente usamos =====
+app.include_router(tanks_router)   # /tanks (config + runtime)
+app.include_router(pumps_router)   # /pumps (config mínima)
+app.include_router(ingest_router)  # /ingest (tanque: POST lecturas, GET latest)
