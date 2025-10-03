@@ -1,3 +1,4 @@
+# app/main.py
 import os
 import sys
 import logging
@@ -5,10 +6,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
-from app.routes.locations import router as locations_router
 from app.routes.tanks import router as tanks_router
 from app.routes.pumps import router as pumps_router
-from app.routes.alarms import router as alarms_router
+from app.routes.alarms import router as alarms_router  # si no usás alarmas, borrá esta línea
 from app.db import get_conn
 
 # ===== LOGGING simple =====
@@ -52,7 +52,6 @@ def health_db():
     return {"ok": True, "db": "up"}
 
 # ===== Rutas =====
-app.include_router(locations_router)
 app.include_router(tanks_router)
 app.include_router(pumps_router)
-app.include_router(alarms_router)
+app.include_router(alarms_router)  # si no usás alarmas, quitá esta línea también
