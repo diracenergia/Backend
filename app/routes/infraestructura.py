@@ -5,6 +5,24 @@ from psycopg.rows import dict_row
 
 router = APIRouter(prefix="/infraestructura", tags=["infraestructura"])
 
+
+# -------------------------------------------------------------------
+# GET /infraestructura/health_db
+# -------------------------------------------------------------------
+@router.get("/health_db")
+async def health_db():
+    """
+    Verifica la conexión con la base de datos (health-check interno).
+    """
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB down: {e}")
+
+
 # -------------------------------------------------------------------
 # GET /infraestructura/get_layout_edges
 # -------------------------------------------------------------------
@@ -141,4 +159,3 @@ async def bootstrap_layout():
             return {"nodes": nodes, "edges": edges}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error (bootstrap): {e}")
-    
