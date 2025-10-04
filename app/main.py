@@ -1,4 +1,3 @@
-# app/main.py
 import os
 import sys
 import logging
@@ -33,10 +32,10 @@ app = FastAPI(
 # ===== CORS totalmente abierto =====
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-    allow_credentials=False,
+    allow_origins=["*"],  # Permite todas las URLs de origen
+    allow_methods=["*"],  # Permite todos los métodos HTTP
+    allow_headers=["*"],  # Permite todos los encabezados
+    allow_credentials=False, 
     expose_headers=["*"],
     max_age=3600,
 )
