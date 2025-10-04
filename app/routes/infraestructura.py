@@ -1,5 +1,6 @@
 # app/routes/infraestructura.py
 from typing import List
+from datetime import datetime, date
 from fastapi import APIRouter
 from pydantic import BaseModel
 from app.db import get_conn
@@ -35,8 +36,10 @@ class EdgeIn(BaseModel):
 def get_nodes():
     rows = fetch_all("SELECT * FROM infraestructura.v_graph_nodes ORDER BY type, id")
     for r in rows:
-        if r.get("last_seen") is not None:
-            r["last_seen"] = r["last_seen"].isoformat()
+        val = r.get("last_seen")
+        if isinstance(val, (datetime, date)):
+            r["last_seen"] = val.isoformat()
+        # si es None o string, lo dejamos como está
     return rows
 
 @router.get("/edges")
