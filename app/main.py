@@ -1,3 +1,4 @@
+# app/main.py
 import os
 import sys
 import logging
@@ -13,7 +14,7 @@ from app.routes.pumps import router as pumps_router
 from app.routes.ingest import router as ingest_router
 from app.routes.arduino_controler import router as arduino_router  # <<< NUEVO (ya estaba)
 
-# >>> Importa el router de infraestructura
+# >>> Importá el router de infraestructura
 from app.routes.infraestructura import router as infraestructura_router  # <<< NUEVO
 
 # ===== Logging simple =====
