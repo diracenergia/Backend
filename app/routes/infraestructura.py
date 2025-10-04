@@ -34,6 +34,7 @@ class EdgeIn(BaseModel):
 # --- GETs: leen de las VISTAS ---
 @router.get("/nodes")
 def get_nodes():
+    # Aseguramos que se lea desde el esquema correcto "infraestructura"
     rows = fetch_all("SELECT * FROM infraestructura.v_graph_nodes ORDER BY type, id")
     for r in rows:
         val = r.get("last_seen")
@@ -43,10 +44,12 @@ def get_nodes():
 
 @router.get("/edges")
 def get_edges():
+    # Aseguramos que se lea desde el esquema correcto "infraestructura"
     return fetch_all("SELECT src, dst FROM infraestructura.v_graph_edges ORDER BY 1,2")
 
 @router.get("/graph")
 def get_graph():
+    # Incluye ambos endpoints de nodes y edges
     return {"nodes": get_nodes(), "edges": get_edges()}
 
 # --- POSTs: escriben en tablas base ---
