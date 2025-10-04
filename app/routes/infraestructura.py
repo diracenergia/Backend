@@ -31,7 +31,7 @@ class EdgeIn(BaseModel):
     relacion: str = "feeds"
     prioridad: int = 0
 
-# --- GETs sin response_model (devuelven list[dict]) ---
+# --- GETs: leen de las VISTAS ---
 @router.get("/nodes")
 def get_nodes():
     rows = fetch_all("SELECT * FROM infraestructura.v_graph_nodes ORDER BY type, id")
@@ -39,18 +39,17 @@ def get_nodes():
         val = r.get("last_seen")
         if isinstance(val, (datetime, date)):
             r["last_seen"] = val.isoformat()
-        # si es None o string, lo dejamos como está
     return rows
 
 @router.get("/edges")
 def get_edges():
-    return fetch_all("SELECT src, dst FROM infraestructura.v_graph_edges")
+    return fetch_all("SELECT src, dst FROM infraestructura.v_graph_edges ORDER BY 1,2")
 
 @router.get("/graph")
 def get_graph():
     return {"nodes": get_nodes(), "edges": get_edges()}
 
-# --- POSTs simples ---
+# --- POSTs: escriben en tablas base ---
 @router.post("/layout")
 def save_layout(items: List[LayoutIn]):
     sql = """
@@ -74,46 +73,3 @@ def save_edges(edges: List[EdgeIn]):
     for e in edges:
         execute(upsert, (e.src, e.dst, e.relacion, e.prioridad))
     return {"ok": True, "upserted": len(edges)}
-
-
-# en app/routes/infraestructura.py (TEMPORAL)
-@router.get("/_debug_viewdefs")
-def _debug_viewdefs():
-    sql = "SELECT 'v_graph_nodes' AS name, pg_get_viewdef('infraestructura.v_graph_nodes'::regclass, true)"
-    sql2 = "SELECT 'v_graph_edges' AS name, pg_get_viewdef('infraestructura.v_graph_edges'::regclass, true)"
-    return {
-        "nodes": fetch_all(sql)[0],
-        "edges": fetch_all(sql2)[0],
-    }
-
-
-@router.get("/_debug_env")
-def _debug_env():
-    q1 = """
-    SELECT current_database() AS db, current_user AS usr,
-           current_schema() AS schema, current_setting('search_path') AS search_path,
-           version() AS version
-    """
-    q2 = "SELECT EXISTS (SELECT 1 FROM information_schema.views WHERE table_schema='infraestructura' AND table_name='v_graph_nodes') AS has_nodes"
-    q3 = "SELECT EXISTS (SELECT 1 FROM information_schema.views WHERE table_schema='infraestructura' AND table_name='v_graph_edges') AS has_edges"
-    return {
-        "env": fetch_all(q1)[0],
-        "has_v_graph_nodes": fetch_all(q2)[0]["has_nodes"],
-        "has_v_graph_edges": fetch_all(q3)[0]["has_edges"],
-    }
-
-
-@router.get("/_debug_python")
-def _debug_python():
-    with get_conn() as conn:
-        info = {
-            "conn_type": str(type(conn)),
-            "module": getattr(conn, "__module__", None),
-            "dsn": getattr(conn, "dsn", None),
-        }
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1::int AS one, 'abc'::text AS txt, now()::timestamptz AS ts")
-            cols = [d[0] for d in cur.description]
-            row = cur.fetchone()
-            sample = dict(zip(cols, row))
-        return {"conn": info, "sample": sample}
