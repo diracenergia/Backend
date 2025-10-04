@@ -93,8 +93,7 @@ async def get_layout_combined():
 # -------------------------------------------------------------------
 # POST /infraestructura/update_layout
 # -------------------------------------------------------------------
-from fastapi import Request, HTTPException
-from psycopg.rows import dict_row
+
 
 @router.post("/update_layout")
 async def update_layout(request: Request):
