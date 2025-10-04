@@ -74,3 +74,14 @@ def save_edges(edges: List[EdgeIn]):
     for e in edges:
         execute(upsert, (e.src, e.dst, e.relacion, e.prioridad))
     return {"ok": True, "upserted": len(edges)}
+
+
+# en app/routes/infraestructura.py (TEMPORAL)
+@router.get("/_debug_viewdefs")
+def _debug_viewdefs():
+    sql = "SELECT 'v_graph_nodes' AS name, pg_get_viewdef('infraestructura.v_graph_nodes'::regclass, true)"
+    sql2 = "SELECT 'v_graph_edges' AS name, pg_get_viewdef('infraestructura.v_graph_edges'::regclass, true)"
+    return {
+        "nodes": fetch_all(sql)[0],
+        "edges": fetch_all(sql2)[0],
+    }
