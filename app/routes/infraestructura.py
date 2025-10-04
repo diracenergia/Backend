@@ -5,139 +5,61 @@ from typing import List
 
 router = APIRouter(prefix="/infraestructura", tags=["infraestructura"])
 
-# Endpoint para obtener las conexiones entre bombas y tanques desde public.layout_edges
+# -------------------------------------------------------------------
+# GET /infraestructura/get_layout_edges
+# -------------------------------------------------------------------
 @router.get("/get_layout_edges", response_model=List[dict])
 async def get_layout_edges():
     """
-    Devuelve todas las conexiones entre las bombas y los tanques desde public.layout_edges.
+    Devuelve todas las conexiones entre nodos desde public.layout_edges.
+    (Ej.: pump:1 -> manifold:1 -> valve:1 -> tank:1)
     """
     sql = """
-    SELECT 
-        edge_id, 
-        src_node_id, 
-        dst_node_id, 
-        relacion, 
-        prioridad, 
+    SELECT
+        edge_id,
+        src_node_id,
+        dst_node_id,
+        relacion,
+        prioridad,
         updated_at
-    FROM 
-        public.layout_edges  -- Especificamos el schema 'public'
-    ORDER BY 
-        updated_at DESC;  -- Ordenamos por la fecha más reciente
+    FROM public.layout_edges
+    ORDER BY updated_at DESC;
     """
-    
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(sql)
-            layout_edges = cur.fetchall()
-
-            # Si no hay conexiones, lanzar un error 404
-            if not layout_edges:
+            rows = cur.fetchall()
+            if not rows:
                 raise HTTPException(status_code=404, detail="No se encontraron conexiones en public.layout_edges")
-
-            return layout_edges
-    
+            return rows
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Endpoint para obtener los datos de la vista public.v_tanks_with_config
-@router.get("/get_tanks_with_config", response_model=List[dict])
-async def get_tanks_with_config():
-    """
-    Devuelve todos los datos de la vista public.v_tanks_with_config.
-    """
-    sql = """
-    SELECT 
-        tank_id, 
-        name, 
-        location_id, 
-        location_name, 
-        low_pct, 
-        low_low_pct, 
-        high_pct, 
-        high_high_pct, 
-        updated_by, 
-        updated_at, 
-        level_pct, 
-        latest_ingest_id, 
-        age_sec, 
-        online, 
-        alarma, 
-        node_id, 
-        x, 
-        y
-    FROM 
-        public.v_tanks_with_config  -- Especificamos el schema 'public'
-    ORDER BY 
-        tank_id;  -- Puedes ordenar por cualquier campo que desees, por ejemplo, por tank_id
-    """
-    
-    try:
-        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sql)
-            tanks = cur.fetchall()
-
-            # Si no hay datos, lanzar un error 404
-            if not tanks:
-                raise HTTPException(status_code=404, detail="No se encontraron datos en public.v_tanks_with_config")
-
-            return tanks
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-
-# Endpoint para obtener los datos de la vista public.v_pumps_with_status
-@router.get("/get_pumps_with_status", response_model=List[dict])
-async def get_pumps_with_status():
-    """
-    Devuelve todos los datos de la vista public.v_pumps_with_status.
-    """
-    sql = """
-    SELECT 
-        pump_id, 
-        name, 
-        location_id, 
-        location_name, 
-        state, 
-        latest_event_id, 
-        age_sec, 
-        online, 
-        event_ts, 
-        latest_hb_id, 
-        hb_ts
-    FROM 
-        public.v_pumps_with_status  -- Especificamos el schema 'public'
-    ORDER BY 
-        pump_id;  -- Puedes ordenar por cualquier campo que desees, por ejemplo, por pump_id
-    """
-    
-    try:
-        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sql)
-            pumps = cur.fetchall()
-
-            # Si no hay datos, lanzar un error 404
-            if not pumps:
-                raise HTTPException(status_code=404, detail="No se encontraron datos en public.v_pumps_with_status")
-
-            return pumps
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-
-
-        # GET /infraestructura/get_layout_combined
+# -------------------------------------------------------------------
+# GET /infraestructura/get_layout_combined
+# -------------------------------------------------------------------
 @router.get("/get_layout_combined", response_model=List[dict])
 async def get_layout_combined():
     """
-    Devuelve todos los nodos (pump/tank/valve/manifold) desde public.v_layout_combined.
+    Devuelve todos los nodos (pump/tank/valve/manifold) desde public.v_layout_combined,
+    incluyendo estado básico cuando aplica:
+      - online (pumps/tanks)
+      - state  (pumps)
+      - level_pct, alarma (tanks)
     """
     sql = """
-    SELECT node_id, id, type, x, y, updated_at
+    SELECT
+        node_id,
+        id,
+        type,
+        x,
+        y,
+        updated_at,
+        online,
+        state,
+        level_pct,
+        alarma
     FROM public.v_layout_combined
     ORDER BY type, id;
     """
