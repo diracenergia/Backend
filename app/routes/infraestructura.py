@@ -40,3 +40,47 @@ async def get_layout_edges():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/get_tanks_with_config", response_model=List[dict])
+async def get_tanks_with_config():
+    """
+    Devuelve todos los datos de la vista public.v_tanks_with_config.
+    """
+    sql = """
+    SELECT 
+        tank_id, 
+        name, 
+        location_id, 
+        location_name, 
+        low_pct, 
+        low_low_pct, 
+        high_pct, 
+        high_high_pct, 
+        updated_by, 
+        updated_at, 
+        level_pct, 
+        latest_ingest_id, 
+        age_sec, 
+        online, 
+        alarma, 
+        node_id, 
+        x, 
+        y
+    FROM 
+        public.v_tanks_with_config  -- Especificamos el schema 'public'
+    ORDER BY 
+        tank_id;
+    """
+    
+    try:
+        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql)
+            tanks = cur.fetchall()
+
+            # Si no hay datos, lanzar un error 404
+            if not tanks:
+                raise HTTPException(status_code=404, detail="No se encontraron datos en public.v_tanks_with_config")
+
+            return tanks
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
