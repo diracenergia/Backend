@@ -85,3 +85,44 @@ async def get_tanks_with_config():
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+# Endpoint para obtener los datos de la vista public.v_pumps_with_status
+@router.get("/get_pumps_with_status", response_model=List[dict])
+async def get_pumps_with_status():
+    """
+    Devuelve todos los datos de la vista public.v_pumps_with_status.
+    """
+    sql = """
+    SELECT 
+        pump_id, 
+        name, 
+        location_id, 
+        location_name, 
+        state, 
+        latest_event_id, 
+        age_sec, 
+        online, 
+        event_ts, 
+        latest_hb_id, 
+        hb_ts
+    FROM 
+        public.v_pumps_with_status  -- Especificamos el schema 'public'
+    ORDER BY 
+        pump_id;  -- Puedes ordenar por cualquier campo que desees, por ejemplo, por pump_id
+    """
+    
+    try:
+        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql)
+            pumps = cur.fetchall()
+
+            # Si no hay datos, lanzar un error 404
+            if not pumps:
+                raise HTTPException(status_code=404, detail="No se encontraron datos en public.v_pumps_with_status")
+
+            return pumps
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
