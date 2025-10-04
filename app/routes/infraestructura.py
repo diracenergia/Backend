@@ -93,12 +93,11 @@ async def get_layout_combined():
 # -------------------------------------------------------------------
 # POST /infraestructura/update_layout
 # -------------------------------------------------------------------
+from fastapi import Request, HTTPException
+from psycopg.rows import dict_row
+
 @router.post("/update_layout")
 async def update_layout(request: Request):
-    """
-    Actualiza las coordenadas (x, y) de un nodo en la tabla layout_*
-    según el prefijo del node_id ('pump', 'manifold', 'valve', 'tank').
-    """
     data = await request.json()
     node_id = data.get("node_id")
     x = data.get("x")
@@ -107,38 +106,51 @@ async def update_layout(request: Request):
     if not node_id or not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
         raise HTTPException(status_code=400, detail="Parámetros inválidos: node_id, x, y son requeridos")
 
-    tipo = node_id.split(":", 1)[0]
+    tipo, _, sufijo = node_id.partition(":")
     table_map = {
-        "pump": "layout_pumps",
-        "manifold": "layout_manifolds",
-        "valve": "layout_valves",
-        "tank": "layout_tanks",
+        "pump": ("layout_pumps", "pump_id"),
+        "manifold": ("layout_manifolds", "manifold_id"),
+        "valve": ("layout_valves", "valve_id"),
+        "tank": ("layout_tanks", "tank_id"),
     }
-    table = table_map.get(tipo)
-    if not table:
+    meta = table_map.get(tipo)
+    if not meta:
         raise HTTPException(status_code=400, detail=f"Tipo de nodo no soportado: {tipo}")
+
+    table, id_col = meta
+
+    # Si el sufijo es numérico, actualizamos por *_id (lo que usa la vista).
+    try:
+        id_numeric = int(sufijo)
+        where = f"{id_col} = %s"
+        params = (x, y, id_numeric)
+    except ValueError:
+        # Si no es numérico, caemos a node_id
+        where = "node_id = %s"
+        params = (x, y, node_id)
 
     sql = f"""
         UPDATE public.{table}
         SET x = %s::double precision,
             y = %s::double precision,
             updated_at = now()
-        WHERE node_id = %s
-        RETURNING node_id, x, y, updated_at
+        WHERE {where}
+        RETURNING node_id, {id_col} AS entity_id, x, y, updated_at
     """
 
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sql, (x, y, node_id))
+            cur.execute(sql, params)
             row = cur.fetchone()
             if not row:
-                raise HTTPException(status_code=404, detail=f"node_id no encontrado: {node_id}")
+                raise HTTPException(status_code=404, detail=f"no se encontró fila en {table} con {where}")
             conn.commit()
-            return {"ok": True, **row, "table": table}
+            return {"ok": True, "table": table, "updated": row}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error (update): {e}")
+
 
 @router.get("/bootstrap_layout")
 async def bootstrap_layout():
