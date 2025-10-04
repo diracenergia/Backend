@@ -101,3 +101,19 @@ def _debug_env():
         "has_v_graph_nodes": fetch_all(q2)[0]["has_nodes"],
         "has_v_graph_edges": fetch_all(q3)[0]["has_edges"],
     }
+
+
+@router.get("/_debug_python")
+def _debug_python():
+    with get_conn() as conn:
+        info = {
+            "conn_type": str(type(conn)),
+            "module": getattr(conn, "__module__", None),
+            "dsn": getattr(conn, "dsn", None),
+        }
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1::int AS one, 'abc'::text AS txt, now()::timestamptz AS ts")
+            cols = [d[0] for d in cur.description]
+            row = cur.fetchone()
+            sample = dict(zip(cols, row))
+        return {"conn": info, "sample": sample}
