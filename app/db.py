@@ -1,12 +1,29 @@
+# app/db.py
 import os
-import psycopg
-from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
+DSN = os.environ.get("DATABASE_URL")
+if not DSN:
     raise RuntimeError("Falta la env DATABASE_URL")
 
+# Pool chico y estable. Ajustá max_size si lo necesitás (con 60 conexiones globales, 8 es seguro).
+pool = ConnectionPool(
+    conninfo=DSN,
+    min_size=1,
+    max_size=8,
+    max_idle=30,          # segundos
+    max_lifetime=3600,    # recicla conexiones cada hora
+    timeout=5,            # espera por un conn del pool
+    kwargs=dict(
+        connect_timeout=5,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=3,
+        options="-c statement_timeout=60000"  # 60s por query
+    ),
+)
+
 def get_conn():
-    # Pool simple por conexión a demanda (suficiente para un backend chico)
-    # sslmode=require ya viene en tu cadena de Supabase.
-    return psycopg.connect(DATABASE_URL, connect_timeout=10, row_factory=dict_row)
+    """Usar como: with get_conn() as conn:"""
+    return pool.connection()
