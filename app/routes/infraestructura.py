@@ -1,12 +1,12 @@
 # app/routes/infraestructura.py
-from typing import List, TypedDict
+from typing import List
 from fastapi import APIRouter
 from pydantic import BaseModel
 from app.db import get_conn
 
 router = APIRouter(prefix="/infraestructura", tags=["infraestructura"])
 
-# --- helpers DB súper simples ---
+# --- helpers DB ---
 def fetch_all(sql: str, params: tuple = ()):
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
@@ -18,31 +18,21 @@ def execute(sql: str, params: tuple = ()):
         cur.execute(sql, params)
         conn.commit()
 
-# --- tipos mínimos ---
-class GraphNode(TypedDict, total=False):
-    id: str; type: str; name: str|None
-    x: int|None; y: int|None
-    level: float|None
-    low_pct: float|None; low_low_pct: float|None; high_high_pct: float|None
-    status: str|None
-    location_id: int|None; location_name: str|None
-    alarma: str|None
-    online: bool|None; age_sec: int|None; last_seen: str|None
-
-class GraphEdge(TypedDict):
-    src: str; dst: str
-
+# --- inputs ---
 class LayoutIn(BaseModel):
-    id: str; x: int; y: int
+    id: str
+    x: int
+    y: int
 
 class EdgeIn(BaseModel):
-    src: str; dst: str
+    src: str
+    dst: str
     relacion: str = "feeds"
     prioridad: int = 0
 
-# --- lectura ---
+# --- GETs sin response_model (devuelven list[dict]) ---
 @router.get("/nodes")
-def get_nodes() -> List[GraphNode]:
+def get_nodes():
     rows = fetch_all("SELECT * FROM infraestructura.v_graph_nodes ORDER BY type, id")
     for r in rows:
         if r.get("last_seen") is not None:
@@ -50,17 +40,14 @@ def get_nodes() -> List[GraphNode]:
     return rows
 
 @router.get("/edges")
-def get_edges() -> List[GraphEdge]:
+def get_edges():
     return fetch_all("SELECT src, dst FROM infraestructura.v_graph_edges")
 
 @router.get("/graph")
 def get_graph():
-    return {
-        "nodes": get_nodes(),
-        "edges": get_edges(),
-    }
+    return {"nodes": get_nodes(), "edges": get_edges()}
 
-# --- escritura ---
+# --- POSTs simples ---
 @router.post("/layout")
 def save_layout(items: List[LayoutIn]):
     sql = """
