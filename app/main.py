@@ -12,10 +12,10 @@ from app.db import get_conn
 from app.routes.tanks import router as tanks_router
 from app.routes.pumps import router as pumps_router
 from app.routes.ingest import router as ingest_router
-from app.routes.arduino_controler import router as arduino_router  # <<< NUEVO (ya estaba)
+from app.routes.arduino_controler import router as arduino_router
 
-# >>> Importá el router de infraestructura
-from app.routes.infraestructura import router as infraestructura_router  # <<< NUEVO
+# Router de infraestructura (nodes/edges/graph + POST layout/edges)
+from app.routes.infraestructura import router as infraestructura_router
 
 # ===== Logging simple =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -72,5 +72,5 @@ app.include_router(pumps_router)            # /pumps
 app.include_router(ingest_router)           # /ingest
 app.include_router(arduino_router)          # /arduino-controler
 
-# >>> Montamos infraestructura (nodes/edges/graph + POST layout/edges)
-app.include_router(infraestructura_router)  # /infra
+# Montamos infraestructura (expuesto como /infraestructura/*)
+app.include_router(infraestructura_router)
