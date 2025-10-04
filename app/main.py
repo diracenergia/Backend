@@ -7,10 +7,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
 from app.db import get_conn
+
+# Rutas existentes
 from app.routes.tanks import router as tanks_router
 from app.routes.pumps import router as pumps_router
 from app.routes.ingest import router as ingest_router
-from app.routes.arduino_controler import router as arduino_router  # <<< NUEVO
+from app.routes.arduino_controler import router as arduino_router  # <<< NUEVO (ya estaba)
+
+# >>> Importá el router de infraestructura
+from app.routes.infraestructura import router as infraestructura_router  # <<< NUEVO
 
 # ===== Logging simple =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -62,7 +67,10 @@ def health_db():
     return {"ok": True, "db": "up"}
 
 # ===== Rutas que realmente usamos =====
-app.include_router(tanks_router)     # /tanks (config + runtime)
-app.include_router(pumps_router)     # /pumps (config/status, comandos UI si los tenés acá)
-app.include_router(ingest_router)    # /ingest (tanques: POST lecturas, GET latest)
-app.include_router(arduino_router)   # /arduino-controler (HB/estado y fetch de comandos)
+app.include_router(tanks_router)            # /tanks
+app.include_router(pumps_router)            # /pumps
+app.include_router(ingest_router)           # /ingest
+app.include_router(arduino_router)          # /arduino-controler
+
+# >>> Montamos infraestructura (nodes/edges/graph + POST layout/edges)
+app.include_router(infraestructura_router)  # /infra
