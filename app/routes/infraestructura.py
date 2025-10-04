@@ -72,3 +72,50 @@ async def get_layout_combined():
             return nodes
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+# -------------------------------------------------------------------
+# POST /infraestructura/update_layout
+# -------------------------------------------------------------------
+from fastapi import Request
+
+@router.post("/update_layout")
+async def update_layout(request: Request):
+    """
+    Actualiza las coordenadas (x, y) de un nodo en la tabla layout_*
+    según el prefijo del node_id ('pump', 'manifold', 'valve', 'tank').
+    """
+    data = await request.json()
+    node_id = data.get("node_id")
+    x = data.get("x")
+    y = data.get("y")
+
+    if not node_id or not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+        raise HTTPException(status_code=400, detail="Parámetros inválidos: node_id, x, y son requeridos")
+
+    tipo = node_id.split(":", 1)[0]
+    table_map = {
+        "pump": "layout_pumps",
+        "manifold": "layout_manifolds",
+        "valve": "layout_valves",
+        "tank": "layout_tanks",
+    }
+
+    table = table_map.get(tipo)
+    if not table:
+        raise HTTPException(status_code=400, detail=f"Tipo de nodo no soportado: {tipo}")
+
+    sql = f"UPDATE public.{table} SET x = %s, y = %s, updated_at = now() WHERE node_id = %s"
+
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(sql, (x, y, node_id))
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail=f"node_id no encontrado: {node_id}")
+            conn.commit()
+            return {"ok": True, "node_id": node_id, "x": x, "y": y, "table": table}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
