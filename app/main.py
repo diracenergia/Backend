@@ -1,3 +1,4 @@
+# app/main.py
 import os
 import sys
 import logging
@@ -13,7 +14,7 @@ from app.routes.pumps import router as pumps_router
 from app.routes.ingest import router as ingest_router
 from app.routes.arduino_controler import router as arduino_router  # <<< NUEVO (ya estaba)
 
-# >>> Importar el router de infraestructura
+# >>> Importá el router de infraestructura
 from app.routes.infraestructura import router as infraestructura_router  # <<< NUEVO
 
 # ===== Logging simple =====
@@ -32,11 +33,11 @@ app = FastAPI(
 # ===== CORS totalmente abierto =====
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Permite todas las origines
-    allow_methods=["*"],  # Permite todos los métodos HTTP
-    allow_headers=["*"],  # Permite todos los encabezados
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
     allow_credentials=False,
-    expose_headers=["*"],  # Expone todos los encabezados
+    expose_headers=["*"],
     max_age=3600,
 )
 
@@ -71,5 +72,5 @@ app.include_router(pumps_router)            # /pumps
 app.include_router(ingest_router)           # /ingest
 app.include_router(arduino_router)          # /arduino-controler
 
-# >>> Montar infraestructura (nodes/edges/graph + POST layout/edges)
+# >>> Montamos infraestructura (nodes/edges/graph + POST layout/edges)
 app.include_router(infraestructura_router)  # /infra
