@@ -126,3 +126,27 @@ async def get_pumps_with_status():
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+        # GET /infraestructura/get_layout_combined
+@router.get("/get_layout_combined", response_model=List[dict])
+async def get_layout_combined():
+    """
+    Devuelve todos los nodos (pump/tank/valve/manifold) desde public.v_layout_combined.
+    """
+    sql = """
+    SELECT node_id, id, type, x, y, updated_at
+    FROM public.v_layout_combined
+    ORDER BY type, id;
+    """
+    try:
+        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql)
+            nodes = cur.fetchall()
+            if not nodes:
+                raise HTTPException(status_code=404, detail="No se encontraron nodos en v_layout_combined")
+            return nodes
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
