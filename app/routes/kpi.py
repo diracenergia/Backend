@@ -2,8 +2,8 @@
 from fastapi import APIRouter, Query, HTTPException
 from psycopg.rows import dict_row
 from app.db import get_conn
-from datetime import datetime, timedelta
-from typing import Optional, List
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 # Un solo router para todo: /kpi/*
 router = APIRouter(prefix="/kpi", tags=["kpi"])
@@ -14,10 +14,28 @@ router = APIRouter(prefix="/kpi", tags=["kpi"])
 LOCAL_TZ = "America/Argentina/Buenos_Aires"
 
 def _ft_defaults(date_from: Optional[datetime], date_to: Optional[datetime]):
+    """
+    Normaliza fechas a UTC aware y aplica defaults:
+      - to: ahora (UTC)
+      - from: to - 24h
+    Valida from < to.
+    """
     if date_to is None:
-        date_to = datetime.utcnow()
+        date_to = datetime.now(timezone.utc)
     if date_from is None:
         date_from = date_to - timedelta(hours=24)
+
+    # Normalizamos a UTC aware
+    if date_to.tzinfo is None:
+        date_to = date_to.replace(tzinfo=timezone.utc)
+    else:
+        date_to = date_to.astimezone(timezone.utc)
+
+    if date_from.tzinfo is None:
+        date_from = date_from.replace(tzinfo=timezone.utc)
+    else:
+        date_from = date_from.astimezone(timezone.utc)
+
     if date_from >= date_to:
         raise HTTPException(status_code=400, detail="'from' debe ser menor que 'to'")
     return date_from, date_to
@@ -44,18 +62,19 @@ def _compute_alarm(level_pct, low_low, low, high, high_high) -> str:
     if x <= low     or x >= high:      return "alerta"
     return "normal"
 
+# =========================
+# Ping/diagnóstico
+# =========================
 
-
-@router.get("/ping")
+@router.get("/ping", summary="Ping KPI (sin DB)")
 def kpi_ping():
-    return {"ok": True, "module": "kpi"}
-
+    return {"ok": True, "module": "kpi", "tz": LOCAL_TZ}
 
 # =========================
-# ESTADO (antes en kpi.py)
+# ESTADO
 # =========================
 
-@router.get("/pumps/status")
+@router.get("/pumps/status", summary="Estado de bombas (vista kpi.v_pumps_with_status)")
 def list_pumps_status():
     sql = """
     select
@@ -95,7 +114,7 @@ def list_pumps_status():
     return out
 
 
-@router.get("/tanks/latest")
+@router.get("/tanks/latest", summary="Últimos niveles y config de tanques (kpi.v_tanks_with_config)")
 def list_tanks_latest():
     sql = """
     select
@@ -154,12 +173,12 @@ def list_tanks_latest():
 # GRÁFICOS (con from/to)
 # =========================
 
-@router.get("/graphs/buckets")
+@router.get("/graphs/buckets", summary="Devuelve buckets hora local entre from/to (default: últimas 24h)")
 def buckets(
     date_from: Optional[datetime] = Query(None, alias="from"),
     date_to:   Optional[datetime] = Query(None, alias="to"),
 ):
-    """Devuelve buckets hora local entre from/to (default: últimas 24h)."""
+    """Buckets horarios en hora local. Rango **[from,to)**."""
     df, dt = _ft_defaults(date_from, date_to)
     sql = f"""
     WITH bounds AS (
@@ -168,7 +187,7 @@ def buckets(
     hours AS (
       SELECT generate_series(
         date_trunc('hour', (from_utc AT TIME ZONE '{LOCAL_TZ}')),
-        date_trunc('hour', (to_utc   AT TIME ZONE '{LOCAL_TZ}')),
+        date_trunc('hour', (to_utc   AT TIME ZONE '{LOCAL_TZ}')) - interval '1 hour',
         interval '1 hour'
       ) AS local_hour_ts
       FROM bounds
@@ -182,13 +201,12 @@ def buckets(
         return cur.fetchall()
 
 
-@router.get("/graphs/pumps/active")
+@router.get("/graphs/pumps/active", summary="Bombas activas por hora en [from,to). Devuelve buckets completos")
 def pumps_active(
     date_from: Optional[datetime] = Query(None, alias="from"),
     date_to:   Optional[datetime] = Query(None, alias="to"),
     location_id: Optional[int] = None,
 ):
-    """Bombas activas por hora en [from,to). Devuelve todos los buckets con 0 si no hay actividad."""
     df, dt = _ft_defaults(date_from, date_to)
     sql = f"""
     WITH bounds AS (
@@ -197,7 +215,7 @@ def pumps_active(
     hours AS (
       SELECT generate_series(
         date_trunc('hour', (SELECT from_ts FROM bounds)),
-        date_trunc('hour', (SELECT to_ts   FROM bounds)),
+        date_trunc('hour', (SELECT to_ts   FROM bounds)) - interval '1 hour',
         interval '1 hour'
       ) AS hour_utc
     ),
@@ -213,7 +231,7 @@ def pumps_active(
     ),
     intervals AS (
       SELECT pump_id, ts AS start_ts, COALESCE(next_ts, now()) AS end_ts
-      FROM ev WHERE value = 1
+      FROM ev WHERE value = '1' OR value = 1
     ),
     counts AS (
       SELECT h.hour_utc, count(DISTINCT i.pump_id) AS pumps_count
@@ -234,14 +252,13 @@ def pumps_active(
         return cur.fetchall()
 
 
-@router.get("/graphs/pumps/starts")
+@router.get("/graphs/pumps/starts", summary="Arranques por hora en [from,to), buckets completos")
 def pumps_starts(
     date_from: Optional[datetime] = Query(None, alias="from"),
     date_to:   Optional[datetime] = Query(None, alias="to"),
     location_id: Optional[int] = None,
     entity_id:  Optional[int] = None,
 ):
-    """Arranques por hora en [from,to), con buckets completos."""
     df, dt = _ft_defaults(date_from, date_to)
     sql = f"""
     WITH bounds AS (
@@ -250,7 +267,7 @@ def pumps_starts(
     hours AS (
       SELECT generate_series(
         date_trunc('hour', (SELECT from_ts FROM bounds)),
-        date_trunc('hour', (SELECT to_ts   FROM bounds)),
+        date_trunc('hour', (SELECT to_ts   FROM bounds)) - interval '1 hour',
         interval '1 hour'
       ) AS hour_utc
     ),
@@ -279,14 +296,13 @@ def pumps_starts(
         return cur.fetchall()
 
 
-@router.get("/graphs/tanks/level_avg")
+@router.get("/graphs/tanks/level_avg", summary="Promedio horario de nivel en [from,to), buckets completos")
 def tanks_level_avg(
     date_from: Optional[datetime] = Query(None, alias="from"),
     date_to:   Optional[datetime] = Query(None, alias="to"),
     location_id: Optional[int] = None,
     entity_id:  Optional[int] = None,
 ):
-    """Promedio horario de nivel en [from,to), con buckets completos (null si no hubo lecturas)."""
     df, dt = _ft_defaults(date_from, date_to)
     sql = f"""
     WITH bounds AS (
@@ -295,12 +311,12 @@ def tanks_level_avg(
     hours AS (
       SELECT generate_series(
         date_trunc('hour', (SELECT from_ts FROM bounds)),
-        date_trunc('hour', (SELECT to_ts   FROM bounds)),
+        date_trunc('hour', (SELECT to_ts   FROM bounds)) - interval '1 hour',
         interval '1 hour'
       ) AS hour_utc
     ),
     levels AS (
-      SELECT date_trunc('hour', ts) AS hour_utc, value::float AS val
+      SELECT date_trunc('hour', ts) AS hour_utc, (value)::float AS val
       FROM kpi.v_kpi_stream
       WHERE kind='tank' AND metric='level_pct'
         AND ts >= (SELECT from_ts FROM bounds) AND ts < (SELECT to_ts FROM bounds)
