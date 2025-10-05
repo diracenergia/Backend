@@ -1,23 +1,156 @@
 # app/routes/kpi_graphs.py
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, HTTPException
 from psycopg.rows import dict_row
 from app.db import get_conn
 from datetime import datetime, timedelta
+from typing import Optional, List
 
-router = APIRouter(prefix="/kpi/graphs", tags=["kpi-graphs"])
+# Un solo router para todo: /kpi/*
+router = APIRouter(prefix="/kpi", tags=["kpi"])
+
+# =========================
+# Helpers
+# =========================
 LOCAL_TZ = "America/Argentina/Buenos_Aires"
 
-def _ft_defaults(date_from: datetime | None, date_to: datetime | None):
-    if date_to is None: date_to = datetime.utcnow()
-    if date_from is None: date_from = date_to - timedelta(hours=24)
+def _ft_defaults(date_from: Optional[datetime], date_to: Optional[datetime]):
+    if date_to is None:
+        date_to = datetime.utcnow()
+    if date_from is None:
+        date_from = date_to - timedelta(hours=24)
     if date_from >= date_to:
-        raise ValueError("'from' debe ser menor que 'to'")
+        raise HTTPException(status_code=400, detail="'from' debe ser menor que 'to'")
     return date_from, date_to
 
-@router.get("/buckets")
+def _as_float(x):
+    return float(x) if x is not None else None
+
+def _as_int(x):
+    return int(x) if x is not None else None
+
+def _as_bool(x):
+    return bool(x) if x is not None else None
+
+def _compute_alarm(level_pct, low_low, low, high, high_high) -> str:
+    # "normal" | "alerta" | "critico"
+    if level_pct is None:
+        return "normal"
+    low_low   = float(low_low)   if low_low   is not None else 10.0
+    low       = float(low)       if low       is not None else 25.0
+    high      = float(high)      if high      is not None else 80.0
+    high_high = float(high_high) if high_high is not None else 90.0
+    x = float(level_pct)
+    if x <= low_low or x >= high_high: return "critico"
+    if x <= low     or x >= high:      return "alerta"
+    return "normal"
+
+# =========================
+# ESTADO (antes en kpi.py)
+# =========================
+
+@router.get("/pumps/status")
+def list_pumps_status():
+    sql = """
+    select
+      pump_id,
+      name,
+      location_id,
+      location_name,
+      state,
+      latest_event_id,
+      age_sec,
+      online,
+      event_ts,
+      latest_hb_id,
+      hb_ts
+    from kpi.v_pumps_with_status
+    order by pump_id
+    """
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql)
+        rows = cur.fetchall()
+
+    out = []
+    for r in rows:
+        out.append({
+            "pump_id":         r["pump_id"],
+            "name":            r["name"],
+            "location_id":     r["location_id"],
+            "location_name":   r["location_name"],
+            "state":           r["state"],
+            "latest_event_id": r["latest_event_id"],
+            "age_sec":         _as_int(r.get("age_sec")),
+            "online":          _as_bool(r.get("online")),
+            "event_ts":        r["event_ts"],
+            "latest_hb_id":    r["latest_hb_id"],
+            "hb_ts":           r["hb_ts"],
+        })
+    return out
+
+
+@router.get("/tanks/latest")
+def list_tanks_latest():
+    sql = """
+    select
+      tank_id,
+      name,
+      location_id,
+      location_name,
+      low_pct,
+      low_low_pct,
+      high_pct,
+      high_high_pct,
+      updated_by,
+      updated_at,
+      level_pct,
+      age_sec,
+      online,
+      alarma
+    from kpi.v_tanks_with_config
+    order by tank_id
+    """
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql)
+        rows = cur.fetchall()
+
+    out = []
+    for r in rows:
+        alarm_txt = r.get("alarma")
+        if alarm_txt is None:
+            alarm_txt = _compute_alarm(
+                r.get("level_pct"),
+                r.get("low_low_pct"),
+                r.get("low_pct"),
+                r.get("high_pct"),
+                r.get("high_high_pct"),
+            )
+
+        out.append({
+            "tank_id":        r["tank_id"],
+            "name":           r["name"],
+            "location_id":    r["location_id"],
+            "location_name":  r["location_name"],
+            "low_pct":        _as_float(r.get("low_pct")),
+            "low_low_pct":    _as_float(r.get("low_low_pct")),
+            "high_pct":       _as_float(r.get("high_pct")),
+            "high_high_pct":  _as_float(r.get("high_high_pct")),
+            "updated_by":     r["updated_by"],
+            "updated_at":     r["updated_at"],
+            "level_pct":      _as_float(r.get("level_pct")),
+            "age_sec":        _as_int(r.get("age_sec")),
+            "online":         _as_bool(r.get("online")),
+            "alarma":         str(alarm_txt),
+        })
+    return out
+
+# =========================
+# GRÁFICOS (con from/to)
+# =========================
+
+@router.get("/graphs/buckets")
 def buckets(
-    date_from: datetime | None = Query(None, alias="from"),
-    date_to:   datetime | None = Query(None, alias="to"),
+    date_from: Optional[datetime] = Query(None, alias="from"),
+    date_to:   Optional[datetime] = Query(None, alias="to"),
 ):
     """Devuelve buckets hora local entre from/to (default: últimas 24h)."""
     df, dt = _ft_defaults(date_from, date_to)
@@ -41,11 +174,12 @@ def buckets(
         cur.execute(sql, (df, dt))
         return cur.fetchall()
 
-@router.get("/pumps/active")
+
+@router.get("/graphs/pumps/active")
 def pumps_active(
-    date_from: datetime | None = Query(None, alias="from"),
-    date_to:   datetime | None = Query(None, alias="to"),
-    location_id: int | None = None,
+    date_from: Optional[datetime] = Query(None, alias="from"),
+    date_to:   Optional[datetime] = Query(None, alias="to"),
+    location_id: Optional[int] = None,
 ):
     """Bombas activas por hora en [from,to). Devuelve todos los buckets con 0 si no hay actividad."""
     df, dt = _ft_defaults(date_from, date_to)
@@ -92,12 +226,13 @@ def pumps_active(
         cur.execute(sql, params)
         return cur.fetchall()
 
-@router.get("/pumps/starts")
+
+@router.get("/graphs/pumps/starts")
 def pumps_starts(
-    date_from: datetime | None = Query(None, alias="from"),
-    date_to:   datetime | None = Query(None, alias="to"),
-    location_id: int | None = None,
-    entity_id:  int | None = None,
+    date_from: Optional[datetime] = Query(None, alias="from"),
+    date_to:   Optional[datetime] = Query(None, alias="to"),
+    location_id: Optional[int] = None,
+    entity_id:  Optional[int] = None,
 ):
     """Arranques por hora en [from,to), con buckets completos."""
     df, dt = _ft_defaults(date_from, date_to)
@@ -136,12 +271,13 @@ def pumps_starts(
         cur.execute(sql, params)
         return cur.fetchall()
 
-@router.get("/tanks/level_avg")
+
+@router.get("/graphs/tanks/level_avg")
 def tanks_level_avg(
-    date_from: datetime | None = Query(None, alias="from"),
-    date_to:   datetime | None = Query(None, alias="to"),
-    location_id: int | None = None,
-    entity_id:  int | None = None,
+    date_from: Optional[datetime] = Query(None, alias="from"),
+    date_to:   Optional[datetime] = Query(None, alias="to"),
+    location_id: Optional[int] = None,
+    entity_id:  Optional[int] = None,
 ):
     """Promedio horario de nivel en [from,to), con buckets completos (null si no hubo lecturas)."""
     df, dt = _ft_defaults(date_from, date_to)
