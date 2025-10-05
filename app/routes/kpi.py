@@ -1,4 +1,4 @@
-# app/routes/kpi_graphs.py
+# app/routes/kpi.py
 from fastapi import APIRouter, Query, HTTPException
 from psycopg.rows import dict_row
 from app.db import get_conn
@@ -43,6 +43,13 @@ def _compute_alarm(level_pct, low_low, low, high, high_high) -> str:
     if x <= low_low or x >= high_high: return "critico"
     if x <= low     or x >= high:      return "alerta"
     return "normal"
+
+
+
+@router.get("/ping")
+def kpi_ping():
+    return {"ok": True, "module": "kpi"}
+
 
 # =========================
 # ESTADO (antes en kpi.py)
