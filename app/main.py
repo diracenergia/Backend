@@ -11,10 +11,11 @@ from app.db import get_conn
 from app.routes.tanks import router as tanks_router
 from app.routes.pumps import router as pumps_router
 from app.routes.ingest import router as ingest_router
-from app.routes.arduino_controler import router as arduino_router  # <<< NUEVO (ya estaba)
+from app.routes.arduino_controler import router as arduino_router
+from app.routes.infraestructura import router as infraestructura_router
 
-# >>> Importá el router de infraestructura
-from app.routes.infraestructura import router as infraestructura_router  # <<< NUEVO
+# >>> NUEVO: importamos las rutas KPI
+from app.routes.kpi import router as kpi_router   # 👈 👈 👈
 
 # ===== Logging simple =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -28,18 +29,16 @@ app = FastAPI(
     version=(os.getenv("RENDER_GIT_COMMIT", "")[:8] or None),
 )
 
-# ===== CORS totalmente abierto =====
+# ===== CORS y GZIP =====
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Permite todas las URLs de origen
-    allow_methods=["*"],  # Permite todos los métodos HTTP
-    allow_headers=["*"],  # Permite todos los encabezados
-    allow_credentials=False, 
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=False,
     expose_headers=["*"],
     max_age=3600,
 )
-
-# (Opcional) gzip para respuestas grandes
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # ===== Health =====
@@ -65,10 +64,11 @@ def health_db():
     return {"ok": True, "db": "up"}
 
 # ===== Rutas que realmente usamos =====
-app.include_router(tanks_router)            # /tanks
-app.include_router(pumps_router)            # /pumps
-app.include_router(ingest_router)           # /ingest
-app.include_router(arduino_router)          # /arduino-controler
+app.include_router(tanks_router)            
+app.include_router(pumps_router)            
+app.include_router(ingest_router)           
+app.include_router(arduino_router)          
+app.include_router(infraestructura_router)
 
-# >>> Montamos infraestructura (nodes/edges/graph + POST layout/edges)
-app.include_router(infraestructura_router)  # /infra
+# >>> NUEVO: montamos KPI (usa las vistas v_pumps_with_status, v_tanks_with_config, etc.)
+app.include_router(kpi_router)               # 👈 👈 👈  /kpi/*
