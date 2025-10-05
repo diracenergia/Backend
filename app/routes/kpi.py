@@ -1,118 +1,150 @@
-# app/routes/kpi.py
-from fastapi import APIRouter
-from app.db import get_conn
+# app/routes/kpi_graphs.py
+from fastapi import APIRouter, Query
 from psycopg.rows import dict_row
+from app.db import get_conn
 
-router = APIRouter(prefix="/kpi", tags=["kpi"])
+router = APIRouter(prefix="/kpi/graphs", tags=["kpi-graphs"])
 
-@router.get("/pumps/status")
-def list_pumps_status():
-    sql = """
-    select
-      pump_id,
-      name,
-      location_id,
-      location_name,
-      state,
-      latest_event_id,
-      age_sec,
-      online,
-      event_ts,
-      latest_hb_id,
-      hb_ts
-    from public.v_pumps_with_status
-    order by pump_id
+# Constante de TZ local para bucketing/rotulación
+LOCAL_TZ = "America/Argentina/Buenos_Aires"
+
+@router.get("/buckets24h")
+def buckets_24h():
+    """
+    Devuelve 24 buckets locales (HH:00) de las últimas 24 horas.
+    shape: [{ local_hour: "HH:00" }, ...]
+    """
+    sql = f"""
+    WITH hours AS (
+      SELECT generate_series(
+        date_trunc('hour', (now() AT TIME ZONE '{LOCAL_TZ}') - interval '23 hours'),
+        date_trunc('hour', (now() AT TIME ZONE '{LOCAL_TZ}')),
+        interval '1 hour'
+      ) AS local_hour_ts
+    )
+    SELECT to_char(local_hour_ts, 'HH24:00') AS local_hour
+    FROM hours
+    ORDER BY local_hour_ts;
     """
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(sql)
-        rows = cur.fetchall()
-
-    out = []
-    for r in rows:
-        out.append({
-            "pump_id":         r["pump_id"],
-            "name":            r["name"],
-            "location_id":     r["location_id"],
-            "location_name":   r["location_name"],
-            "state":           r["state"],
-            "latest_event_id": r["latest_event_id"],
-            "age_sec":         int(r["age_sec"])   if r.get("age_sec")   is not None else None,
-            "online":          bool(r["online"])   if r.get("online")    is not None else None,
-            "event_ts":        r["event_ts"],
-            "latest_hb_id":    r["latest_hb_id"],
-            "hb_ts":           r["hb_ts"],
-        })
-    return out
+        return cur.fetchall()
 
 
-@router.get("/tanks/latest")
-def list_tanks_latest():
-    sql = """
-    select
-      tank_id,
-      name,
-      location_id,
-      location_name,
-      low_pct,
-      low_low_pct,
-      high_pct,
-      high_high_pct,
-      updated_by,
-      updated_at,
-      level_pct,        -- último nivel
-      age_sec,          -- antigüedad de la última lectura (segundos)
-      online,           -- true/false según umbral
-      alarma            -- (puede venir NULL si la vista aún no la tiene)
-    from public.v_tanks_with_config
-    order by tank_id
+@router.get("/pumps/active24h")
+def pumps_active_24h(
+    location_id: int | None = Query(None, description="Filtra por location_id"),
+):
     """
+    Bombas activas por hora (últimas 24 h).
+    shape: [{ local_hour: 'HH:00', pumps_count: number }, ...]
+    """
+    sql = f"""
+    WITH bounds AS (
+      SELECT (now() - interval '24 hours')::timestamptz AS from_ts,
+             now()::timestamptz                          AS to_ts
+    ),
+    ev AS (
+      -- Eventos de bombas (state) con siguiente timestamp (para armar intervalos RUN)
+      SELECT
+        entity_id AS pump_id,
+        ts,
+        value,
+        lead(ts) OVER (PARTITION BY entity_id ORDER BY ts) AS next_ts,
+        location_id
+      FROM kpi.v_kpi_stream
+      WHERE kind='pump' AND metric='state'
+        AND ts >= (SELECT from_ts FROM bounds) - interval '6 hours'
+        AND ts <  (SELECT to_ts   FROM bounds) + interval '6 hours'
+        { "AND location_id = %s" if location_id is not None else "" }
+    ),
+    intervals AS (
+      SELECT pump_id,
+             ts AS start_ts,
+             COALESCE(next_ts, now()) AS end_ts
+      FROM ev
+      WHERE value = 1                        -- RUN
+    ),
+    hours AS (
+      SELECT generate_series(
+        date_trunc('hour', (SELECT from_ts FROM bounds)),
+        date_trunc('hour', (SELECT to_ts   FROM bounds)),
+        interval '1 hour'
+      ) AS hour_utc
+    ),
+    expanded AS (
+      SELECT h.hour_utc, i.pump_id
+      FROM hours h
+      JOIN intervals i
+        ON i.start_ts < h.hour_utc + interval '1 hour'
+       AND i.end_ts   > h.hour_utc
+    )
+    SELECT
+      to_char((hour_utc AT TIME ZONE '{LOCAL_TZ}'), 'HH24:00') AS local_hour,
+      count(DISTINCT pump_id) AS pumps_count
+    FROM expanded
+    GROUP BY 1
+    ORDER BY 1;
+    """
+    params = ([location_id] if location_id is not None else [])
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(sql)
-        rows = cur.fetchall()
+        cur.execute(sql, params)
+        return cur.fetchall()
 
-    def compute_alarm(level_pct, low_low, low, high, high_high):
-        # Devuelve "normal" | "alerta" | "critico"
-        if level_pct is None:
-            return "normal"
-        # defaults por si faltan en la fila
-        low_low   = float(low_low)    if low_low    is not None else 10.0
-        low       = float(low)        if low        is not None else 25.0
-        high      = float(high)       if high       is not None else 80.0
-        high_high = float(high_high)  if high_high  is not None else 90.0
-        x = float(level_pct)
-        if x <= low_low or x >= high_high: return "critico"
-        if x <= low     or x >= high:      return "alerta"
-        return "normal"
 
-    out = []
-    for r in rows:
-        alarm_txt = r.get("alarma")
-        if alarm_txt is None:
-            alarm_txt = compute_alarm(
-                r.get("level_pct"),
-                r.get("low_low_pct"),
-                r.get("low_pct"),
-                r.get("high_pct"),
-                r.get("high_high_pct"),
-            )
+@router.get("/pumps/starts24h")
+def pumps_starts_24h(
+    location_id: int | None = Query(None, description="Filtra por location_id"),
+    entity_id: int | None   = Query(None, description="Filtra por pump_id específico"),
+):
+    """
+    Arranques (RUN) por hora (últimas 24 h).
+    shape: [{ local_hour: 'HH:00', starts: number }, ...]
+    """
+    sql = f"""
+    SELECT
+      to_char(date_trunc('hour', (ts AT TIME ZONE '{LOCAL_TZ}')), 'HH24:00') AS local_hour,
+      count(*) AS starts
+    FROM kpi.v_kpi_stream
+    WHERE kind='pump' AND metric='state' AND event='start'
+      AND ts >= now() - interval '24 hours'
+      { "AND location_id = %s" if location_id is not None else "" }
+      { "AND entity_id   = %s" if entity_id   is not None else "" }
+    GROUP BY 1
+    ORDER BY 1;
+    """
+    params: list = []
+    if location_id is not None: params.append(location_id)
+    if entity_id   is not None: params.append(entity_id)
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, params)
+        return cur.fetchall()
 
-        out.append({
-            "tank_id":        r["tank_id"],
-            "name":           r["name"],
-            "location_id":    r["location_id"],
-            "location_name":  r["location_name"],
-            "low_pct":        float(r["low_pct"])        if r["low_pct"]        is not None else None,
-            "low_low_pct":    float(r["low_low_pct"])    if r["low_low_pct"]    is not None else None,
-            "high_pct":       float(r["high_pct"])       if r["high_pct"]       is not None else None,
-            "high_high_pct":  float(r["high_high_pct"])  if r["high_high_pct"]  is not None else None,
-            "updated_by":     r["updated_by"],
-            "updated_at":     r["updated_at"],
 
-            "level_pct":      float(r["level_pct"]) if r.get("level_pct") is not None else None,
-            "age_sec":        int(r["age_sec"])     if r.get("age_sec")   is not None else None,
-            "online":         bool(r["online"])     if r.get("online")    is not None else None,
-
-            # Solo texto
-            "alarma":         str(alarm_txt),
-        })
-    return out
+@router.get("/tanks/level_avg24h")
+def tanks_level_avg_24h(
+    location_id: int | None = Query(None, description="Filtra por location_id"),
+    entity_id: int | None   = Query(None, description="Filtra por tank_id específico"),
+):
+    """
+    Promedio horario de nivel de tanques (últimas 24 h).
+    shape: [{ local_hour: 'HH:00', avg_level_pct: number }, ...]
+    """
+    sql = f"""
+    SELECT
+      to_char(date_trunc('hour', (ts AT TIME ZONE '{LOCAL_TZ}')), 'HH24:00') AS local_hour,
+      avg(value)::float AS avg_level_pct
+    FROM kpi.v_kpi_stream
+    WHERE kind='tank' AND metric='level_pct'
+      AND ts >= now() - interval '24 hours'
+      { "AND location_id = %s" if location_id is not None else "" }
+      { "AND entity_id   = %s" if entity_id   is not None else "" }
+    GROUP BY 1
+    ORDER BY 1;
+    """
+    params: list = []
+    if location_id is not None: params.append(location_id)
+    if entity_id   is not None: params.append(entity_id)
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, params)
+        return cur.fetchall()
