@@ -1,158 +1,258 @@
 # app/routes/kpi.py
-from __future__ import annotations
-
 from fastapi import APIRouter, HTTPException, Query
-from psycopg.rows import dict_row
-from psycopg.errors import UndefinedTable, UndefinedColumn
-from typing import List, Optional
-from datetime import datetime
-
 from app.db import get_conn
+from psycopg.rows import dict_row
+from datetime import datetime
+from typing import List, Optional
 
 router = APIRouter(prefix="/kpi", tags=["kpi"])
 
-# -----------------------
-# Utilidades
-# -----------------------
-def q_all(sql: str, params: tuple = ()) -> List[dict]:
-    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(sql, params)
-        return cur.fetchall()
+# ---------------------------
+# Helpers
+# ---------------------------
 
-def q_one(sql: str, params: tuple = ()) -> Optional[dict]:
-    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(sql, params)
-        return cur.fetchone()
+def _as_float(x):
+    return float(x) if x is not None else None
 
-# -----------------------
-# 0) Vistas disponibles / definiciones
-# -----------------------
+def _as_int(x):
+    return int(x) if x is not None else None
 
-@router.get("/views")
-def list_views() -> List[dict]:
-    """
-    Lista si existen las vistas KPI en el esquema public.
-    """
-    sql = """
-    SELECT schemaname, viewname
-    FROM pg_catalog.pg_views
-    WHERE schemaname = 'public'
-      AND viewname IN ('v_pumps_with_status','v_tanks_with_config','v_tank_levels_timeseries')
-    ORDER BY viewname
-    """
-    return q_all(sql)
+def _as_bool(x):
+    return bool(x) if x is not None else None
 
-@router.get("/views/definitions")
-def view_definitions() -> List[dict]:
-    """
-    Devuelve la definición SQL (texto) de las vistas, si existen.
-    """
-    sql = """
-    SELECT viewname, definition
-    FROM pg_views
-    WHERE schemaname='public'
-      AND viewname IN ('v_pumps_with_status','v_tanks_with_config','v_tank_levels_timeseries')
-    ORDER BY viewname
-    """
-    return q_all(sql)
+def _compute_alarm(level_pct, low_low, low, high, high_high) -> str:
+    # Devuelve "normal" | "alerta" | "critico"
+    if level_pct is None:
+        return "normal"
+    low_low   = float(low_low)   if low_low   is not None else 10.0
+    low       = float(low)       if low       is not None else 25.0
+    high      = float(high)      if high      is not None else 80.0
+    high_high = float(high_high) if high_high is not None else 90.0
+    x = float(level_pct)
+    if x <= low_low or x >= high_high: return "critico"
+    if x <= low     or x >= high:      return "alerta"
+    return "normal"
 
-# -----------------------
-# 1) Bombas (v_pumps_with_status)
-# -----------------------
+# ---------------------------
+# PUMPS (v_pumps_with_status)
+# ---------------------------
 
 @router.get("/pumps/status")
-def pumps_status() -> List[dict]:
+def list_pumps_status():
+    sql = """
+    SELECT
+      pump_id,
+      name,
+      location_id,
+      location_name,
+      state,
+      latest_event_id,
+      age_sec,
+      online,
+      event_ts,
+      latest_hb_id,
+      hb_ts
+    FROM public.v_pumps_with_status
+    ORDER BY pump_id
     """
-    Trae TODO lo que expone v_pumps_with_status.
-    """
-    try:
-        return q_all("SELECT * FROM public.v_pumps_with_status ORDER BY 1")
-    except UndefinedTable:
-        raise HTTPException(status_code=404, detail="La vista public.v_pumps_with_status no existe")
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql)
+        rows = cur.fetchall()
+
+    out = []
+    for r in rows:
+        out.append({
+            "pump_id":         r["pump_id"],
+            "name":            r["name"],
+            "location_id":     r["location_id"],
+            "location_name":   r["location_name"],
+            "state":           r["state"],
+            "latest_event_id": r["latest_event_id"],
+            "age_sec":         _as_int(r.get("age_sec")),
+            "online":          _as_bool(r.get("online")),
+            "event_ts":        r["event_ts"],
+            "latest_hb_id":    r["latest_hb_id"],
+            "hb_ts":           r["hb_ts"],
+        })
+    return out
 
 @router.get("/pumps/{pump_id}/status")
-def pump_status(pump_id: int) -> dict:
+def get_pump_status(pump_id: int):
+    sql = """
+    SELECT
+      pump_id, name, location_id, location_name, state,
+      latest_event_id, age_sec, online, event_ts, latest_hb_id, hb_ts
+    FROM public.v_pumps_with_status
+    WHERE pump_id = %s
     """
-    Filtro por ID sobre v_pumps_with_status (devuelve todas las columnas de la vista).
-    """
-    try:
-        row = q_one("SELECT * FROM public.v_pumps_with_status WHERE pump_id = %s", (pump_id,))
-    except UndefinedTable:
-        raise HTTPException(status_code=404, detail="La vista public.v_pumps_with_status no existe")
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, (pump_id,))
+        r = cur.fetchone()
 
-    if not row:
+    if not r:
         raise HTTPException(status_code=404, detail="Pump not found")
-    return row
 
-# -----------------------
-# 2) Tanques (v_tanks_with_config)
-# -----------------------
+    return {
+        "pump_id":         r["pump_id"],
+        "name":            r["name"],
+        "location_id":     r["location_id"],
+        "location_name":   r["location_name"],
+        "state":           r["state"],
+        "latest_event_id": r["latest_event_id"],
+        "age_sec":         _as_int(r.get("age_sec")),
+        "online":          _as_bool(r.get("online")),
+        "event_ts":        r["event_ts"],
+        "latest_hb_id":    r["latest_hb_id"],
+        "hb_ts":           r["hb_ts"],
+    }
+
+# ---------------------------
+# TANKS (v_tanks_with_config)
+# ---------------------------
 
 @router.get("/tanks/latest")
-def tanks_latest() -> List[dict]:
+def list_tanks_latest():
+    sql = """
+    SELECT
+      tank_id,
+      name,
+      location_id,
+      location_name,
+      low_pct,
+      low_low_pct,
+      high_pct,
+      high_high_pct,
+      updated_by,
+      updated_at,
+      level_pct,   -- último nivel
+      age_sec,     -- antigüedad (segundos)
+      online,      -- true/false (umbral, p.ej. 60s)
+      alarma       -- puede venir NULL
+    FROM public.v_tanks_with_config
+    ORDER BY tank_id
     """
-    Trae TODO lo que expone v_tanks_with_config (sin tocar nombres ni tipos).
-    """
-    try:
-        return q_all("SELECT * FROM public.v_tanks_with_config ORDER BY 1")
-    except UndefinedTable:
-        raise HTTPException(status_code=404, detail="La vista public.v_tanks_with_config no existe")
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql)
+        rows = cur.fetchall()
 
-@router.get("/tanks/{id}/latest")
-def tank_latest(id: int) -> dict:
-    """
-    Filtro por ID. Intentamos primero tank_id; si la vista es legacy y usa pump_id, hacemos fallback.
-    Se devuelve la fila tal cual la vista (todas las columnas).
-    """
-    try:
-        row = q_one("SELECT * FROM public.v_tanks_with_config WHERE tank_id = %s", (id,))
-    except UndefinedColumn:
-        row = None
-    except UndefinedTable:
-        raise HTTPException(status_code=404, detail="La vista public.v_tanks_with_config no existe")
+    out = []
+    for r in rows:
+        alarm_txt = r.get("alarma")
+        if alarm_txt is None:
+            alarm_txt = _compute_alarm(
+                r.get("level_pct"),
+                r.get("low_low_pct"),
+                r.get("low_pct"),
+                r.get("high_pct"),
+                r.get("high_high_pct"),
+            )
 
-    if not row:
-        # fallback por si la vista usa pump_id como clave
-        try:
-            row = q_one("SELECT * FROM public.v_tanks_with_config WHERE pump_id = %s", (id,))
-        except UndefinedColumn:
-            row = None
+        out.append({
+            "tank_id":        r["tank_id"],
+            "name":           r["name"],
+            "location_id":    r["location_id"],
+            "location_name":  r["location_name"],
+            "low_pct":        _as_float(r.get("low_pct")),
+            "low_low_pct":    _as_float(r.get("low_low_pct")),
+            "high_pct":       _as_float(r.get("high_pct")),
+            "high_high_pct":  _as_float(r.get("high_high_pct")),
+            "updated_by":     r["updated_by"],
+            "updated_at":     r["updated_at"],
+            "level_pct":      _as_float(r.get("level_pct")),
+            "age_sec":        _as_int(r.get("age_sec")),
+            "online":         _as_bool(r.get("online")),
+            "alarma":         str(alarm_txt),
+        })
+    return out
 
-    if not row:
+@router.get("/tanks/{tank_id}/latest")
+def get_tank_latest(tank_id: int):
+    sql = """
+    SELECT
+      tank_id,
+      name,
+      location_id,
+      location_name,
+      low_pct,
+      low_low_pct,
+      high_pct,
+      high_high_pct,
+      updated_by,
+      updated_at,
+      level_pct,
+      age_sec,
+      online,
+      alarma
+    FROM public.v_tanks_with_config
+    WHERE tank_id = %s
+    """
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, (tank_id,))
+        r = cur.fetchone()
+
+    if not r:
         raise HTTPException(status_code=404, detail="Tank not found")
-    return row
 
-# -----------------------
-# 3) Serie temporal (v_tank_levels_timeseries)
-# -----------------------
+    alarm_txt = r.get("alarma")
+    if alarm_txt is None:
+        alarm_txt = _compute_alarm(
+            r.get("level_pct"),
+            r.get("low_low_pct"),
+            r.get("low_pct"),
+            r.get("high_pct"),
+            r.get("high_high_pct"),
+        )
+
+    return {
+        "tank_id":        r["tank_id"],
+        "name":           r["name"],
+        "location_id":    r["location_id"],
+        "location_name":  r["location_name"],
+        "low_pct":        _as_float(r.get("low_pct")),
+        "low_low_pct":    _as_float(r.get("low_low_pct")),
+        "high_pct":       _as_float(r.get("high_pct")),
+        "high_high_pct":  _as_float(r.get("high_high_pct")),
+        "updated_by":     r["updated_by"],
+        "updated_at":     r["updated_at"],
+        "level_pct":      _as_float(r.get("level_pct")),
+        "age_sec":        _as_int(r.get("age_sec")),
+        "online":         _as_bool(r.get("online")),
+        "alarma":         str(alarm_txt),
+    }
+
+# ---------------------------
+# Timeseries (v_tank_levels_timeseries)
+# ---------------------------
 
 @router.get("/tanks/{tank_id}/levels")
-def tank_levels_timeseries(
+def get_tank_levels(
     tank_id: int,
     date_from: Optional[datetime] = Query(None, alias="from"),
     date_to:   Optional[datetime] = Query(None, alias="to"),
-) -> List[dict]:
+):
     """
-    Trae TODO lo que expone v_tank_levels_timeseries para un tank_id.
-    Si 'from' y 'to' vienen, filtra por 'ts' en ese rango [from, to).
-    Devuelve las columnas exactas de la vista.
+    Devuelve la serie de niveles desde v_tank_levels_timeseries.
+    Con rango opcional [from, to). Si no se envía rango, devuelve todo el histórico del tanque.
     """
-    try:
-        if date_from is not None and date_to is not None:
-            if date_from >= date_to:
-                raise HTTPException(status_code=400, detail="'from' debe ser menor que 'to'")
-            sql = """
-              SELECT * FROM public.v_tank_levels_timeseries
-              WHERE tank_id = %s AND ts >= %s AND ts < %s
-              ORDER BY ts ASC
-            """
-            return q_all(sql, (tank_id, date_from, date_to))
-        else:
-            sql = """
-              SELECT * FROM public.v_tank_levels_timeseries
-              WHERE tank_id = %s
-              ORDER BY ts ASC
-            """
-            return q_all(sql, (tank_id,))
-    except UndefinedTable:
-        raise HTTPException(status_code=404, detail="La vista public.v_tank_levels_timeseries no existe")
+    base = """
+      SELECT tank_id, tank_name, level_pct, ts
+      FROM public.v_tank_levels_timeseries
+      WHERE tank_id = %s
+    """
+    params: List = [tank_id]
+
+    if date_from is not None and date_to is not None:
+        if date_from >= date_to:
+            raise HTTPException(status_code=400, detail="'from' debe ser menor que 'to'")
+        base += " AND ts >= %s AND ts < %s"
+        params.extend([date_from, date_to])
+
+    base += " ORDER BY ts ASC"
+
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(base, tuple(params))
+        rows = cur.fetchall()
+
+    for r in rows:
+        r["level_pct"] = _as_float(r.get("level_pct"))
+    return rows
