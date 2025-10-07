@@ -17,6 +17,9 @@ from app.routes.infraestructura import router as infraestructura_router
 # >>> NUEVO: importamos las rutas KPI
 from app.routes.kpi import router as kpi_router   # 👈 👈 👈
 
+# >>> NUEVO: Notifier (avisos Telegram/WhatsApp)
+from app.alerts.notifier import AlertsNotifier    # 👈 👈 👈
+
 # ===== Logging simple =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -64,11 +67,30 @@ def health_db():
     return {"ok": True, "db": "up"}
 
 # ===== Rutas que realmente usamos =====
-app.include_router(tanks_router)            
-app.include_router(pumps_router)            
-app.include_router(ingest_router)           
-app.include_router(arduino_router)          
+app.include_router(tanks_router)
+app.include_router(pumps_router)
+app.include_router(ingest_router)
+app.include_router(arduino_router)
 app.include_router(infraestructura_router)
 
 # >>> NUEVO: montamos KPI (usa las vistas v_pumps_with_status, v_tanks_with_config, etc.)
 app.include_router(kpi_router)               # 👈 👈 👈  /kpi/*
+
+# ===== NUEVO: lifecycle del Notifier =====
+_notifier = AlertsNotifier()                 # 👈 instancia global
+
+@app.on_event("startup")
+async def _startup_notifier():
+    try:
+        await _notifier.start()
+        logging.getLogger("alerts").info("AlertsNotifier iniciado.")
+    except Exception as e:
+        logging.getLogger("alerts").exception("No se pudo iniciar AlertsNotifier: %s", e)
+
+@app.on_event("shutdown")
+async def _shutdown_notifier():
+    try:
+        await _notifier.stop()
+        logging.getLogger("alerts").info("AlertsNotifier detenido.")
+    except Exception as e:
+        logging.getLogger("alerts").exception("Error al detener AlertsNotifier: %s", e)
